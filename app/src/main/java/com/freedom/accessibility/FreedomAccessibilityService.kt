@@ -406,7 +406,7 @@ class FreedomAccessibilityService : AccessibilityService() {
         }
 
         val fingerprint = try {
-            if (isMomoDynamicFeedPage(root)) pageFingerprint(root) else null
+            inspectMomoFeedReadiness(root)
         } finally {
             runCatching { root.recycle() }
         }
@@ -414,11 +414,14 @@ class FreedomAccessibilityService : AccessibilityService() {
         if (fingerprint == null) {
             accountBrowseLastStableFingerprint = ""
             accountBrowseStableSamples = 0
+            addLog("动态列表尚不具备操作条件：动态页标识、可见列表容器、有效尺寸或可见项目未通过")
         } else if (fingerprint.signature == accountBrowseLastStableFingerprint) {
             accountBrowseStableSamples++
+            addLog("动态列表采样：可见项目=${fingerprint.nodeCount}，稳定计数=${accountBrowseStableSamples}/$REQUIRED_STABLE_FEED_SAMPLES")
         } else {
             accountBrowseLastStableFingerprint = fingerprint.signature
             accountBrowseStableSamples = 1
+            addLog("动态列表布局基准已建立：可见项目=${fingerprint.nodeCount}，稳定计数=1/$REQUIRED_STABLE_FEED_SAMPLES")
         }
 
         if (accountBrowseStableSamples >= REQUIRED_STABLE_FEED_SAMPLES) {
@@ -961,15 +964,130 @@ class FreedomAccessibilityService : AccessibilityService() {
         }
     }
 
-    private fun isMomoDynamicFeedPage(root: AccessibilityNodeInfo): Boolean {
-        val packageName = runCatching { root.packageName?.toString().orEmpty() }.getOrDefault("")
-        if (packageName != MOMO_PACKAGE || !hasVisibleMomoDynamicTab(root)) return false
+    private fun isMomoDynamicFeedPage(root: AccessibilityNodeInfo): Boolean =
+        inspectMomoFeedReadiness(root) != null
 
-        // Do not require a clickable card merely to establish that this is the feed.
-        // Card lookup happens after scrolling; coupling it here could block the first swipe.
-        val scrollNode = findScrollableFeedContainer(root) ?: return false
-        runCatching { scrollNode.recycle() }
-        return true
+    /**
+     * Initial readiness is intentionally less strict than normal scroll-container lookup:
+     * the list may be laid out and touchable before Android exposes it as scrollable, and
+     * network-driven text/image updates must not keep resetting the stability timer.
+     * The fingerprint therefore describes only the list container's geometry and a coarse
+     * visible-child count, not the entire page or card text/content.
+     */
+    private fun inspectMomoFeedReadiness(root: AccessibilityNodeInfo): PageFingerprint? {
+        val packageName = runCatching { root.packageName?.toString().orEmpty() }.getOrDefault("")
+        if (packageName != MOMO_PACKAGE || !hasVisibleMomoDynamicTab(root)) return null
+
+        val listNode = findVisibleFeedContainer(root) ?: return null
+        return try {
+            val bounds = Rect()
+            listNode.getBoundsInScreen(bounds)
+            val metrics = resources.displayMetrics
+            val minWidth = (metrics.widthPixels * MIN_LIST_WIDTH_RATIO).toInt()
+            val minHeight = (metrics.heightPixels * MIN_LIST_HEIGHT_RATIO).toInt()
+            if (!listNode.isVisibleToUser || bounds.width() < minWidth || bounds.height() < minHeight) {
+                return null
+            }
+
+            var visibleChildren = 0
+            val childCount = runCatching { listNode.childCount }.getOrDefault(0)
+            for (index in 0 until childCount) {
+                val child = runCatching { listNode.getChild(index) }.getOrNull() ?: continue
+                try {
+                    val childBounds = Rect()
+                    child.getBoundsInScreen(childBounds)
+                    if (child.isVisibleToUser && childBounds.width() > 0 && childBounds.height() > 0 &&
+                        Rect.intersects(bounds, childBounds)
+                    ) {
+                        visibleChildren++
+                    }
+                } finally {
+                    runCatching { child.recycle() }
+                }
+            }
+            if (visibleChildren == 0) return null
+
+            val className = listNode.className?.toString().orEmpty().substringAfterLast('.')
+            val signature = listOf(
+                className,
+                bounds.left / FINGERPRINT_SIZE_BUCKET_PX,
+                bounds.top / FINGERPRINT_SIZE_BUCKET_PX,
+                bounds.width() / FINGERPRINT_SIZE_BUCKET_PX,
+                bounds.height() / FINGERPRINT_SIZE_BUCKET_PX,
+                when {
+                    visibleChildren <= 1 -> 1
+                    visibleChildren <= 3 -> 2
+                    visibleChildren <= 6 -> 3
+                    else -> 4
+                }
+            ).joinToString(":")
+            PageFingerprint(signature = signature, nodeCount = visibleChildren)
+        } finally {
+            runCatching { listNode.recycle() }
+        }
+    }
+
+    /** Finds a visible list-like container even before its scrollable flag is exposed. */
+    private fun findVisibleFeedContainer(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+        val queue = ArrayDeque<AccessibilityNodeInfo>()
+        queue.add(AccessibilityNodeInfo.obtain(root))
+        val metrics = resources.displayMetrics
+        val minWidth = (metrics.widthPixels * MIN_LIST_WIDTH_RATIO).toInt()
+        val minHeight = (metrics.heightPixels * MIN_LIST_HEIGHT_RATIO).toInt()
+        val minComposerWidth = (metrics.widthPixels * MIN_COMPOSER_WIDTH_RATIO).toInt()
+        val screenHeight = metrics.heightPixels
+        var hasBottomTextEntry = false
+        var bestNode: AccessibilityNodeInfo? = null
+        var bestArea = 0L
+        var visited = 0
+        try {
+            while (queue.isNotEmpty() && visited < PAGE_FINGERPRINT_MAX_NODES) {
+                val node = queue.removeFirst()
+                visited++
+                try {
+                    val bounds = Rect()
+                    runCatching { node.getBoundsInScreen(bounds) }
+                    if (node.isVisibleToUser && node.isEditable &&
+                        bounds.bottom >= (screenHeight * COMPOSER_BOTTOM_RATIO).toInt() &&
+                        bounds.width() >= minComposerWidth
+                    ) {
+                        hasBottomTextEntry = true
+                    }
+
+                    val className = node.className?.toString().orEmpty()
+                    val isListLike = className.endsWith("RecyclerView") ||
+                        className.endsWith("ListView") || className.endsWith("AbsListView") ||
+                        className.endsWith("ScrollView") || className.endsWith("NestedScrollView") ||
+                        className.endsWith("WebView")
+                    if (node.isVisibleToUser && isListLike && bounds.width() >= minWidth &&
+                        bounds.height() >= minHeight
+                    ) {
+                        val area = bounds.width().toLong() * bounds.height().toLong()
+                        if (area > bestArea) {
+                            runCatching { bestNode?.recycle() }
+                            bestNode = AccessibilityNodeInfo.obtain(node)
+                            bestArea = area
+                        }
+                    }
+
+                    val childCount = runCatching { node.childCount }.getOrDefault(0)
+                    for (index in 0 until childCount) {
+                        if (visited + queue.size >= PAGE_FINGERPRINT_MAX_NODES) break
+                        val child = runCatching { node.getChild(index) }.getOrNull() ?: continue
+                        queue.add(child)
+                    }
+                } finally {
+                    runCatching { node.recycle() }
+                }
+            }
+        } finally {
+            while (queue.isNotEmpty()) runCatching { queue.removeFirst().recycle() }
+        }
+        if (hasBottomTextEntry) {
+            runCatching { bestNode?.recycle() }
+            return null
+        }
+        return bestNode
     }
 
     private fun hasVisibleMomoDynamicTab(root: AccessibilityNodeInfo): Boolean {
@@ -1483,10 +1601,10 @@ class FreedomAccessibilityService : AccessibilityService() {
         private const val MAX_BROWSE_DELAY_MS = 15_000L
         private const val DETAIL_LOAD_TIMEOUT_MS = 12_000L
         private const val LIST_RETURN_TIMEOUT_MS = 10_000L
-        private const val PAGE_STATE_POLL_MS = 350L
+        private const val PAGE_STATE_POLL_MS = 300L
         private const val SCROLL_SETTLE_MS = 850L
         private const val MANUAL_TOUCH_RESUME_MS = 2_500L
-        private const val INITIAL_FEED_STABILITY_TIMEOUT_MS = 30_000L
+        private const val INITIAL_FEED_STABILITY_TIMEOUT_MS = 10_000L
         private const val REQUIRED_STABLE_FEED_SAMPLES = 3
         private const val FIRST_SWIPE_COUNTDOWN_SECONDS = 3
         private const val FIRST_SWIPE_COUNTDOWN_STEP_MS = 1_000L
