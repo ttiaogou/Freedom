@@ -1,10 +1,12 @@
 package com.freedom.accessibility
 
 import android.accessibilityservice.AccessibilityService
+import android.accessibilityservice.GestureDescription
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.graphics.Path
 import android.graphics.Rect
 import android.os.Build
 import android.os.Handler
@@ -20,6 +22,10 @@ import java.text.SimpleDateFormat
 import java.util.ArrayDeque
 import java.util.Date
 import java.util.Locale
+import kotlin.math.PI
+import kotlin.math.pow
+import kotlin.math.sin
+import kotlin.random.Random
 
 class FreedomAccessibilityService : AccessibilityService() {
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -29,14 +35,56 @@ class FreedomAccessibilityService : AccessibilityService() {
     private var targetReceiverRegistered = false
 
     // Read the existing main-screen checkbox without changing its storage key.
+    private enum class AccountBrowsePhase {
+        IDLE,
+        WAIT_FOR_LIST_SCROLL,
+        WAIT_FOR_SCROLL_SETTLE,
+        WAIT_FOR_DETAIL_LOAD,
+        DETAIL_DWELL,
+        WAIT_FOR_LIST_RETURN,
+        PAUSED
+    }
+
+    private data class PageFingerprint(
+        val signature: String,
+        val nodeCount: Int
+    )
+
+    private data class ScrollGestureProfile(
+        val durationMs: Long,
+        val curveOffsetRatio: Float,
+        val accelerationExponent: Float
+    )
+
+    private var accountBrowsePhase = AccountBrowsePhase.IDLE
     private var accountBrowseStepPending = false
     private var accountBrowsePauseReason = ""
-    private var accountBrowseNextStepAt = 0L
+    private var accountBrowseDeadlineAt = 0L
+    private var accountBrowseSourceFingerprint = ""
+    private var accountBrowseDetailFingerprint = ""
+    private var accountBrowseLastStableFingerprint = ""
+    private var accountBrowseStableSamples = 0
+    private var accountBrowseTouchActive = false
+    private var accountBrowseGestureInFlight = false
+    private var refreshReceiverRegistered = false
 
     private val targetChangedReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             applyTargetPackageFilter()
+            resetAccountBrowseSession()
             addLog("监听目标已更新：${MonitorStore.targetPackage(this@FreedomAccessibilityService)}")
+        }
+    }
+
+    private val refreshReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (!MonitorStore.isRunning(this@FreedomAccessibilityService) ||
+                !isAccountBrowseModeEnabled()
+            ) {
+                resetAccountBrowseSession()
+            } else if (accountBrowsePhase == AccountBrowsePhase.IDLE) {
+                startAccountBrowseIfNeeded()
+            }
         }
     }
 
@@ -61,6 +109,16 @@ class FreedomAccessibilityService : AccessibilityService() {
                 registerReceiver(targetChangedReceiver, filter)
             }
             targetReceiverRegistered = true
+        }
+        if (!refreshReceiverRegistered) {
+            val filter = IntentFilter(MonitorActions.ACTION_REFRESH)
+            if (Build.VERSION.SDK_INT >= 33) {
+                registerReceiver(refreshReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+            } else {
+                @Suppress("DEPRECATION")
+                registerReceiver(refreshReceiver, filter)
+            }
+            refreshReceiverRegistered = true
         }
         applyTargetPackageFilter()
         addLog("无障碍服务已连接；当前仅接收指定目标应用的事件")
@@ -91,7 +149,7 @@ class FreedomAccessibilityService : AccessibilityService() {
         }
 
         if (MonitorStore.isRunning(this) && isAccountBrowseModeEnabled()) {
-            scheduleAccountBrowseStep(INITIAL_BROWSE_DELAY_MS)
+            startAccountBrowseIfNeeded()
         }
         refreshViews()
     }
@@ -107,12 +165,16 @@ class FreedomAccessibilityService : AccessibilityService() {
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        if (event == null || !MonitorStore.isRunning(this)) return
+        if (event == null) return
+        if (!MonitorStore.isRunning(this)) {
+            resetAccountBrowseSession()
+            return
+        }
         if (!Settings.canDrawOverlays(this)) {
             MonitorStore.setRunning(this, false)
             MonitorStore.addLog(this, "监听已暂停：悬浮窗授权已撤销")
             MonitorKeepAliveService.stop(this)
-            cancelAccountBrowseStep()
+            resetAccountBrowseSession()
             refreshViews()
             return
         }
@@ -120,6 +182,32 @@ class FreedomAccessibilityService : AccessibilityService() {
         val targetPackage = MonitorStore.targetPackage(this)
         val eventPackage = event.packageName?.toString().orEmpty()
         if (eventPackage != targetPackage || eventPackage == packageName) return
+
+        if (!isAccountBrowseModeEnabled()) {
+            resetAccountBrowseSession()
+        } else {
+            when (event.eventType) {
+                AccessibilityEvent.TYPE_TOUCH_INTERACTION_START -> {
+                    if (accountBrowseGestureInFlight) return
+                    if (!accountBrowseTouchActive) {
+                        accountBrowseTouchActive = true
+                        pauseAccountBrowse("检测到手动触摸；为避免与用户操作冲突，自动浏览已暂停。重新启动运行按钮可恢复")
+                    }
+                    return
+                }
+                AccessibilityEvent.TYPE_TOUCH_INTERACTION_END -> {
+                    if (accountBrowseGestureInFlight) return
+                    if (accountBrowseTouchActive) {
+                        accountBrowseTouchActive = false
+                        addLog("手动触摸已结束；自动浏览保持暂停，重新启动运行按钮可恢复")
+                    }
+                    return
+                }
+            }
+            if (accountBrowsePhase == AccountBrowsePhase.IDLE) {
+                startAccountBrowseIfNeeded()
+            }
+        }
 
         val rawEventName = rawEventName(event.eventType)
         val className = event.className?.toString().orEmpty()
@@ -162,81 +250,229 @@ class FreedomAccessibilityService : AccessibilityService() {
         mainHandler.removeCallbacks(scanRunnable)
         scanQueued = true
         mainHandler.postDelayed(scanRunnable, SCAN_DEBOUNCE_MS)
-
-        if (isAccountBrowseModeEnabled()) {
-            scheduleAccountBrowseStep()
-        } else {
-            cancelAccountBrowseStep()
-        }
     }
 
     /**
-     * The checkbox already present on MainActivity is the user's explicit opt-in.
-     * Keep its existing SharedPreferences file/key so no UI migration is needed.
+     * The existing checkbox is the user's explicit opt-in. Keep its original key.
+     * The first cycle starts only when the selected target app is actually foregrounded.
      */
     private fun isAccountBrowseModeEnabled(): Boolean =
         getSharedPreferences(ACCOUNT_BROWSE_PREFS, Context.MODE_PRIVATE)
             .getBoolean(ACCOUNT_BROWSE_KEY, false)
 
-    private fun scheduleAccountBrowseStep(delayMs: Long = EVENT_BROWSE_DELAY_MS) {
-        if (!MonitorStore.isRunning(this) || !isAccountBrowseModeEnabled()) {
-            cancelAccountBrowseStep()
+    private fun startAccountBrowseIfNeeded() {
+        if (!MonitorStore.isRunning(this) || !isAccountBrowseModeEnabled()) return
+        if (accountBrowsePhase != AccountBrowsePhase.IDLE) return
+        if (MonitorStore.targetPackage(this) != MOMO_PACKAGE) {
+            pauseAccountBrowse("当前阶段仅支持陌陌动态列表；其他应用暂未接入浏览适配")
+            return
+        }
+        val root = runCatching { rootInActiveWindow }.getOrNull() ?: return
+        val isTargetForeground = runCatching {
+            root.packageName?.toString().orEmpty() == MOMO_PACKAGE
+        }.getOrDefault(false)
+        runCatching { root.recycle() }
+        if (!isTargetForeground) return
+
+        accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_LIST_SCROLL
+        val delay = randomBrowseDelayMs()
+        addLog("动态浏览已启动；首次滑动将在 ${delay / 1000.0} 秒后进行")
+        scheduleAccountBrowseStep(delay)
+    }
+
+    private fun scheduleAccountBrowseStep(delayMs: Long) {
+        if (!MonitorStore.isRunning(this) || !isAccountBrowseModeEnabled() ||
+            accountBrowseTouchActive || accountBrowsePhase == AccountBrowsePhase.PAUSED ||
+            accountBrowsePhase == AccountBrowsePhase.IDLE
+        ) {
             return
         }
         if (accountBrowseStepPending) return
-
-        val dwellRemaining = (accountBrowseNextStepAt - System.currentTimeMillis())
-            .coerceAtLeast(0L)
-        val actualDelay = maxOf(delayMs, dwellRemaining)
-
         accountBrowseStepPending = true
-        mainHandler.postDelayed(accountBrowseRunnable, actualDelay)
+        mainHandler.postDelayed(accountBrowseRunnable, delayMs.coerceAtLeast(0L))
     }
 
-    private fun cancelAccountBrowseStep() {
+    private fun resetAccountBrowseSession() {
         mainHandler.removeCallbacks(accountBrowseRunnable)
         accountBrowseStepPending = false
-        accountBrowseNextStepAt = 0L
+        accountBrowsePhase = AccountBrowsePhase.IDLE
+        accountBrowsePauseReason = ""
+        accountBrowseDeadlineAt = 0L
+        accountBrowseSourceFingerprint = ""
+        accountBrowseDetailFingerprint = ""
+        accountBrowseLastStableFingerprint = ""
+        accountBrowseStableSamples = 0
+        accountBrowseTouchActive = false
+        accountBrowseGestureInFlight = false
     }
 
     private fun pauseAccountBrowse(reason: String) {
         mainHandler.removeCallbacks(accountBrowseRunnable)
         accountBrowseStepPending = false
-        accountBrowseNextStepAt = 0L
-
+        accountBrowseGestureInFlight = false
+        accountBrowsePhase = AccountBrowsePhase.PAUSED
+        accountBrowseDeadlineAt = 0L
         if (accountBrowsePauseReason != reason) {
             accountBrowsePauseReason = reason
             addLog("动态浏览已暂停：$reason")
         }
     }
 
-    /**
-     * Phase 1 is deliberately read-only:
-     * - operate only while the target app is the foreground window;
-     * - scroll a clearly identifiable, large vertical list using its accessibility action;
-     * - wait six seconds between successful page advances;
-     * - never click feed cards, likes, follows, comments, or message controls.
-     */
     private fun performAccountBrowseStep() {
         if (!MonitorStore.isRunning(this) || !isAccountBrowseModeEnabled()) {
-            cancelAccountBrowseStep()
+            resetAccountBrowseSession()
             return
         }
+        if (accountBrowseTouchActive || accountBrowsePhase == AccountBrowsePhase.PAUSED) return
 
-        val targetPackage = MonitorStore.targetPackage(this)
+        when (accountBrowsePhase) {
+            AccountBrowsePhase.IDLE,
+            AccountBrowsePhase.PAUSED -> return
+            AccountBrowsePhase.WAIT_FOR_LIST_SCROLL -> performFeedScroll()
+            AccountBrowsePhase.WAIT_FOR_SCROLL_SETTLE -> openVisibleFeedCard()
+            AccountBrowsePhase.WAIT_FOR_DETAIL_LOAD -> checkDetailPageLoaded()
+            AccountBrowsePhase.DETAIL_DWELL -> returnFromDetailPage()
+            AccountBrowsePhase.WAIT_FOR_LIST_RETURN -> checkFeedListReturned()
+        }
+    }
+
+    private fun obtainTargetRootOrPause(): AccessibilityNodeInfo? {
         val root = runCatching { rootInActiveWindow }.getOrNull()
         if (root == null) {
-            pauseAccountBrowse("暂时无法读取当前页面；请回到陌陌动态列表后继续")
+            pauseAccountBrowse("暂时无法读取当前页面；请确认陌陌仍在前台")
+            return null
+        }
+        val activePackage = runCatching { root.packageName?.toString().orEmpty() }.getOrDefault("")
+        if (activePackage != MOMO_PACKAGE) {
+            runCatching { root.recycle() }
+            pauseAccountBrowse("当前没有打开陌陌；自动浏览已暂停")
+            return null
+        }
+        return root
+    }
+
+    private fun performFeedScroll() {
+        val root = obtainTargetRootOrPause() ?: return
+        if (!isMomoDynamicFeedPage(root)) {
+            runCatching { root.recycle() }
+            pauseAccountBrowse("没有确认当前位于陌陌动态列表；为避免误操作，已暂停")
             return
         }
 
-        val activePackage = runCatching {
-            root.packageName?.toString().orEmpty()
-        }.getOrDefault("")
-
-        if (activePackage != targetPackage) {
+        accountBrowseSourceFingerprint = pageFingerprint(root).signature
+        val scrollNode = try {
+            findScrollableFeedContainer(root)
+        } finally {
             runCatching { root.recycle() }
-            pauseAccountBrowse("当前没有打开目标应用；请回到陌陌动态列表后继续")
+        }
+        if (scrollNode == null) {
+            pauseAccountBrowse("没有识别到可滚动的动态列表；已暂停")
+            return
+        }
+
+        val bounds = Rect()
+        val validBounds = runCatching {
+            scrollNode.getBoundsInScreen(bounds)
+            bounds.width() >= MIN_GESTURE_WIDTH_PX && bounds.height() >= MIN_GESTURE_HEIGHT_PX
+        }.getOrDefault(false)
+        if (!validBounds) {
+            runCatching { scrollNode.recycle() }
+            pauseAccountBrowse("动态列表尺寸不足，无法安全执行滑动")
+            return
+        }
+
+        val profile = loadScrollGestureProfile()
+        val path = createSmoothScrollPath(bounds, profile)
+        val gesture = GestureDescription.Builder()
+            .addStroke(GestureDescription.StrokeDescription(path, 0L, profile.durationMs))
+            .build()
+
+        accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_SCROLL_SETTLE
+        accountBrowseGestureInFlight = true
+        val accepted = runCatching {
+            dispatchGesture(gesture, object : AccessibilityService.GestureResultCallback() {
+                override fun onCompleted(gestureDescription: GestureDescription?) {
+                    accountBrowseGestureInFlight = false
+                    if (accountBrowsePhase != AccountBrowsePhase.WAIT_FOR_SCROLL_SETTLE ||
+                        !MonitorStore.isRunning(this@FreedomAccessibilityService)
+                    ) return
+                    addLog("动态列表滑动完成；正在等待页面稳定")
+                    scheduleAccountBrowseStep(SCROLL_SETTLE_MS)
+                }
+
+                override fun onCancelled(gestureDescription: GestureDescription?) {
+                    accountBrowseGestureInFlight = false
+                    if (accountBrowsePhase == AccountBrowsePhase.WAIT_FOR_SCROLL_SETTLE) {
+                        pauseAccountBrowse("滑动被系统或用户操作中断；请重新启动后继续")
+                    }
+                }
+            }, mainHandler)
+        }.getOrDefault(false)
+
+        if (!accepted) {
+            accountBrowseGestureInFlight = false
+            val fallbackScrolled = runCatching {
+                scrollNode.performAction(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD)
+            }.getOrDefault(false)
+            runCatching { scrollNode.recycle() }
+            if (fallbackScrolled) {
+                addLog("动态列表已通过无障碍滚动动作移动；正在等待页面稳定")
+                scheduleAccountBrowseStep(SCROLL_SETTLE_MS)
+            } else {
+                pauseAccountBrowse("系统未接受滑动手势，备用滚动动作也未成功")
+            }
+            return
+        }
+
+        runCatching { scrollNode.recycle() }
+        addLog("动态列表正在平滑滑动（${profile.durationMs} 毫秒）")
+    }
+
+    private fun loadScrollGestureProfile(): ScrollGestureProfile {
+        val prefs = getSharedPreferences(ACCOUNT_BROWSE_PREFS, Context.MODE_PRIVATE)
+        return ScrollGestureProfile(
+            durationMs = prefs.getLong(KEY_BROWSE_GESTURE_DURATION_MS, DEFAULT_GESTURE_DURATION_MS)
+                .coerceIn(MIN_GESTURE_DURATION_MS, MAX_GESTURE_DURATION_MS),
+            curveOffsetRatio = (prefs.getFloat(KEY_BROWSE_GESTURE_CURVE_OFFSET, DEFAULT_CURVE_OFFSET_RATIO))
+                .coerceIn(0f, MAX_CURVE_OFFSET_RATIO),
+            accelerationExponent = prefs.getFloat(
+                KEY_BROWSE_GESTURE_ACCELERATION,
+                DEFAULT_GESTURE_ACCELERATION
+            ).coerceIn(MIN_GESTURE_ACCELERATION, MAX_GESTURE_ACCELERATION)
+        )
+    }
+
+    /** Build a smooth, curved swipe with gradual acceleration and deceleration. */
+    private fun createSmoothScrollPath(
+        bounds: Rect,
+        profile: ScrollGestureProfile
+    ): Path {
+        val path = Path()
+        val centerX = bounds.centerX().toFloat()
+        val startY = bounds.top + bounds.height() * SCROLL_START_FRACTION
+        val endY = bounds.top + bounds.height() * SCROLL_END_FRACTION
+        val curveOffset = bounds.width() * profile.curveOffsetRatio
+        val steps = GESTURE_PATH_STEPS
+
+        for (step in 0..steps) {
+            val t = step.toFloat() / steps.toFloat()
+            val eased = if (t < 0.5f) {
+                0.5f * (2f * t).pow(profile.accelerationExponent)
+            } else {
+                1f - 0.5f * (2f * (1f - t)).pow(profile.accelerationExponent)
+            }
+            val x = centerX + sin(PI * t.toDouble()).toFloat() * curveOffset
+            val y = startY + (endY - startY) * eased
+            if (step == 0) path.moveTo(x, y) else path.lineTo(x, y)
+        }
+        return path
+    }
+
+    private fun openVisibleFeedCard() {
+        val root = obtainTargetRootOrPause() ?: return
+        if (!isMomoDynamicFeedPage(root)) {
+            runCatching { root.recycle() }
+            pauseAccountBrowse("滑动后页面不再是可识别的陌陌动态列表；已暂停")
             return
         }
 
@@ -245,32 +481,254 @@ class FreedomAccessibilityService : AccessibilityService() {
         } finally {
             runCatching { root.recycle() }
         }
-
         if (scrollNode == null) {
-            pauseAccountBrowse("没有识别到合适的动态列表；请先打开陌陌动态信息流页面")
+            pauseAccountBrowse("滑动后未找到动态列表；已暂停")
             return
         }
 
-        // Set the dwell deadline before performing the action so that the resulting
-        // scroll events cannot schedule another step too early.
-        accountBrowseNextStepAt = System.currentTimeMillis() + BROWSE_DWELL_MS
-
-        val scrolled = try {
-            scrollNode.performAction(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD)
-        } catch (_: Exception) {
-            false
+        val cardNode = try {
+            findClickableFeedCard(scrollNode)
         } finally {
             runCatching { scrollNode.recycle() }
         }
+        if (cardNode == null) {
+            pauseAccountBrowse("没有找到安全可识别的动态卡片；没有点击任何控件")
+            return
+        }
 
-        if (scrolled) {
-            accountBrowsePauseReason = ""
-            addLog("动态浏览：已向上浏览一屏，停留 ${BROWSE_DWELL_MS / 1000} 秒后再继续")
-            scheduleAccountBrowseStep(BROWSE_DWELL_MS)
+        val currentRoot = obtainTargetRootOrPause()
+        if (currentRoot == null) {
+            runCatching { cardNode.recycle() }
+            return
+        }
+        accountBrowseSourceFingerprint = pageFingerprint(currentRoot).signature
+        runCatching { currentRoot.recycle() }
+
+        val clicked = runCatching {
+            cardNode.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+        }.getOrDefault(false)
+        runCatching { cardNode.recycle() }
+
+        if (!clicked) {
+            pauseAccountBrowse("动态卡片未接受无障碍点击；已停止本轮操作")
+            return
+        }
+
+        accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_DETAIL_LOAD
+        accountBrowseDeadlineAt = System.currentTimeMillis() + DETAIL_LOAD_TIMEOUT_MS
+        accountBrowseLastStableFingerprint = ""
+        accountBrowseStableSamples = 0
+        addLog("已打开一条动态；正在确认详情页面是否成功载入")
+        scheduleAccountBrowseStep(PAGE_STATE_POLL_MS)
+    }
+
+    /** Only direct, large, fully visible, clickable children of the feed list qualify as cards. */
+    private fun findClickableFeedCard(
+        scrollNode: AccessibilityNodeInfo
+    ): AccessibilityNodeInfo? {
+        val listBounds = Rect()
+        runCatching { scrollNode.getBoundsInScreen(listBounds) }
+        val minWidth = (resources.displayMetrics.widthPixels * MIN_FEED_CARD_WIDTH_RATIO).toInt()
+        val minHeight = (resources.displayMetrics.heightPixels * MIN_FEED_CARD_HEIGHT_RATIO).toInt()
+        val childCount = runCatching { scrollNode.childCount }.getOrDefault(0)
+
+        var bestNode: AccessibilityNodeInfo? = null
+        var bestTop = Int.MAX_VALUE
+        var bestArea = 0L
+        for (index in 0 until childCount) {
+            val child = runCatching { scrollNode.getChild(index) }.getOrNull() ?: continue
+            try {
+                val bounds = Rect()
+                runCatching { child.getBoundsInScreen(bounds) }
+                if (!child.isVisibleToUser || !child.isClickable || child.isEditable) continue
+                if (bounds.width() < minWidth || bounds.height() < minHeight) continue
+                if (bounds.top < listBounds.top || bounds.bottom > listBounds.bottom) continue
+
+                val area = bounds.width().toLong() * bounds.height().toLong()
+                if (bounds.top < bestTop || (bounds.top == bestTop && area > bestArea)) {
+                    runCatching { bestNode?.recycle() }
+                    bestNode = AccessibilityNodeInfo.obtain(child)
+                    bestTop = bounds.top
+                    bestArea = area
+                }
+            } finally {
+                runCatching { child.recycle() }
+            }
+        }
+        return bestNode
+    }
+
+    private fun checkDetailPageLoaded() {
+        val root = obtainTargetRootOrPause() ?: return
+        val fingerprint = try {
+            pageFingerprint(root)
+        } finally {
+            runCatching { root.recycle() }
+        }
+
+        if (fingerprint.signature != accountBrowseSourceFingerprint &&
+            fingerprint.nodeCount >= MIN_DETAIL_NODE_COUNT
+        ) {
+            if (fingerprint.signature == accountBrowseLastStableFingerprint) {
+                accountBrowseStableSamples++
+            } else {
+                accountBrowseLastStableFingerprint = fingerprint.signature
+                accountBrowseStableSamples = 1
+            }
+            if (accountBrowseStableSamples >= REQUIRED_STABLE_PAGE_SAMPLES) {
+                accountBrowseDetailFingerprint = fingerprint.signature
+                val dwell = randomBrowseDelayMs()
+                accountBrowsePhase = AccountBrowsePhase.DETAIL_DWELL
+                addLog("动态详情已确认载入；本次阅读停留 ${dwell / 1000.0} 秒")
+                scheduleAccountBrowseStep(dwell)
+                return
+            }
         } else {
-            pauseAccountBrowse("当前列表无法继续向下滚动，自动浏览已暂停")
+            accountBrowseLastStableFingerprint = ""
+            accountBrowseStableSamples = 0
+        }
+
+        if (System.currentTimeMillis() >= accountBrowseDeadlineAt) {
+            pauseAccountBrowse("等待详情页面超时，无法确认动态已经载入；没有继续执行返回操作")
+        } else {
+            scheduleAccountBrowseStep(PAGE_STATE_POLL_MS)
         }
     }
+
+    private fun returnFromDetailPage() {
+        val root = obtainTargetRootOrPause() ?: return
+        val fingerprint = try {
+            pageFingerprint(root)
+        } finally {
+            runCatching { root.recycle() }
+        }
+        if (fingerprint.signature != accountBrowseDetailFingerprint ||
+            fingerprint.signature == accountBrowseSourceFingerprint
+        ) {
+            pauseAccountBrowse("阅读期间页面结构发生变化；为避免返回到错误页面，已暂停")
+            return
+        }
+
+        if (!performGlobalAction(GLOBAL_ACTION_BACK)) {
+            pauseAccountBrowse("系统未能执行返回操作；请手动返回动态列表后重新启动")
+            return
+        }
+        accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_LIST_RETURN
+        accountBrowseDeadlineAt = System.currentTimeMillis() + LIST_RETURN_TIMEOUT_MS
+        addLog("阅读停留结束；正在确认已返回动态列表")
+        scheduleAccountBrowseStep(PAGE_STATE_POLL_MS)
+    }
+
+    private fun checkFeedListReturned() {
+        val root = obtainTargetRootOrPause() ?: return
+        val isFeedList = try {
+            isMomoDynamicFeedPage(root)
+        } finally {
+            runCatching { root.recycle() }
+        }
+
+        if (isFeedList) {
+            accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_LIST_SCROLL
+            val delay = randomBrowseDelayMs()
+            addLog("已返回陌陌动态列表；下一次滑动将在 ${delay / 1000.0} 秒后进行")
+            scheduleAccountBrowseStep(delay)
+        } else if (System.currentTimeMillis() >= accountBrowseDeadlineAt) {
+            pauseAccountBrowse("返回后没有重新识别到动态列表；请检查页面并重新启动")
+        } else {
+            scheduleAccountBrowseStep(PAGE_STATE_POLL_MS)
+        }
+    }
+
+    private fun isMomoDynamicFeedPage(root: AccessibilityNodeInfo): Boolean {
+        val packageName = runCatching { root.packageName?.toString().orEmpty() }.getOrDefault("")
+        if (packageName != MOMO_PACKAGE || !hasVisibleMomoDynamicTab(root)) return false
+
+        val scrollNode = findScrollableFeedContainer(root) ?: return false
+        return try {
+            val card = findClickableFeedCard(scrollNode)
+            if (card == null) false else {
+                runCatching { card.recycle() }
+                true
+            }
+        } finally {
+            runCatching { scrollNode.recycle() }
+        }
+    }
+
+    private fun hasVisibleMomoDynamicTab(root: AccessibilityNodeInfo): Boolean {
+        val queue = ArrayDeque<AccessibilityNodeInfo>()
+        queue.add(AccessibilityNodeInfo.obtain(root))
+        var visited = 0
+        try {
+            while (queue.isNotEmpty() && visited < PAGE_FINGERPRINT_MAX_NODES) {
+                val node = queue.removeFirst()
+                visited++
+                try {
+                    val id = runCatching { node.viewIdResourceName.orEmpty() }.getOrDefault("")
+                    val text = runCatching { node.text?.toString()?.trim().orEmpty() }.getOrDefault("")
+                    if (node.isVisibleToUser && node.isSelected &&
+                        text == MOMO_DYNAMIC_TAB_LABEL && id.endsWith(MOMO_TAB_TITLE_ID_SUFFIX)
+                    ) return true
+
+                    val childCount = runCatching { node.childCount }.getOrDefault(0)
+                    for (index in 0 until childCount) {
+                        if (visited + queue.size >= PAGE_FINGERPRINT_MAX_NODES) break
+                        val child = runCatching { node.getChild(index) }.getOrNull() ?: continue
+                        queue.add(child)
+                    }
+                } finally {
+                    runCatching { node.recycle() }
+                }
+            }
+        } finally {
+            while (queue.isNotEmpty()) runCatching { queue.removeFirst().recycle() }
+        }
+        return false
+    }
+
+    private fun pageFingerprint(root: AccessibilityNodeInfo): PageFingerprint {
+        val queue = ArrayDeque<Pair<AccessibilityNodeInfo, Int>>()
+        queue.add(AccessibilityNodeInfo.obtain(root) to 0)
+        val structure = ArrayList<String>()
+        var visibleCount = 0
+        var visited = 0
+        try {
+            while (queue.isNotEmpty() && visited < PAGE_FINGERPRINT_MAX_NODES) {
+                val (node, depth) = queue.removeFirst()
+                visited++
+                try {
+                    if (node.isVisibleToUser) {
+                        visibleCount++
+                        val className = node.className?.toString().orEmpty().substringAfterLast('.')
+                        val viewId = runCatching { node.viewIdResourceName.orEmpty() }.getOrDefault("")
+                        val bounds = Rect()
+                        runCatching { node.getBoundsInScreen(bounds) }
+                        structure.add(
+                            "$depth:$className:$viewId:${node.isClickable}:${node.isScrollable}:" +
+                                "${bounds.width() / FINGERPRINT_SIZE_BUCKET_PX}:${bounds.height() / FINGERPRINT_SIZE_BUCKET_PX}"
+                        )
+                    }
+                    val childCount = runCatching { node.childCount }.getOrDefault(0)
+                    for (index in 0 until childCount) {
+                        if (visited + queue.size >= PAGE_FINGERPRINT_MAX_NODES) break
+                        val child = runCatching { node.getChild(index) }.getOrNull() ?: continue
+                        queue.add(child to depth + 1)
+                    }
+                } finally {
+                    runCatching { node.recycle() }
+                }
+            }
+        } finally {
+            while (queue.isNotEmpty()) runCatching { queue.removeFirst().first.recycle() }
+        }
+        return PageFingerprint(
+            signature = "$visibleCount:${structure.joinToString("|").hashCode()}",
+            nodeCount = visibleCount
+        )
+    }
+
+    private fun randomBrowseDelayMs(): Long =
+        Random.nextLong(MIN_BROWSE_DELAY_MS, MAX_BROWSE_DELAY_MS + 1L)
 
     /**
      * Finds the largest visible, vertical, scrollable list in the target window.
@@ -667,7 +1125,7 @@ class FreedomAccessibilityService : AccessibilityService() {
     }
 
     override fun onInterrupt() {
-        cancelAccountBrowseStep()
+        pauseAccountBrowse("无障碍服务被系统中断；请检查系统设置后重新启动")
         addLog("无障碍服务被系统中断")
     }
 
@@ -679,6 +1137,10 @@ class FreedomAccessibilityService : AccessibilityService() {
             runCatching { unregisterReceiver(targetChangedReceiver) }
             targetReceiverRegistered = false
         }
+        if (refreshReceiverRegistered) {
+            runCatching { unregisterReceiver(refreshReceiver) }
+            refreshReceiverRegistered = false
+        }
         super.onDestroy()
     }
 
@@ -687,9 +1149,40 @@ class FreedomAccessibilityService : AccessibilityService() {
 
         private const val ACCOUNT_BROWSE_PREFS = "freedom_main_ui"
         private const val ACCOUNT_BROWSE_KEY = "keep_account_mode_enabled"
-        private const val INITIAL_BROWSE_DELAY_MS = 1_500L
-        private const val EVENT_BROWSE_DELAY_MS = 1_200L
-        private const val BROWSE_DWELL_MS = 6_000L
+        private const val KEY_BROWSE_GESTURE_DURATION_MS = "account_browse_gesture_duration_ms"
+        private const val KEY_BROWSE_GESTURE_CURVE_OFFSET = "account_browse_gesture_curve_offset"
+        private const val KEY_BROWSE_GESTURE_ACCELERATION = "account_browse_gesture_acceleration"
+        private const val MOMO_PACKAGE = "com.immomo.momo"
+        private const val MOMO_DYNAMIC_TAB_LABEL = "动态"
+        private const val MOMO_TAB_TITLE_ID_SUFFIX = "/id/tab_title"
+
+        private const val MIN_BROWSE_DELAY_MS = 3_000L
+        private const val MAX_BROWSE_DELAY_MS = 15_000L
+        private const val DETAIL_LOAD_TIMEOUT_MS = 12_000L
+        private const val LIST_RETURN_TIMEOUT_MS = 10_000L
+        private const val PAGE_STATE_POLL_MS = 350L
+        private const val SCROLL_SETTLE_MS = 850L
+        private const val REQUIRED_STABLE_PAGE_SAMPLES = 2
+        private const val MIN_DETAIL_NODE_COUNT = 12
+        private const val PAGE_FINGERPRINT_MAX_NODES = 500
+        private const val FINGERPRINT_SIZE_BUCKET_PX = 24
+
+        private const val DEFAULT_GESTURE_DURATION_MS = 620L
+        private const val MIN_GESTURE_DURATION_MS = 350L
+        private const val MAX_GESTURE_DURATION_MS = 1_200L
+        private const val DEFAULT_CURVE_OFFSET_RATIO = 0.012f
+        private const val MAX_CURVE_OFFSET_RATIO = 0.04f
+        private const val DEFAULT_GESTURE_ACCELERATION = 1.8f
+        private const val MIN_GESTURE_ACCELERATION = 1.0f
+        private const val MAX_GESTURE_ACCELERATION = 3.0f
+        private const val MIN_GESTURE_WIDTH_PX = 220
+        private const val MIN_GESTURE_HEIGHT_PX = 300
+        private const val SCROLL_START_FRACTION = 0.78f
+        private const val SCROLL_END_FRACTION = 0.32f
+        private const val GESTURE_PATH_STEPS = 32
+        private const val MIN_FEED_CARD_WIDTH_RATIO = 0.75f
+        private const val MIN_FEED_CARD_HEIGHT_RATIO = 0.18f
+
         private const val MIN_LIST_WIDTH_RATIO = 0.58f
         private const val MIN_LIST_HEIGHT_RATIO = 0.28f
         private const val MIN_COMPOSER_WIDTH_RATIO = 0.35f
