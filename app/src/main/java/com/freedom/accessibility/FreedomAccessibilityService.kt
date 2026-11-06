@@ -8,11 +8,13 @@ import android.content.IntentFilter
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.provider.Settings
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import com.freedom.data.MonitorActions
 import com.freedom.data.MonitorStore
 import com.freedom.overlay.MonitorOverlay
+import com.freedom.stability.MonitorKeepAliveService
 import java.text.SimpleDateFormat
 import java.util.ArrayDeque
 import java.util.Date
@@ -51,6 +53,32 @@ class FreedomAccessibilityService : AccessibilityService() {
         }
         applyTargetPackageFilter()
         addLog("无障碍服务已连接；当前仅接收指定目标应用的事件")
+
+        // A persisted run request is restored only after Android has rebound this service.
+        if (MonitorStore.isRunning(this)) {
+            if (!Settings.canDrawOverlays(this)) {
+                MonitorStore.setRunning(this, false)
+                MonitorKeepAliveService.stop(this)
+                MonitorStore.addLog(this, "恢复监听失败：悬浮窗授权已失效，请重新授权后启动")
+            } else {
+                if (MonitorStore.isOverlayEnabled(this)) {
+                    MonitorOverlay.show(this)
+                }
+                if (MonitorStore.isKeepAliveEnabled(this) && MonitorStore.isOverlayEnabled(this)) {
+                    // Android 15 background FGS starts require a visible overlay for the SYSTEM_ALERT_WINDOW exemption.
+                    // The overlay is attached above before attempting to restore the foreground companion.
+                    mainHandler.postDelayed({
+                        if (MonitorStore.isRunning(this) &&
+                            MonitorStore.isKeepAliveEnabled(this) &&
+                            MonitorStore.isOverlayEnabled(this) &&
+                            Settings.canDrawOverlays(this)) {
+                            MonitorKeepAliveService.start(this)
+                        }
+                    }, 500L)
+                }
+            }
+        }
+        refreshViews()
     }
 
     private fun applyTargetPackageFilter() {
@@ -65,6 +93,13 @@ class FreedomAccessibilityService : AccessibilityService() {
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event == null || !MonitorStore.isRunning(this)) return
+        if (!Settings.canDrawOverlays(this)) {
+            MonitorStore.setRunning(this, false)
+            MonitorStore.addLog(this, "监听已暂停：悬浮窗授权已撤销")
+            MonitorKeepAliveService.stop(this)
+            refreshViews()
+            return
+        }
 
         val targetPackage = MonitorStore.targetPackage(this)
         val eventPackage = event.packageName?.toString().orEmpty()

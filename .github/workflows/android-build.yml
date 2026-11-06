@@ -38,6 +38,16 @@ jobs:
         with:
           gradle-version: "8.9"
 
+      - name: Validate Android resources
+        run: |
+          python3 - <<'PY'
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+          for path in Path("app/src/main").rglob("*.xml"):
+              ET.parse(path)
+              print(f"XML OK: {path}")
+          PY
+
       - name: Build debug APK
         run: gradle --no-daemon clean assembleDebug
 
