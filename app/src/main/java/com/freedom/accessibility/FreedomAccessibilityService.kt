@@ -126,14 +126,21 @@ class FreedomAccessibilityService : AccessibilityService() {
             .orEmpty()
         MonitorStore.updateAppPage(this, app = appLabel, page = pageHint)
 
-        val classLabel = chineseClass(className.substringAfterLast('.'))
-        val details = buildList {
-            if (classLabel.isNotBlank()) add("控件=$classLabel")
-            if (className.isNotBlank()) add("原始类名=$className")
-            if (content.isNotBlank()) add("内容=$content")
-            if (description.isNotBlank()) add("描述=$description")
+        val friendlyEvent = friendlyEventDescription(
+            eventType = event.eventType,
+            className = className,
+            content = content,
+            description = description
+        )
+        val technicalDetails = buildList {
+            add("原始事件名=$rawEventName")
+            add("事件类型值=${event.eventType}")
+            add("来源应用=$eventPackage")
+            if (className.isNotBlank()) add("原始控件类名=$className")
+            if (content.isNotBlank()) add("事件文本=$content")
+            if (description.isNotBlank()) add("内容描述=$description")
         }.joinToString("；")
-        addLog("${eventLabel(event.eventType)} [$rawEventName]" + if (details.isNotBlank()) "：$details" else "")
+        addLog("$friendlyEvent$LOG_DETAIL_SEPARATOR$technicalDetails")
 
         // Scan once shortly after the latest event, not once for every event in a burst.
         mainHandler.removeCallbacks(scanRunnable)
@@ -332,6 +339,102 @@ class FreedomAccessibilityService : AccessibilityService() {
         else -> "无障碍事件"
     }
 
+    /** Convert technical accessibility events into a plain-language event summary. */
+    private fun friendlyEventDescription(
+        eventType: Int,
+        className: String,
+        content: String,
+        description: String
+    ): String {
+        val rawClass = className.substringAfterLast('.')
+        val area = when (rawClass) {
+            "RecyclerView" -> "内容列表"
+            "ScrollView", "HorizontalScrollView" -> "可滚动区域"
+            "EditText" -> "文字输入框"
+            "TextView" -> "文字区域"
+            "Button", "ImageButton" -> "按钮区域"
+            "ImageView" -> "图片区域"
+            "WebView" -> "网页内容区域"
+            "ViewPager", "ViewPager2" -> "分页区域"
+            "CheckBox", "RadioButton", "Switch" -> "选项控件"
+            "" -> "当前界面"
+            else -> "界面控件"
+        }
+
+        val title: String
+        val explanation: String
+        when (eventType) {
+            AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED -> {
+                title = "页面内容更新"
+                explanation = "这个区域的内容或结构发生了变化，可能是列表刷新、内容加载或项目更新。"
+            }
+            AccessibilityEvent.TYPE_VIEW_SCROLLED -> {
+                title = if (rawClass == "RecyclerView") "列表滚动" else "页面滚动"
+                explanation = if (rawClass == "RecyclerView") {
+                    "检测到内容列表的滚动位置或可见项目发生变化。"
+                } else {
+                    "检测到可滚动区域的位置或可见内容发生变化。"
+                }
+            }
+            AccessibilityEvent.TYPE_VIEW_CLICKED -> {
+                title = "控件点击"
+                explanation = "系统报告这个界面控件发生了一次点击事件。"
+            }
+            AccessibilityEvent.TYPE_VIEW_LONG_CLICKED -> {
+                title = "控件长按"
+                explanation = "系统报告这个界面控件发生了一次长按事件。"
+            }
+            AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED -> {
+                title = "文字内容变化"
+                explanation = "一个文字控件中的内容发生了变化。"
+            }
+            AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED -> {
+                title = "页面或窗口切换"
+                explanation = "当前应用的窗口或页面状态发生了变化。"
+            }
+            AccessibilityEvent.TYPE_VIEW_SELECTED -> {
+                title = "选项状态变化"
+                explanation = "一个界面控件报告了选中状态变化。"
+            }
+            AccessibilityEvent.TYPE_VIEW_FOCUSED -> {
+                title = "控件获得焦点"
+                explanation = "输入焦点或键盘焦点移动到了这个控件。"
+            }
+            AccessibilityEvent.TYPE_VIEW_TEXT_SELECTION_CHANGED -> {
+                title = "文字选区变化"
+                explanation = "文字控件中的选中范围发生了变化。"
+            }
+            AccessibilityEvent.TYPE_NOTIFICATION_STATE_CHANGED -> {
+                title = "通知内容变化"
+                explanation = "系统报告目标应用的通知状态发生了变化。"
+            }
+            AccessibilityEvent.TYPE_WINDOWS_CHANGED -> {
+                title = "应用窗口变化"
+                explanation = "系统报告当前应用相关窗口发生了变化。"
+            }
+            else -> {
+                title = eventLabel(eventType)
+                explanation = "系统检测到一个界面辅助事件；详细类型可在技术详情中查看。"
+            }
+        }
+
+        val relatedText = sequenceOf(content, description)
+            .firstOrNull { it.isNotBlank() }
+            ?.take(100)
+
+        return buildString {
+            append(title)
+            append("\n操作区域：")
+            append(area)
+            append("\n说明：")
+            append(explanation)
+            if (!relatedText.isNullOrBlank()) {
+                append("\n相关文字：")
+                append(relatedText)
+            }
+        }
+    }
+
     private fun chineseClass(rawClass: String): String = when (rawClass) {
         "FrameLayout" -> "帧布局容器"
         "LinearLayout" -> "线性布局"
@@ -371,5 +474,6 @@ class FreedomAccessibilityService : AccessibilityService() {
 
     companion object {
         private const val SCAN_DEBOUNCE_MS = 350L
+        private const val LOG_DETAIL_SEPARATOR = "\u001F"
     }
 }

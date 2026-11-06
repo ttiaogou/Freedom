@@ -36,6 +36,8 @@ object MonitorOverlay {
     private var pageView: TextView? = null
     private var eventLabelView: TextView? = null
     private var eventView: TextView? = null
+    private var technicalDetailsButton: Button? = null
+    private var showTechnicalDetails = false
     private var nodeView: TextView? = null
     private var contentContainer: LinearLayout? = null
     private var scrollView: ScrollView? = null
@@ -58,6 +60,7 @@ object MonitorOverlay {
         val wm = appContext.getSystemService(Context.WINDOW_SERVICE) as? WindowManager ?: return false
         windowManager = wm
         expanded = false
+        showTechnicalDetails = false
 
         val outer = LinearLayout(appContext).apply {
             orientation = LinearLayout.VERTICAL
@@ -148,11 +151,33 @@ object MonitorOverlay {
         val eventLabel = label(appContext, "实时事件（最近 12 条）")
         eventLabelView = eventLabel
 
+        val technicalToggle = Button(appContext).apply {
+            text = "查看技术详情"
+            textSize = 10f
+            isAllCaps = false
+            minHeight = dp(appContext, 28)
+            minimumHeight = dp(appContext, 28)
+            setPadding(dp(appContext, 5), 0, dp(appContext, 5), 0)
+            setOnClickListener {
+                showTechnicalDetails = !showTechnicalDetails
+                text = if (showTechnicalDetails) "收起技术详情" else "查看技术详情"
+                update(appContext)
+            }
+        }
+        technicalDetailsButton = technicalToggle
+
+        val eventHeader = LinearLayout(appContext).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            addView(eventLabel, LinearLayout.LayoutParams(0, -2, 1f))
+            addView(technicalToggle, LinearLayout.LayoutParams(-2, dp(appContext, 30)))
+        }
+
         val events = sectionText(appContext, 10f, 0xFF283244.toInt()).apply {
-            typeface = Typeface.MONOSPACE
+            typeface = Typeface.DEFAULT
         }
         eventView = events
-        content.addView(eventLabel)
+        content.addView(eventHeader)
         content.addView(events)
         content.addView(divider(appContext))
         content.addView(label(appContext, "节点扫描预览"))
@@ -366,11 +391,14 @@ object MonitorOverlay {
 
             val showLogs = MonitorStore.isFloatingLogEnabled(appContext)
             eventLabelView?.visibility = if (showLogs) View.VISIBLE else View.GONE
+            technicalDetailsButton?.visibility = if (showLogs) View.VISIBLE else View.GONE
             eventView?.visibility = if (showLogs) View.VISIBLE else View.GONE
-            eventView?.text = MonitorStore.logs(appContext)
-                .takeLast(12)
-                .joinToString("\n")
-                .ifBlank { "等待目标应用产生事件……" }
+            technicalDetailsButton?.text =
+                if (showTechnicalDetails) "收起技术详情" else "查看技术详情"
+            eventView?.text = formatLogLines(
+                MonitorStore.logs(appContext).takeLast(12),
+                showTechnicalDetails
+            ).ifBlank { "等待目标应用产生事件……" }
 
             nodeView?.text = buildString {
                 if (snapshot.nodes.isEmpty()) {
@@ -398,6 +426,8 @@ object MonitorOverlay {
             pageView = null
             eventLabelView = null
             eventView = null
+            technicalDetailsButton = null
+            showTechnicalDetails = false
             nodeView = null
             contentContainer = null
             scrollView = null
@@ -407,6 +437,75 @@ object MonitorOverlay {
         }
     }
 
+
+    private fun formatLogLines(lines: List<String>, includeTechnicalDetails: Boolean): String =
+        lines.joinToString("\n") { line -> formatLogLine(line, includeTechnicalDetails) }
+
+    private fun formatLogLine(line: String, includeTechnicalDetails: Boolean): String {
+        val separatorIndex = line.indexOf(LOG_DETAIL_SEPARATOR)
+        if (separatorIndex >= 0) {
+            val summary = line.substring(0, separatorIndex).trimEnd()
+            val technical = line.substring(separatorIndex + 1).trim()
+            return if (includeTechnicalDetails && technical.isNotBlank()) {
+                "$summary\n  技术详情：$technical"
+            } else {
+                summary
+            }
+        }
+        return if (includeTechnicalDetails) line else formatLegacyEventLine(line)
+    }
+
+    /** Convert previously stored v1 event strings too, so old history remains readable after upgrade. */
+    private fun formatLegacyEventLine(line: String): String {
+        val type = Regex("\\[(TYPE_[A-Z0-9_]+)\\]").find(line)?.groupValues?.get(1)
+            ?: return line
+        val className = Regex("原始类名=([^；]+)").find(line)?.groupValues?.get(1)?.trim().orEmpty()
+        val simpleClass = className.substringAfterLast('.')
+        val area = when (simpleClass) {
+            "RecyclerView" -> "内容列表"
+            "ScrollView", "HorizontalScrollView" -> "可滚动区域"
+            "EditText" -> "文字输入框"
+            "TextView" -> "文字区域"
+            "Button", "ImageButton" -> "按钮区域"
+            "ImageView" -> "图片区域"
+            "WebView" -> "网页内容区域"
+            "ViewPager", "ViewPager2" -> "分页区域"
+            "CheckBox", "RadioButton", "Switch" -> "选项控件"
+            else -> "界面区域"
+        }
+        val title = when (type) {
+            "TYPE_WINDOW_CONTENT_CHANGED" -> "页面内容更新"
+            "TYPE_VIEW_SCROLLED" -> if (simpleClass == "RecyclerView") "列表滚动" else "页面滚动"
+            "TYPE_VIEW_CLICKED" -> "控件点击"
+            "TYPE_VIEW_LONG_CLICKED" -> "控件长按"
+            "TYPE_VIEW_TEXT_CHANGED" -> "文字内容变化"
+            "TYPE_WINDOW_STATE_CHANGED" -> "页面或窗口切换"
+            "TYPE_VIEW_SELECTED" -> "选项状态变化"
+            "TYPE_VIEW_FOCUSED" -> "控件获得焦点"
+            "TYPE_VIEW_TEXT_SELECTION_CHANGED" -> "文字选区变化"
+            "TYPE_NOTIFICATION_STATE_CHANGED" -> "通知内容变化"
+            "TYPE_WINDOWS_CHANGED" -> "应用窗口变化"
+            else -> "界面事件"
+        }
+        val explanation = when (type) {
+            "TYPE_WINDOW_CONTENT_CHANGED" -> "这个区域的内容或结构发生了变化，可能是列表刷新、内容加载或项目更新。"
+            "TYPE_VIEW_SCROLLED" -> if (simpleClass == "RecyclerView") "检测到内容列表的滚动位置或可见项目发生变化。" else "检测到可滚动区域的位置或可见内容发生变化。"
+            "TYPE_VIEW_CLICKED" -> "系统报告这个界面控件发生了一次点击事件。"
+            "TYPE_VIEW_LONG_CLICKED" -> "系统报告这个界面控件发生了一次长按事件。"
+            "TYPE_VIEW_TEXT_CHANGED" -> "一个文字控件中的内容发生了变化。"
+            "TYPE_WINDOW_STATE_CHANGED" -> "当前应用的窗口或页面状态发生了变化。"
+            else -> "系统检测到界面状态变化；详细类型可在技术详情中查看。"
+        }
+        val time = Regex("^\\d{2}:\\d{2}:\\d{2}\\.\\d{3}").find(line)?.value.orEmpty()
+        val relatedText = Regex("(?:内容|描述)=([^；]+)").find(line)?.groupValues?.get(1)?.trim()
+        return buildString {
+            if (time.isNotBlank()) append(time).append("  ")
+            append(title)
+            append("\n操作区域：").append(area)
+            append("\n说明：").append(explanation)
+            if (!relatedText.isNullOrBlank()) append("\n相关文字：").append(relatedText.take(100))
+        }
+    }
 
     private fun isAccessibilityEnabled(context: Context): Boolean {
         val expected = ComponentName(context, FreedomAccessibilityService::class.java)
@@ -455,4 +554,6 @@ object MonitorOverlay {
 
     private fun timestamp(): String =
         java.text.SimpleDateFormat("HH:mm:ss.SSS", java.util.Locale.getDefault()).format(java.util.Date())
+
+    private const val LOG_DETAIL_SEPARATOR = "\u001F"
 }
