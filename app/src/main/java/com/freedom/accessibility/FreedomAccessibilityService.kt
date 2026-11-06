@@ -6,14 +6,20 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.graphics.Color
 import android.graphics.Path
 import android.graphics.Rect
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
+import android.view.Gravity
+import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import android.widget.TextView
 import com.freedom.data.MonitorActions
 import com.freedom.data.MonitorStore
 import com.freedom.overlay.MonitorOverlay
@@ -37,6 +43,8 @@ class FreedomAccessibilityService : AccessibilityService() {
     // Read the existing main-screen checkbox without changing its storage key.
     private enum class AccountBrowsePhase {
         IDLE,
+        WAIT_FOR_FEED_STABLE,
+        FIRST_SWIPE_COUNTDOWN,
         WAIT_FOR_LIST_SCROLL,
         WAIT_FOR_SCROLL_SETTLE,
         WAIT_FOR_DETAIL_LOAD,
@@ -69,6 +77,10 @@ class FreedomAccessibilityService : AccessibilityService() {
     private var accountBrowseScrollEventSeen = false
     private var accountBrowseInitialSwipeCompleted = false
     private var accountBrowseFallbackScrollAttempted = false
+    private var accountBrowseSourceSnapshot = ""
+    private var accountBrowseCountdownRemaining = 0
+    private var firstSwipeCountdownWindow: WindowManager? = null
+    private var firstSwipeCountdownView: TextView? = null
     private var refreshReceiverRegistered = false
 
     private val targetChangedReceiver = object : BroadcastReceiver() {
@@ -301,10 +313,12 @@ class FreedomAccessibilityService : AccessibilityService() {
         runCatching { root.recycle() }
         if (!isTargetForeground) return
 
-        accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_LIST_SCROLL
-        val delay = randomBrowseDelayMs()
-        addLog("动态浏览已启动；首次滑动将在 ${delay / 1000.0} 秒后进行")
-        scheduleAccountBrowseStep(delay)
+        accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_FEED_STABLE
+        accountBrowseDeadlineAt = System.currentTimeMillis() + INITIAL_FEED_STABILITY_TIMEOUT_MS
+        accountBrowseLastStableFingerprint = ""
+        accountBrowseStableSamples = 0
+        addLog("已检测到陌陌进入前台；正在等待动态列表稳定，确认后会显示 3 秒倒计时")
+        scheduleAccountBrowseStep(PAGE_STATE_POLL_MS)
     }
 
     private fun scheduleAccountBrowseStep(delayMs: Long) {
@@ -327,6 +341,7 @@ class FreedomAccessibilityService : AccessibilityService() {
         accountBrowsePauseReason = ""
         accountBrowseDeadlineAt = 0L
         accountBrowseSourceFingerprint = ""
+        accountBrowseSourceSnapshot = ""
         accountBrowseDetailFingerprint = ""
         accountBrowseLastStableFingerprint = ""
         accountBrowseStableSamples = 0
@@ -335,12 +350,16 @@ class FreedomAccessibilityService : AccessibilityService() {
         accountBrowseScrollEventSeen = false
         accountBrowseInitialSwipeCompleted = false
         accountBrowseFallbackScrollAttempted = false
+        accountBrowseCountdownRemaining = 0
+        hideFirstSwipeCountdown()
     }
 
     private fun pauseAccountBrowse(reason: String) {
         mainHandler.removeCallbacks(accountBrowseRunnable)
         accountBrowseStepPending = false
         accountBrowseGestureInFlight = false
+        accountBrowseCountdownRemaining = 0
+        hideFirstSwipeCountdown()
         accountBrowsePhase = AccountBrowsePhase.PAUSED
         accountBrowseDeadlineAt = 0L
         if (accountBrowsePauseReason != reason) {
@@ -359,6 +378,8 @@ class FreedomAccessibilityService : AccessibilityService() {
         when (accountBrowsePhase) {
             AccountBrowsePhase.IDLE,
             AccountBrowsePhase.PAUSED -> return
+            AccountBrowsePhase.WAIT_FOR_FEED_STABLE -> waitForMomoFeedStable()
+            AccountBrowsePhase.FIRST_SWIPE_COUNTDOWN -> runFirstSwipeCountdown()
             AccountBrowsePhase.WAIT_FOR_LIST_SCROLL -> performFeedScroll()
             AccountBrowsePhase.WAIT_FOR_SCROLL_SETTLE -> verifyInitialSwipe()
             AccountBrowsePhase.WAIT_FOR_DETAIL_LOAD -> checkDetailPageLoaded()
@@ -366,6 +387,151 @@ class FreedomAccessibilityService : AccessibilityService() {
             AccountBrowsePhase.WAIT_FOR_LIST_RETURN -> checkFeedListReturned()
         }
     }
+
+    /** Wait until the actual Dynamic tab and its scrollable feed are visible and stable. */
+    private fun waitForMomoFeedStable() {
+        val root = runCatching { rootInActiveWindow }.getOrNull()
+        if (root == null) {
+            scheduleOrTimeoutFeedStability()
+            return
+        }
+
+        val activePackage = runCatching { root.packageName?.toString().orEmpty() }.getOrDefault("")
+        if (activePackage != MOMO_PACKAGE) {
+            runCatching { root.recycle() }
+            accountBrowseLastStableFingerprint = ""
+            accountBrowseStableSamples = 0
+            scheduleOrTimeoutFeedStability()
+            return
+        }
+
+        val fingerprint = try {
+            if (isMomoDynamicFeedPage(root)) pageFingerprint(root) else null
+        } finally {
+            runCatching { root.recycle() }
+        }
+
+        if (fingerprint == null) {
+            accountBrowseLastStableFingerprint = ""
+            accountBrowseStableSamples = 0
+        } else if (fingerprint.signature == accountBrowseLastStableFingerprint) {
+            accountBrowseStableSamples++
+        } else {
+            accountBrowseLastStableFingerprint = fingerprint.signature
+            accountBrowseStableSamples = 1
+        }
+
+        if (accountBrowseStableSamples >= REQUIRED_STABLE_FEED_SAMPLES) {
+            accountBrowsePhase = AccountBrowsePhase.FIRST_SWIPE_COUNTDOWN
+            accountBrowseCountdownRemaining = FIRST_SWIPE_COUNTDOWN_SECONDS
+            addLog("已连续确认陌陌动态列表稳定 ${REQUIRED_STABLE_FEED_SAMPLES} 次；现在开始首次滑动倒计时")
+            if (!showFirstSwipeCountdown(accountBrowseCountdownRemaining)) {
+                pauseAccountBrowse("无法显示首次滑动倒计时提示；为避免无提示操作，已暂停")
+                return
+            }
+            addLog("首次滑动倒计时：${accountBrowseCountdownRemaining} 秒")
+            scheduleAccountBrowseStep(FIRST_SWIPE_COUNTDOWN_STEP_MS)
+            return
+        }
+
+        scheduleOrTimeoutFeedStability()
+    }
+
+    private fun scheduleOrTimeoutFeedStability() {
+        if (System.currentTimeMillis() >= accountBrowseDeadlineAt) {
+            pauseAccountBrowse("等待陌陌动态列表稳定超时；没有执行首次滑动，请确认已进入动态页面")
+        } else {
+            scheduleAccountBrowseStep(PAGE_STATE_POLL_MS)
+        }
+    }
+
+    /** Keep the user informed for three seconds, and re-check the feed before dispatch. */
+    private fun runFirstSwipeCountdown() {
+        val root = obtainTargetRootOrPause() ?: return
+        val isFeed = try {
+            isMomoDynamicFeedPage(root)
+        } finally {
+            runCatching { root.recycle() }
+        }
+        if (!isFeed) {
+            pauseAccountBrowse("倒计时期间动态列表状态发生变化；已取消首次滑动")
+            return
+        }
+
+        if (accountBrowseCountdownRemaining > 1) {
+            accountBrowseCountdownRemaining--
+            if (!showFirstSwipeCountdown(accountBrowseCountdownRemaining)) {
+                pauseAccountBrowse("首次滑动倒计时提示中断；已取消首次滑动")
+                return
+            }
+            addLog("首次滑动倒计时：${accountBrowseCountdownRemaining} 秒")
+            scheduleAccountBrowseStep(FIRST_SWIPE_COUNTDOWN_STEP_MS)
+            return
+        }
+
+        accountBrowseCountdownRemaining = 0
+        hideFirstSwipeCountdown()
+        accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_LIST_SCROLL
+        performFeedScroll()
+    }
+
+    /** Use a non-touchable accessibility overlay so the countdown remains visible over Momo. */
+    private fun showFirstSwipeCountdown(seconds: Int): Boolean {
+        val existing = firstSwipeCountdownView
+        if (existing != null) {
+            existing.text = "首次滑动倒计时\n$seconds\n请观察动态列表是否移动"
+            return true
+        }
+
+        val wm = runCatching {
+            getSystemService(WINDOW_SERVICE) as? WindowManager
+        }.getOrNull() ?: return false
+        val density = resources.displayMetrics.density
+        val view = TextView(this).apply {
+            text = "首次滑动倒计时\n$seconds\n请观察动态列表是否移动"
+            textSize = 18f
+            setTextColor(Color.WHITE)
+            setTypeface(typeface, Typeface.BOLD)
+            gravity = Gravity.CENTER
+            setPadding(dp(22), dp(16), dp(22), dp(16))
+            background = GradientDrawable().apply {
+                setColor(0xE6293548.toInt())
+                cornerRadius = 16f * density
+                setStroke(dp(1), 0xFF9AA8BC.toInt())
+            }
+        }
+        val params = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            android.graphics.PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+            y = dp(110)
+        }
+
+        return runCatching {
+            wm.addView(view, params)
+            firstSwipeCountdownWindow = wm
+            firstSwipeCountdownView = view
+            true
+        }.getOrDefault(false)
+    }
+
+    private fun hideFirstSwipeCountdown() {
+        val view = firstSwipeCountdownView
+        if (view != null) {
+            runCatching { firstSwipeCountdownWindow?.removeView(view) }
+        }
+        firstSwipeCountdownView = null
+        firstSwipeCountdownWindow = null
+    }
+
+    private fun dp(value: Int): Int =
+        (value * resources.displayMetrics.density + 0.5f).toInt()
 
     private fun obtainTargetRootOrPause(): AccessibilityNodeInfo? {
         val root = runCatching { rootInActiveWindow }.getOrNull()
@@ -388,7 +554,12 @@ class FreedomAccessibilityService : AccessibilityService() {
      */
     private fun performFeedScroll() {
         val root = obtainTargetRootOrPause() ?: return
-        runCatching { root.recycle() }
+        accountBrowseSourceSnapshot = try {
+            captureVisibleFeedNodeSnapshot(root)
+        } finally {
+            runCatching { root.recycle() }
+        }
+        addLog("首次滑动前可见节点快照：${accountBrowseSourceSnapshot.ifBlank { "未提取到可见文字节点" }}")
 
         val bounds = screenSwipeBounds()
         if (bounds.width() < MIN_GESTURE_WIDTH_PX || bounds.height() < MIN_GESTURE_HEIGHT_PX) {
@@ -406,9 +577,14 @@ class FreedomAccessibilityService : AccessibilityService() {
         accountBrowseScrollEventSeen = false
         accountBrowseFallbackScrollAttempted = false
         accountBrowseGestureInFlight = true
+        val startX = bounds.centerX()
+        val startY = (bounds.top + bounds.height() * SCROLL_START_FRACTION).toInt()
+        val endX = bounds.centerX()
+        val endY = (bounds.top + bounds.height() * SCROLL_END_FRACTION).toInt()
         addLog(
-            "首次坐标滑动开始：区域 ${bounds.width()}×${bounds.height()}，" +
-                "持续 ${profile.durationMs} 毫秒；本次不进行控件或动态卡片识别"
+            "首次坐标滑动开始：起点 ($startX,$startY)，终点 ($endX,$endY)，" +
+                "屏幕区域 ${bounds.width()}×${bounds.height()}，持续 ${profile.durationMs} 毫秒；" +
+                "本次不进行动态卡片识别"
         )
 
         val accepted = runCatching {
@@ -431,6 +607,7 @@ class FreedomAccessibilityService : AccessibilityService() {
             }, mainHandler)
         }.getOrDefault(false)
 
+        addLog("dispatchGesture 返回：accepted=$accepted")
         if (!accepted) {
             accountBrowseGestureInFlight = false
             pauseAccountBrowse("Android 未接受首次屏幕滑动手势；未执行节点滚动备用操作")
@@ -451,13 +628,95 @@ class FreedomAccessibilityService : AccessibilityService() {
         if (accountBrowsePhase != AccountBrowsePhase.WAIT_FOR_SCROLL_SETTLE) return
         accountBrowseInitialSwipeCompleted = true
 
+        val root = runCatching { rootInActiveWindow }.getOrNull()
+        val afterSnapshot = if (root == null) {
+            ""
+        } else {
+            try {
+                if (runCatching { root.packageName?.toString().orEmpty() }.getOrDefault("") == MOMO_PACKAGE) {
+                    captureVisibleFeedNodeSnapshot(root)
+                } else {
+                    ""
+                }
+            } finally {
+                runCatching { root.recycle() }
+            }
+        }
+        addLog("首次滑动后可见节点快照：${afterSnapshot.ifBlank { "当前无法提取目标页面节点" }}")
+        val snapshotsDiffer = accountBrowseSourceSnapshot.isNotBlank() &&
+            afterSnapshot.isNotBlank() && accountBrowseSourceSnapshot != afterSnapshot
+
         if (accountBrowseScrollEventSeen) {
             addLog("首次滑动结果：已收到目标应用 TYPE_VIEW_SCROLLED 事件")
+        } else {
+            addLog("首次滑动结果：手势回调已完成，但未收到 TYPE_VIEW_SCROLLED 事件")
+        }
+        when {
+            afterSnapshot.isBlank() -> addLog("前后节点快照对比：滑动后快照不可用，无法比较")
+            snapshotsDiffer -> addLog("前后节点快照对比：可见节点文字或位置发生变化；这是辅助迹象，仍以实际画面确认是否滚动")
+            else -> addLog("前后节点快照对比：未发现明显变化；这不能单独证明列表没有移动")
+        }
+
+        if (accountBrowseScrollEventSeen) {
             pauseAccountBrowse("首次滑动已完成并记录；本阶段到此结束，尚未启动动态卡片点击")
         } else {
-            addLog("首次滑动结果：手势回调已完成，但未收到 TYPE_VIEW_SCROLLED 事件；无法确认列表是否实际移动")
-            pauseAccountBrowse("首次滑动结果待人工确认；请检查画面是否发生移动后再重新启动")
+            pauseAccountBrowse("首次滑动结果待人工确认；请结合画面和前后节点快照确认后再重新启动")
         }
+    }
+
+    /** Capture a small, readable sample of visible text nodes and their screen positions. */
+    private fun captureVisibleFeedNodeSnapshot(root: AccessibilityNodeInfo): String {
+        val queue = ArrayDeque<AccessibilityNodeInfo>()
+        queue.add(AccessibilityNodeInfo.obtain(root))
+        val lines = ArrayList<String>(SNAPSHOT_MAX_TEXT_NODES)
+        var visited = 0
+        val screenHeight = resources.displayMetrics.heightPixels
+        try {
+            while (queue.isNotEmpty() && visited < SNAPSHOT_MAX_NODES &&
+                lines.size < SNAPSHOT_MAX_TEXT_NODES
+            ) {
+                val node = queue.removeFirst()
+                visited++
+                try {
+                    if (runCatching { node.isVisibleToUser }.getOrDefault(false)) {
+                        val bounds = Rect()
+                        runCatching { node.getBoundsInScreen(bounds) }
+                        val text = runCatching { node.text?.toString().orEmpty().trim() }
+                            .getOrDefault("")
+                        val description = runCatching { node.contentDescription?.toString().orEmpty().trim() }
+                            .getOrDefault("")
+                        val content = sequenceOf(text, description)
+                            .firstOrNull { it.isNotBlank() }
+                            .orEmpty()
+                        if (content.isNotBlank() && bounds.top >= (screenHeight * SNAPSHOT_TOP_RATIO).toInt() &&
+                            bounds.top < (screenHeight * SNAPSHOT_BOTTOM_RATIO).toInt()
+                        ) {
+                            val nodeClass = node.className?.toString().orEmpty().substringAfterLast('.')
+                            lines.add(
+                                "$nodeClass:${content.take(SNAPSHOT_TEXT_LENGTH)}@" +
+                                    "${bounds.left},${bounds.top},${bounds.right},${bounds.bottom}"
+                            )
+                        }
+                    }
+
+                    val childCount = runCatching { node.childCount }.getOrDefault(0)
+                    for (index in 0 until childCount) {
+                        if (visited + queue.size >= SNAPSHOT_MAX_NODES ||
+                            lines.size >= SNAPSHOT_MAX_TEXT_NODES
+                        ) break
+                        val child = runCatching { node.getChild(index) }.getOrNull() ?: continue
+                        queue.add(child)
+                    }
+                } finally {
+                    runCatching { node.recycle() }
+                }
+            }
+        } finally {
+            while (queue.isNotEmpty()) {
+                runCatching { queue.removeFirst().recycle() }
+            }
+        }
+        return lines.joinToString(" | ").take(SNAPSHOT_MAX_LOG_LENGTH)
     }
 
     private fun loadScrollGestureProfile(): ScrollGestureProfile {
@@ -1196,6 +1455,7 @@ class FreedomAccessibilityService : AccessibilityService() {
         mainHandler.removeCallbacksAndMessages(null)
         scanQueued = false
         accountBrowseStepPending = false
+        hideFirstSwipeCountdown()
         if (targetReceiverRegistered) {
             runCatching { unregisterReceiver(targetChangedReceiver) }
             targetReceiverRegistered = false
@@ -1226,7 +1486,17 @@ class FreedomAccessibilityService : AccessibilityService() {
         private const val PAGE_STATE_POLL_MS = 350L
         private const val SCROLL_SETTLE_MS = 850L
         private const val MANUAL_TOUCH_RESUME_MS = 2_500L
+        private const val INITIAL_FEED_STABILITY_TIMEOUT_MS = 30_000L
+        private const val REQUIRED_STABLE_FEED_SAMPLES = 3
+        private const val FIRST_SWIPE_COUNTDOWN_SECONDS = 3
+        private const val FIRST_SWIPE_COUNTDOWN_STEP_MS = 1_000L
         private const val REQUIRED_STABLE_PAGE_SAMPLES = 2
+        private const val SNAPSHOT_MAX_NODES = 500
+        private const val SNAPSHOT_MAX_TEXT_NODES = 8
+        private const val SNAPSHOT_TEXT_LENGTH = 36
+        private const val SNAPSHOT_MAX_LOG_LENGTH = 520
+        private const val SNAPSHOT_TOP_RATIO = 0.18f
+        private const val SNAPSHOT_BOTTOM_RATIO = 0.92f
         private const val MIN_DETAIL_NODE_COUNT = 12
         private const val PAGE_FINGERPRINT_MAX_NODES = 500
         private const val FINGERPRINT_SIZE_BUCKET_PX = 24
