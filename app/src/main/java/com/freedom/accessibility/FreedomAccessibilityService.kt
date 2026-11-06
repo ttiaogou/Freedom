@@ -5,6 +5,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.graphics.Rect
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
@@ -27,6 +28,11 @@ class FreedomAccessibilityService : AccessibilityService() {
     private var scanQueued = false
     private var targetReceiverRegistered = false
 
+    // Read the existing main-screen checkbox without changing its storage key.
+    private var accountBrowseStepPending = false
+    private var accountBrowsePauseReason = ""
+    private var accountBrowseNextStepAt = 0L
+
     private val targetChangedReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             applyTargetPackageFilter()
@@ -37,6 +43,11 @@ class FreedomAccessibilityService : AccessibilityService() {
     private val scanRunnable = Runnable {
         scanQueued = false
         scanActiveWindow()
+    }
+
+    private val accountBrowseRunnable = Runnable {
+        accountBrowseStepPending = false
+        performAccountBrowseStep()
     }
 
     override fun onServiceConnected() {
@@ -78,6 +89,10 @@ class FreedomAccessibilityService : AccessibilityService() {
                 }
             }
         }
+
+        if (MonitorStore.isRunning(this) && isAccountBrowseModeEnabled()) {
+            scheduleAccountBrowseStep(INITIAL_BROWSE_DELAY_MS)
+        }
         refreshViews()
     }
 
@@ -97,6 +112,7 @@ class FreedomAccessibilityService : AccessibilityService() {
             MonitorStore.setRunning(this, false)
             MonitorStore.addLog(this, "监听已暂停：悬浮窗授权已撤销")
             MonitorKeepAliveService.stop(this)
+            cancelAccountBrowseStep()
             refreshViews()
             return
         }
@@ -146,6 +162,198 @@ class FreedomAccessibilityService : AccessibilityService() {
         mainHandler.removeCallbacks(scanRunnable)
         scanQueued = true
         mainHandler.postDelayed(scanRunnable, SCAN_DEBOUNCE_MS)
+
+        if (isAccountBrowseModeEnabled()) {
+            scheduleAccountBrowseStep()
+        } else {
+            cancelAccountBrowseStep()
+        }
+    }
+
+    /**
+     * The checkbox already present on MainActivity is the user's explicit opt-in.
+     * Keep its existing SharedPreferences file/key so no UI migration is needed.
+     */
+    private fun isAccountBrowseModeEnabled(): Boolean =
+        getSharedPreferences(ACCOUNT_BROWSE_PREFS, Context.MODE_PRIVATE)
+            .getBoolean(ACCOUNT_BROWSE_KEY, false)
+
+    private fun scheduleAccountBrowseStep(delayMs: Long = EVENT_BROWSE_DELAY_MS) {
+        if (!MonitorStore.isRunning(this) || !isAccountBrowseModeEnabled()) {
+            cancelAccountBrowseStep()
+            return
+        }
+        if (accountBrowseStepPending) return
+
+        val dwellRemaining = (accountBrowseNextStepAt - System.currentTimeMillis())
+            .coerceAtLeast(0L)
+        val actualDelay = maxOf(delayMs, dwellRemaining)
+
+        accountBrowseStepPending = true
+        mainHandler.postDelayed(accountBrowseRunnable, actualDelay)
+    }
+
+    private fun cancelAccountBrowseStep() {
+        mainHandler.removeCallbacks(accountBrowseRunnable)
+        accountBrowseStepPending = false
+        accountBrowseNextStepAt = 0L
+    }
+
+    private fun pauseAccountBrowse(reason: String) {
+        mainHandler.removeCallbacks(accountBrowseRunnable)
+        accountBrowseStepPending = false
+        accountBrowseNextStepAt = 0L
+
+        if (accountBrowsePauseReason != reason) {
+            accountBrowsePauseReason = reason
+            addLog("动态浏览已暂停：$reason")
+        }
+    }
+
+    /**
+     * Phase 1 is deliberately read-only:
+     * - operate only while the target app is the foreground window;
+     * - scroll a clearly identifiable, large vertical list using its accessibility action;
+     * - wait six seconds between successful page advances;
+     * - never click feed cards, likes, follows, comments, or message controls.
+     */
+    private fun performAccountBrowseStep() {
+        if (!MonitorStore.isRunning(this) || !isAccountBrowseModeEnabled()) {
+            cancelAccountBrowseStep()
+            return
+        }
+
+        val targetPackage = MonitorStore.targetPackage(this)
+        val root = runCatching { rootInActiveWindow }.getOrNull()
+        if (root == null) {
+            pauseAccountBrowse("暂时无法读取当前页面；请回到陌陌动态列表后继续")
+            return
+        }
+
+        val activePackage = runCatching {
+            root.packageName?.toString().orEmpty()
+        }.getOrDefault("")
+
+        if (activePackage != targetPackage) {
+            runCatching { root.recycle() }
+            pauseAccountBrowse("当前没有打开目标应用；请回到陌陌动态列表后继续")
+            return
+        }
+
+        val scrollNode = try {
+            findScrollableFeedContainer(root)
+        } finally {
+            runCatching { root.recycle() }
+        }
+
+        if (scrollNode == null) {
+            pauseAccountBrowse("没有识别到合适的动态列表；请先打开陌陌动态信息流页面")
+            return
+        }
+
+        // Set the dwell deadline before performing the action so that the resulting
+        // scroll events cannot schedule another step too early.
+        accountBrowseNextStepAt = System.currentTimeMillis() + BROWSE_DWELL_MS
+
+        val scrolled = try {
+            scrollNode.performAction(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD)
+        } catch (_: Exception) {
+            false
+        } finally {
+            runCatching { scrollNode.recycle() }
+        }
+
+        if (scrolled) {
+            accountBrowsePauseReason = ""
+            addLog("动态浏览：已向上浏览一屏，停留 ${BROWSE_DWELL_MS / 1000} 秒后再继续")
+            scheduleAccountBrowseStep(BROWSE_DWELL_MS)
+        } else {
+            pauseAccountBrowse("当前列表无法继续向下滚动，自动浏览已暂停")
+        }
+    }
+
+    /**
+     * Finds the largest visible, vertical, scrollable list in the target window.
+     * A visible bottom text-entry field is treated as a chat/composer screen and
+     * blocks automatic scrolling to avoid moving a conversation by mistake.
+     */
+    private fun findScrollableFeedContainer(
+        root: AccessibilityNodeInfo
+    ): AccessibilityNodeInfo? {
+        val queue = ArrayDeque<AccessibilityNodeInfo>()
+        queue.add(AccessibilityNodeInfo.obtain(root))
+
+        val metrics = resources.displayMetrics
+        val screenWidth = metrics.widthPixels
+        val screenHeight = metrics.heightPixels
+        val minimumWidth = (screenWidth * MIN_LIST_WIDTH_RATIO).toInt()
+        val minimumHeight = (screenHeight * MIN_LIST_HEIGHT_RATIO).toInt()
+        val minimumComposerWidth = (screenWidth * MIN_COMPOSER_WIDTH_RATIO).toInt()
+
+        var bestNode: AccessibilityNodeInfo? = null
+        var bestArea = 0L
+        var hasBottomTextEntry = false
+        var visited = 0
+
+        try {
+            while (queue.isNotEmpty() && visited < MonitorStore.MAX_NODES_PER_SCAN) {
+                val node = queue.removeFirst()
+                visited++
+
+                try {
+                    val bounds = Rect()
+                    runCatching { node.getBoundsInScreen(bounds) }
+
+                    if (node.isVisibleToUser && node.isEditable &&
+                        bounds.bottom >= (screenHeight * COMPOSER_BOTTOM_RATIO).toInt() &&
+                        bounds.width() >= minimumComposerWidth
+                    ) {
+                        hasBottomTextEntry = true
+                    }
+
+                    val className = node.className?.toString().orEmpty()
+                    val isKnownVerticalList =
+                        className.endsWith("RecyclerView") ||
+                        className.endsWith("ListView") ||
+                        className.endsWith("AbsListView") ||
+                        className.endsWith("ScrollView") ||
+                        className.endsWith("NestedScrollView") ||
+                        className.endsWith("WebView")
+
+                    if (node.isVisibleToUser && node.isScrollable && isKnownVerticalList) {
+                        val width = bounds.width()
+                        val height = bounds.height()
+                        if (width >= minimumWidth && height >= minimumHeight) {
+                            val area = width.toLong() * height.toLong()
+                            if (area > bestArea) {
+                                runCatching { bestNode?.recycle() }
+                                bestNode = AccessibilityNodeInfo.obtain(node)
+                                bestArea = area
+                            }
+                        }
+                    }
+
+                    val childCount = runCatching { node.childCount }.getOrDefault(0)
+                    for (index in 0 until childCount) {
+                        if (visited + queue.size >= MonitorStore.MAX_NODES_PER_SCAN) break
+                        val child = runCatching { node.getChild(index) }.getOrNull() ?: continue
+                        queue.add(child)
+                    }
+                } finally {
+                    runCatching { node.recycle() }
+                }
+            }
+        } finally {
+            while (queue.isNotEmpty()) {
+                runCatching { queue.removeFirst().recycle() }
+            }
+        }
+
+        if (hasBottomTextEntry) {
+            runCatching { bestNode?.recycle() }
+            return null
+        }
+        return bestNode
     }
 
     private fun scanActiveWindow() {
@@ -459,12 +667,14 @@ class FreedomAccessibilityService : AccessibilityService() {
     }
 
     override fun onInterrupt() {
+        cancelAccountBrowseStep()
         addLog("无障碍服务被系统中断")
     }
 
     override fun onDestroy() {
         mainHandler.removeCallbacksAndMessages(null)
         scanQueued = false
+        accountBrowseStepPending = false
         if (targetReceiverRegistered) {
             runCatching { unregisterReceiver(targetChangedReceiver) }
             targetReceiverRegistered = false
@@ -474,6 +684,17 @@ class FreedomAccessibilityService : AccessibilityService() {
 
     companion object {
         private const val SCAN_DEBOUNCE_MS = 350L
+
+        private const val ACCOUNT_BROWSE_PREFS = "freedom_main_ui"
+        private const val ACCOUNT_BROWSE_KEY = "keep_account_mode_enabled"
+        private const val INITIAL_BROWSE_DELAY_MS = 1_500L
+        private const val EVENT_BROWSE_DELAY_MS = 1_200L
+        private const val BROWSE_DWELL_MS = 6_000L
+        private const val MIN_LIST_WIDTH_RATIO = 0.58f
+        private const val MIN_LIST_HEIGHT_RATIO = 0.28f
+        private const val MIN_COMPOSER_WIDTH_RATIO = 0.35f
+        private const val COMPOSER_BOTTOM_RATIO = 0.62f
+
         private const val LOG_DETAIL_SEPARATOR = "\u001F"
     }
 }
