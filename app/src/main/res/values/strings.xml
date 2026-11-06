@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">Freedom</string>
+    <string name="accessibility_service_description">监听用户指定应用的界面事件，并读取系统向无障碍服务公开的节点信息。监控数据仅保存在本机。</string>
+</resources>
