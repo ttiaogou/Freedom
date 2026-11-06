@@ -66,6 +66,8 @@ class FreedomAccessibilityService : AccessibilityService() {
     private var accountBrowseStableSamples = 0
     private var accountBrowseTouchActive = false
     private var accountBrowseGestureInFlight = false
+    private var accountBrowseScrollEventSeen = false
+    private var accountBrowseFallbackScrollAttempted = false
     private var refreshReceiverRegistered = false
 
     private val targetChangedReceiver = object : BroadcastReceiver() {
@@ -96,6 +98,19 @@ class FreedomAccessibilityService : AccessibilityService() {
     private val accountBrowseRunnable = Runnable {
         accountBrowseStepPending = false
         performAccountBrowseStep()
+    }
+
+    // Resume after the user finishes navigating or interacting with the target app.
+    private val manualTouchResumeRunnable = Runnable {
+        if (!accountBrowseTouchActive && MonitorStore.isRunning(this) &&
+            isAccountBrowseModeEnabled()
+        ) {
+            accountBrowsePhase = AccountBrowsePhase.IDLE
+            accountBrowsePauseReason = ""
+            accountBrowseSourceFingerprint = ""
+            accountBrowseDetailFingerprint = ""
+            startAccountBrowseIfNeeded()
+        }
     }
 
     override fun onServiceConnected() {
@@ -183,6 +198,12 @@ class FreedomAccessibilityService : AccessibilityService() {
         val eventPackage = event.packageName?.toString().orEmpty()
         if (eventPackage != targetPackage || eventPackage == packageName) return
 
+        if (event.eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED &&
+            accountBrowsePhase == AccountBrowsePhase.WAIT_FOR_SCROLL_SETTLE
+        ) {
+            accountBrowseScrollEventSeen = true
+        }
+
         if (!isAccountBrowseModeEnabled()) {
             resetAccountBrowseSession()
         } else {
@@ -191,7 +212,8 @@ class FreedomAccessibilityService : AccessibilityService() {
                     if (accountBrowseGestureInFlight) return
                     if (!accountBrowseTouchActive) {
                         accountBrowseTouchActive = true
-                        pauseAccountBrowse("检测到手动触摸；为避免与用户操作冲突，自动浏览已暂停。重新启动运行按钮可恢复")
+                        mainHandler.removeCallbacks(manualTouchResumeRunnable)
+                        pauseAccountBrowse("检测到手动触摸；自动浏览暂时让出操作权")
                     }
                     return
                 }
@@ -199,7 +221,9 @@ class FreedomAccessibilityService : AccessibilityService() {
                     if (accountBrowseGestureInFlight) return
                     if (accountBrowseTouchActive) {
                         accountBrowseTouchActive = false
-                        addLog("手动触摸已结束；自动浏览保持暂停，重新启动运行按钮可恢复")
+                        addLog("手动触摸已结束；页面安静一段时间后自动恢复浏览")
+                        mainHandler.removeCallbacks(manualTouchResumeRunnable)
+                        mainHandler.postDelayed(manualTouchResumeRunnable, MANUAL_TOUCH_RESUME_MS)
                     }
                     return
                 }
@@ -294,6 +318,7 @@ class FreedomAccessibilityService : AccessibilityService() {
 
     private fun resetAccountBrowseSession() {
         mainHandler.removeCallbacks(accountBrowseRunnable)
+        mainHandler.removeCallbacks(manualTouchResumeRunnable)
         accountBrowseStepPending = false
         accountBrowsePhase = AccountBrowsePhase.IDLE
         accountBrowsePauseReason = ""
@@ -304,6 +329,8 @@ class FreedomAccessibilityService : AccessibilityService() {
         accountBrowseStableSamples = 0
         accountBrowseTouchActive = false
         accountBrowseGestureInFlight = false
+        accountBrowseScrollEventSeen = false
+        accountBrowseFallbackScrollAttempted = false
     }
 
     private fun pauseAccountBrowse(reason: String) {
@@ -388,6 +415,8 @@ class FreedomAccessibilityService : AccessibilityService() {
             .build()
 
         accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_SCROLL_SETTLE
+        accountBrowseScrollEventSeen = false
+        accountBrowseFallbackScrollAttempted = false
         accountBrowseGestureInFlight = true
         val accepted = runCatching {
             dispatchGesture(gesture, object : AccessibilityService.GestureResultCallback() {
@@ -411,6 +440,7 @@ class FreedomAccessibilityService : AccessibilityService() {
 
         if (!accepted) {
             accountBrowseGestureInFlight = false
+            accountBrowseFallbackScrollAttempted = true
             val fallbackScrolled = runCatching {
                 scrollNode.performAction(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD)
             }.getOrDefault(false)
@@ -469,6 +499,37 @@ class FreedomAccessibilityService : AccessibilityService() {
     }
 
     private fun openVisibleFeedCard() {
+        // dispatchGesture() can be accepted by Android without producing a real list scroll
+        // (for example, when the host view ignores injected touch). Verify the scroll event;
+        // if absent, retry once through the list's native accessibility scroll action.
+        if (!accountBrowseScrollEventSeen && !accountBrowseFallbackScrollAttempted) {
+            val fallbackRoot = obtainTargetRootOrPause() ?: return
+            val fallbackNode = try {
+                findScrollableFeedContainer(fallbackRoot)
+            } finally {
+                runCatching { fallbackRoot.recycle() }
+            }
+            if (fallbackNode == null) {
+                pauseAccountBrowse("手势没有触发列表滚动，且未找到可用的备用滚动区域")
+                return
+            }
+            val fallbackScrolled = try {
+                fallbackNode.performAction(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD)
+            } catch (_: Exception) {
+                false
+            } finally {
+                runCatching { fallbackNode.recycle() }
+            }
+            accountBrowseFallbackScrollAttempted = true
+            if (!fallbackScrolled) {
+                pauseAccountBrowse("触摸滑动和备用无障碍滚动均未能移动列表")
+                return
+            }
+            addLog("未检测到触摸滑动产生的列表滚动；已尝试系统备用滚动动作")
+            scheduleAccountBrowseStep(SCROLL_SETTLE_MS)
+            return
+        }
+
         val root = obtainTargetRootOrPause() ?: return
         if (!isMomoDynamicFeedPage(root)) {
             runCatching { root.recycle() }
@@ -643,30 +704,28 @@ class FreedomAccessibilityService : AccessibilityService() {
         val packageName = runCatching { root.packageName?.toString().orEmpty() }.getOrDefault("")
         if (packageName != MOMO_PACKAGE || !hasVisibleMomoDynamicTab(root)) return false
 
+        // Do not require a clickable card merely to establish that this is the feed.
+        // Card lookup happens after scrolling; coupling it here could block the first swipe.
         val scrollNode = findScrollableFeedContainer(root) ?: return false
-        return try {
-            val card = findClickableFeedCard(scrollNode)
-            if (card == null) false else {
-                runCatching { card.recycle() }
-                true
-            }
-        } finally {
-            runCatching { scrollNode.recycle() }
-        }
+        runCatching { scrollNode.recycle() }
+        return true
     }
 
     private fun hasVisibleMomoDynamicTab(root: AccessibilityNodeInfo): Boolean {
-        val queue = ArrayDeque<AccessibilityNodeInfo>()
-        queue.add(AccessibilityNodeInfo.obtain(root))
+        // Some tab widgets mark the container selected rather than the TextView itself.
+        // Carry selected state down the tree so the same visible tab is still recognized.
+        val queue = ArrayDeque<Pair<AccessibilityNodeInfo, Boolean>>()
+        queue.add(AccessibilityNodeInfo.obtain(root) to false)
         var visited = 0
         try {
             while (queue.isNotEmpty() && visited < PAGE_FINGERPRINT_MAX_NODES) {
-                val node = queue.removeFirst()
+                val (node, selectedInPath) = queue.removeFirst()
                 visited++
                 try {
+                    val selected = selectedInPath || node.isSelected || node.isChecked
                     val id = runCatching { node.viewIdResourceName.orEmpty() }.getOrDefault("")
                     val text = runCatching { node.text?.toString()?.trim().orEmpty() }.getOrDefault("")
-                    if (node.isVisibleToUser && node.isSelected &&
+                    if (node.isVisibleToUser && selected &&
                         text == MOMO_DYNAMIC_TAB_LABEL && id.endsWith(MOMO_TAB_TITLE_ID_SUFFIX)
                     ) return true
 
@@ -674,14 +733,16 @@ class FreedomAccessibilityService : AccessibilityService() {
                     for (index in 0 until childCount) {
                         if (visited + queue.size >= PAGE_FINGERPRINT_MAX_NODES) break
                         val child = runCatching { node.getChild(index) }.getOrNull() ?: continue
-                        queue.add(child)
+                        queue.add(child to selected)
                     }
                 } finally {
                     runCatching { node.recycle() }
                 }
             }
         } finally {
-            while (queue.isNotEmpty()) runCatching { queue.removeFirst().recycle() }
+            while (queue.isNotEmpty()) {
+                runCatching { queue.removeFirst().first.recycle() }
+            }
         }
         return false
     }
@@ -1162,6 +1223,7 @@ class FreedomAccessibilityService : AccessibilityService() {
         private const val LIST_RETURN_TIMEOUT_MS = 10_000L
         private const val PAGE_STATE_POLL_MS = 350L
         private const val SCROLL_SETTLE_MS = 850L
+        private const val MANUAL_TOUCH_RESUME_MS = 2_500L
         private const val REQUIRED_STABLE_PAGE_SAMPLES = 2
         private const val MIN_DETAIL_NODE_COUNT = 12
         private const val PAGE_FINGERPRINT_MAX_NODES = 500
