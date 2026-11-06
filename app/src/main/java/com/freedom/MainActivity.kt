@@ -18,10 +18,13 @@ import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
 import android.view.Gravity
+import android.view.View
 import android.view.ViewGroup
 import android.view.WindowInsets
 import android.widget.Button
+import android.widget.CheckBox
 import android.widget.EditText
+import android.widget.ImageButton
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.Switch
@@ -34,10 +37,10 @@ import com.freedom.overlay.MonitorOverlay
 import com.freedom.stability.MonitorKeepAliveService
 
 class MainActivity : Activity() {
-    private lateinit var statusText: TextView
-    private lateinit var targetText: TextView
-    private lateinit var logText: TextView
-    private lateinit var runButton: Button
+
+    private lateinit var heading: TextView
+    private lateinit var runButton: ImageButton
+    private lateinit var keepAccountCheckBox: CheckBox
     private var receiverRegistered = false
 
     private val refreshReceiver = object : BroadcastReceiver() {
@@ -63,8 +66,11 @@ class MainActivity : Activity() {
             }
             receiverRegistered = true
         }
-        // Stop only when a required system permission has actually been revoked.
-        if (MonitorStore.isRunning(this) && (!isAccessibilityEnabled() || !Settings.canDrawOverlays(this))) {
+
+        // Preserve the latest version's permission validation and recovery behaviour.
+        if (MonitorStore.isRunning(this) &&
+            (!isAccessibilityEnabled() || !Settings.canDrawOverlays(this))
+        ) {
             MonitorStore.setRunning(this, false)
             MonitorKeepAliveService.stop(this)
             MonitorOverlay.hide()
@@ -90,6 +96,7 @@ class MainActivity : Activity() {
         super.onPause()
     }
 
+    /** Main screen: compact header, one opt-in checkbox, and the icon-only run control. */
     private fun buildScreen() {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -98,7 +105,9 @@ class MainActivity : Activity() {
                 val topInset: Int
                 val bottomInset: Int
                 if (Build.VERSION.SDK_INT >= 30) {
-                    val bars = insets.getInsets(WindowInsets.Type.statusBars() or WindowInsets.Type.navigationBars())
+                    val bars = insets.getInsets(
+                        WindowInsets.Type.statusBars() or WindowInsets.Type.navigationBars()
+                    )
                     topInset = bars.top
                     bottomInset = bars.bottom
                 } else {
@@ -120,111 +129,75 @@ class MainActivity : Activity() {
             setPadding(dp(16), dp(8), dp(16), dp(8))
             setBackgroundColor(Color.WHITE)
         }
+
         val configButton = Button(this).apply {
             text = "☰ 配置"
             isAllCaps = false
             setOnClickListener { showConfig() }
         }
-        val heading = TextView(this).apply {
-            text = "Freedom"
-            textSize = 19f
+
+        heading = TextView(this).apply {
+            text = "未运行"
+            textSize = 23f
             typeface = Typeface.DEFAULT_BOLD
             gravity = Gravity.CENTER
             setTextColor(0xFF172033.toInt())
+            maxLines = 1
         }
+
         val recordsButton = Button(this).apply {
             text = "运行记录"
             isAllCaps = false
             setOnClickListener { showRecords() }
         }
+
         header.addView(configButton, LinearLayout.LayoutParams(0, dp(48), 1f))
         header.addView(heading, LinearLayout.LayoutParams(0, dp(48), 1.2f))
         header.addView(recordsButton, LinearLayout.LayoutParams(0, dp(48), 1f))
         root.addView(header)
 
-        val scroll = ScrollView(this).apply { isFillViewport = true }
-        val content = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(16), dp(18), dp(16), dp(18))
-        }
-        scroll.addView(content)
-
-        content.addView(TextView(this).apply {
-            text = "无障碍实时监控"
-            textSize = 25f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(0xFF172033.toInt())
-        })
-        content.addView(TextView(this).apply {
-            text = "监听指定应用的界面事件，并查看系统向无障碍服务公开的节点。"
-            textSize = 13f
-            setTextColor(0xFF697386.toInt())
-            setPadding(0, dp(6), 0, dp(16))
-        })
-
-        val statusCard = card()
-        statusCard.addView(sectionTitle("运行状态"))
-        statusText = TextView(this).apply {
-            textSize = 13f
-            setTextColor(0xFF334155.toInt())
-            setPadding(0, dp(8), 0, dp(2))
-        }
-        statusCard.addView(statusText)
-        content.addView(statusCard)
-
-        val targetCard = card()
-        targetCard.addView(sectionTitle("监控目标"))
-        targetText = TextView(this).apply {
-            textSize = 14f
-            setTextColor(0xFF172033.toInt())
-            typeface = Typeface.MONOSPACE
-            setPadding(0, dp(8), 0, dp(4))
-        }
-        targetCard.addView(targetText)
-        targetCard.addView(TextView(this).apply {
-            text = "默认目标为陌陌（com.immomo.momo），可在左上角配置中修改。"
-            textSize = 12f
-            setTextColor(0xFF778195.toInt())
-        })
-        content.addView(targetCard)
-
-        val liveCard = card()
-        liveCard.addView(sectionTitle("实时运行记录"))
-        logText = TextView(this).apply {
-            textSize = 11f
-            typeface = Typeface.MONOSPACE
-            setTextColor(0xFF263244.toInt())
-            setTextIsSelectable(true)
-            setPadding(dp(10), dp(10), dp(10), dp(10))
-            background = roundedBackground(0xFFF1F3F7.toInt(), dp(8).toFloat())
-        }
-        val logScroll = ScrollView(this).apply {
-            addView(logText)
-            isFillViewport = false
-        }
-        liveCard.addView(logScroll, LinearLayout.LayoutParams(-1, dp(250)))
-        content.addView(liveCard)
-
-        val note = TextView(this).apply {
-            text = "说明：节点数据取决于目标应用实际公开的无障碍信息。部分自绘界面、网页内容或受保护区域可能无法读取。事件监听不保证覆盖目标应用产生的每一条内部变化。所有记录仅保存在本机。"
-            textSize = 12f
-            setTextColor(0xFF778195.toInt())
-            setPadding(dp(3), dp(6), dp(3), dp(12))
-        }
-        content.addView(note)
-
-        root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
-        val bottom = LinearLayout(this).apply {
-            gravity = Gravity.END or Gravity.CENTER_VERTICAL
-            setPadding(dp(16), dp(8), dp(16), dp(12))
+        // This option is stored locally, defaults to unchecked, and does not
+        // trigger any automation until its behaviour is separately specified.
+        val optionArea = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(18), dp(10), dp(18), dp(10))
             setBackgroundColor(Color.WHITE)
         }
-        runButton = Button(this).apply {
-            isAllCaps = false
+
+        keepAccountCheckBox = CheckBox(this).apply {
+            text = "开启养号模式"
             textSize = 15f
+            setTextColor(0xFF263244.toInt())
+            isChecked = getSharedPreferences(PREFS_UI, MODE_PRIVATE)
+                .getBoolean(KEY_KEEP_ACCOUNT_MODE, false)
+            setOnCheckedChangeListener { _, checked ->
+                getSharedPreferences(PREFS_UI, MODE_PRIVATE)
+                    .edit()
+                    .putBoolean(KEY_KEEP_ACCOUNT_MODE, checked)
+                    .apply()
+            }
+        }
+        optionArea.addView(keepAccountCheckBox, LinearLayout.LayoutParams(-1, dp(44)))
+        root.addView(optionArea)
+
+        // Keep the remaining work area empty; the run control stays at the bottom.
+        root.addView(View(this), LinearLayout.LayoutParams(-1, 0, 1f))
+
+        val bottom = LinearLayout(this).apply {
+            gravity = Gravity.END or Gravity.CENTER_VERTICAL
+            setPadding(dp(16), dp(8), dp(20), dp(14))
+            setBackgroundColor(Color.WHITE)
+        }
+
+        runButton = ImageButton(this).apply {
+            setBackgroundColor(Color.TRANSPARENT)
+            scaleType = android.widget.ImageView.ScaleType.FIT_CENTER
+            contentDescription = "开始运行"
+            setPadding(dp(2), dp(2), dp(2), dp(2))
             setOnClickListener { toggleMonitoring() }
         }
-        bottom.addView(runButton, LinearLayout.LayoutParams(-2, dp(50)))
+        bottom.addView(runButton, LinearLayout.LayoutParams(dp(68), dp(68)))
         root.addView(bottom)
 
         setContentView(root)
@@ -245,7 +218,9 @@ class MainActivity : Activity() {
         if (!isAccessibilityEnabled()) {
             AlertDialog.Builder(this)
                 .setTitle("需要开启无障碍服务")
-                .setMessage("Freedom 需要通过系统无障碍服务接收目标应用的界面事件，并读取系统公开的节点信息。请在系统设置中手动开启 Freedom。")
+                .setMessage(
+                    "Freedom 需要通过系统无障碍服务接收目标应用的界面事件，并读取系统公开的节点信息。请在系统设置中手动开启 Freedom。"
+                )
                 .setPositiveButton("前往无障碍设置") { _, _ ->
                     startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
                 }
@@ -263,13 +238,20 @@ class MainActivity : Activity() {
         MonitorStore.addLog(this, timestamp() + "  监听已启动，等待目标应用事件")
 
         if (MonitorStore.isKeepAliveEnabled(this) && !MonitorKeepAliveService.start(this)) {
-            MonitorStore.addLog(this, timestamp() + "  保活服务未能启动；无障碍监听仍会按系统服务状态工作")
+            MonitorStore.addLog(
+                this,
+                timestamp() + "  保活服务未能启动；无障碍监听仍会按系统服务状态工作"
+            )
         }
 
         if (MonitorStore.isOverlayEnabled(this) && !MonitorOverlay.show(this)) {
             MonitorStore.setRunning(this, false)
             MonitorKeepAliveService.stop(this)
-            Toast.makeText(this, "悬浮窗创建失败，请检查系统悬浮窗权限", Toast.LENGTH_LONG).show()
+            Toast.makeText(
+                this,
+                "悬浮窗创建失败，请检查系统悬浮窗权限",
+                Toast.LENGTH_LONG
+            ).show()
             refreshScreen()
             return
         }
@@ -300,6 +282,7 @@ class MainActivity : Activity() {
             background = roundedBackground(0xFF16B889.toInt(), dp(12).toFloat())
         }
         top.addView(mark, LinearLayout.LayoutParams(dp(48), dp(48)))
+
         val titleBlock = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(12), 0, 0, 0)
@@ -316,6 +299,7 @@ class MainActivity : Activity() {
             })
         }
         top.addView(titleBlock, LinearLayout.LayoutParams(0, -2, 1f))
+
         val close = TextView(this).apply {
             text = "×"
             textSize = 27f
@@ -370,7 +354,8 @@ class MainActivity : Activity() {
             MonitorStore.setBootCheckEnabled(this, enabled)
             Toast.makeText(
                 this,
-                if (enabled) "已开启开机检查；厂商自启动限制仍需在系统设置中允许" else "已关闭开机检查提醒",
+                if (enabled) "已开启开机检查；厂商自启动限制仍需在系统设置中允许"
+                else "已关闭开机检查提醒",
                 Toast.LENGTH_LONG
             ).show()
         }
@@ -383,7 +368,7 @@ class MainActivity : Activity() {
 
         addConfigSection(rows, "脚本配置")
         addConfigSwitchRow(
-            rows, "◌", "悬浮按钮", "控制实时监控悬浮窗的显示", 
+            rows, "◌", "悬浮按钮", "控制实时监控悬浮窗的显示",
             MonitorStore.isOverlayEnabled(this)
         ) { enabled ->
             MonitorStore.setOverlayEnabled(this, enabled)
@@ -447,7 +432,8 @@ class MainActivity : Activity() {
             hint = "例如 com.immomo.momo"
             setText(MonitorStore.targetPackage(this@MainActivity))
             setSelection(text.length)
-            inputType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_VARIATION_URI
+            inputType = android.text.InputType.TYPE_CLASS_TEXT or
+                android.text.InputType.TYPE_TEXT_VARIATION_URI
         }
         val container = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -465,11 +451,21 @@ class MainActivity : Activity() {
             .setPositiveButton("保存目标") { _, _ ->
                 val value = input.text.toString().trim()
                 if (!PACKAGE_PATTERN.matches(value)) {
-                    Toast.makeText(this, "包名格式不正确，例如 com.immomo.momo", Toast.LENGTH_LONG).show()
+                    Toast.makeText(
+                        this,
+                        "包名格式不正确，例如 com.immomo.momo",
+                        Toast.LENGTH_LONG
+                    ).show()
                 } else {
                     MonitorStore.setTargetPackage(this, value)
-                    sendBroadcast(Intent(MonitorActions.ACTION_TARGET_CHANGED).setPackage(packageName))
-                    MonitorStore.updateAppPage(this, app = "尚未识别", page = "等待页面信息")
+                    sendBroadcast(
+                        Intent(MonitorActions.ACTION_TARGET_CHANGED).setPackage(packageName)
+                    )
+                    MonitorStore.updateAppPage(
+                        this,
+                        app = "尚未识别",
+                        page = "等待页面信息"
+                    )
                     MonitorStore.addLog(this, timestamp() + "  监控目标已设置为 $value")
                     refreshScreen()
                 }
@@ -504,8 +500,7 @@ class MainActivity : Activity() {
             setOnClickListener { action() }
         }
         row.addView(configRowIcon(icon), LinearLayout.LayoutParams(dp(38), dp(38)))
-        val texts = configRowTexts(title, subtitle)
-        row.addView(texts, LinearLayout.LayoutParams(0, -2, 1f))
+        row.addView(configRowTexts(title, subtitle), LinearLayout.LayoutParams(0, -2, 1f))
         row.addView(TextView(this).apply {
             text = actionText
             textSize = 11f
@@ -576,7 +571,11 @@ class MainActivity : Activity() {
                 )
             )
         }.onFailure {
-            Toast.makeText(this, "无法打开应用详情设置，请手动进入系统应用设置", Toast.LENGTH_LONG).show()
+            Toast.makeText(
+                this,
+                "无法打开应用详情设置，请手动进入系统应用设置",
+                Toast.LENGTH_LONG
+            ).show()
         }
     }
 
@@ -615,7 +614,10 @@ class MainActivity : Activity() {
 
     private fun requestOverlayPermission() {
         if (Build.VERSION.SDK_INT >= 23 && !Settings.canDrawOverlays(this)) {
-            val intent = Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))
+            val intent = Intent(
+                Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                Uri.parse("package:$packageName")
+            )
             startActivity(intent)
         } else {
             Toast.makeText(this, "悬浮窗权限已允许", Toast.LENGTH_SHORT).show()
@@ -631,22 +633,33 @@ class MainActivity : Activity() {
             Build.VERSION.SDK_INT >= 33 -> arrayOf(android.Manifest.permission.READ_MEDIA_IMAGES)
             else -> arrayOf(android.Manifest.permission.READ_EXTERNAL_STORAGE)
         }
-        val needed = permissions.filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
+        val needed = permissions.filter {
+            checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED
+        }
         if (needed.isEmpty()) {
-            Toast.makeText(this, "照片访问权限已满足（可能为用户选择的部分照片）", Toast.LENGTH_SHORT).show()
+            Toast.makeText(
+                this,
+                "照片访问权限已满足（可能为用户选择的部分照片）",
+                Toast.LENGTH_SHORT
+            ).show()
         } else {
             requestPermissions(needed.toTypedArray(), REQUEST_MEDIA_PERMISSION)
         }
     }
 
     @Suppress("DEPRECATION")
-    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode == REQUEST_MEDIA_PERMISSION) {
             val granted = grantResults.count { it == PackageManager.PERMISSION_GRANTED }
             Toast.makeText(
                 this,
-                if (granted > 0) "照片访问权限已授予" else "未授予照片访问权限；不影响事件监控",
+                if (granted > 0) "照片访问权限已授予"
+                else "未授予照片访问权限；不影响事件监控",
                 Toast.LENGTH_LONG
             ).show()
         }
@@ -660,32 +673,36 @@ class MainActivity : Activity() {
         ).orEmpty()
         return enabled.split(':').any { flattened ->
             val component = ComponentName.unflattenFromString(flattened)
-            component != null && component.packageName == expected.packageName &&
+            component != null &&
+                component.packageName == expected.packageName &&
                 component.className == expected.className
         }
     }
 
     private fun refreshScreen() {
-        if (!::statusText.isInitialized) return
+        if (!::heading.isInitialized) return
+
         val running = MonitorStore.isRunning(this)
         val accessibilityEnabled = isAccessibilityEnabled()
-        val overlayEnabled = Settings.canDrawOverlays(this)
-        statusText.text = buildString {
-            val serviceState = when {
-                !accessibilityEnabled -> "异常（无障碍未授权）"
-                !overlayEnabled -> "异常（悬浮窗未授权）"
-                running -> "运行中（正常）"
-                else -> "已停止"
-            }
-            append("服务状态：$serviceState")
-            val snapshot = MonitorStore.snapshot(this@MainActivity)
-            append("\n当前应用：${snapshot.app}")
-            append("\n当前页面：${snapshot.page}")
+        val overlayPermission = Settings.canDrawOverlays(this)
+
+        heading.text = when {
+            !accessibilityEnabled || !overlayPermission -> "异常"
+            running -> "运行中"
+            else -> "未运行"
         }
-        targetText.text = MonitorStore.targetPackage(this)
-        logText.text = formatLogLines(MonitorStore.logs(this).takeLast(45), false)
-            .ifBlank { "暂无运行记录" }
-        runButton.text = if (running) "■ 停止运行" else "▶ 开始运行"
+        heading.setTextColor(
+            when {
+                !accessibilityEnabled || !overlayPermission -> 0xFFD14343.toInt()
+                running -> 0xFF16A765.toInt()
+                else -> 0xFF172033.toInt()
+            }
+        )
+
+        runButton.setImageResource(
+            if (running) R.drawable.ic_run_stop else R.drawable.ic_run_start
+        )
+        runButton.contentDescription = if (running) "停止运行" else "开始运行"
     }
 
     private fun showRecords() {
@@ -728,8 +745,12 @@ class MainActivity : Activity() {
             .show()
     }
 
-    private fun formatLogLines(lines: List<String>, includeTechnicalDetails: Boolean): String =
-        lines.joinToString("\n") { line -> formatLogLine(line, includeTechnicalDetails) }
+    private fun formatLogLines(
+        lines: List<String>,
+        includeTechnicalDetails: Boolean
+    ): String = lines.joinToString("\n") { line ->
+        formatLogLine(line, includeTechnicalDetails)
+    }
 
     private fun formatLogLine(line: String, includeTechnicalDetails: Boolean): String {
         val separatorIndex = line.indexOf(LOG_DETAIL_SEPARATOR)
@@ -779,7 +800,11 @@ class MainActivity : Activity() {
         }
         val explanation = when (type) {
             "TYPE_WINDOW_CONTENT_CHANGED" -> "这个区域的内容或结构发生了变化，可能是列表刷新、内容加载或项目更新。"
-            "TYPE_VIEW_SCROLLED" -> if (simpleClass == "RecyclerView") "检测到内容列表的滚动位置或可见项目发生变化。" else "检测到可滚动区域的位置或可见内容发生变化。"
+            "TYPE_VIEW_SCROLLED" -> if (simpleClass == "RecyclerView") {
+                "检测到内容列表的滚动位置或可见项目发生变化。"
+            } else {
+                "检测到可滚动区域的位置或可见内容发生变化。"
+            }
             "TYPE_VIEW_CLICKED" -> "系统报告这个界面控件发生了一次点击事件。"
             "TYPE_VIEW_LONG_CLICKED" -> "系统报告这个界面控件发生了一次长按事件。"
             "TYPE_VIEW_TEXT_CHANGED" -> "一个文字控件中的内容发生了变化。"
@@ -793,10 +818,13 @@ class MainActivity : Activity() {
             append(title)
             append("\n操作区域：").append(area)
             append("\n说明：").append(explanation)
-            if (!relatedText.isNullOrBlank()) append("\n相关文字：").append(relatedText.take(100))
+            if (!relatedText.isNullOrBlank()) {
+                append("\n相关文字：").append(relatedText.take(100))
+            }
         }
     }
 
+    // Retained utility views from the existing Activity implementation.
     private fun card(): LinearLayout = LinearLayout(this).apply {
         orientation = LinearLayout.VERTICAL
         setPadding(dp(14), dp(13), dp(14), dp(13))
@@ -825,11 +853,15 @@ class MainActivity : Activity() {
     }
 
     private fun timestamp(): String =
-        java.text.SimpleDateFormat("HH:mm:ss.SSS", java.util.Locale.getDefault()).format(java.util.Date())
+        java.text.SimpleDateFormat("HH:mm:ss.SSS", java.util.Locale.getDefault())
+            .format(java.util.Date())
 
-    private fun dp(value: Int): Int = (value * resources.displayMetrics.density + 0.5f).toInt()
+    private fun dp(value: Int): Int =
+        (value * resources.displayMetrics.density + 0.5f).toInt()
 
     companion object {
+        private const val PREFS_UI = "freedom_main_ui"
+        private const val KEY_KEEP_ACCOUNT_MODE = "keep_account_mode_enabled"
         private const val LOG_DETAIL_SEPARATOR = "\u001F"
         private const val REQUEST_MEDIA_PERMISSION = 2001
         private val PACKAGE_PATTERN = Regex("^[A-Za-z][A-Za-z0-9_]*(\\.[A-Za-z][A-Za-z0-9_]*)+$")
