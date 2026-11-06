@@ -67,6 +67,7 @@ class FreedomAccessibilityService : AccessibilityService() {
     private var accountBrowseTouchActive = false
     private var accountBrowseGestureInFlight = false
     private var accountBrowseScrollEventSeen = false
+    private var accountBrowseInitialSwipeCompleted = false
     private var accountBrowseFallbackScrollAttempted = false
     private var refreshReceiverRegistered = false
 
@@ -102,8 +103,8 @@ class FreedomAccessibilityService : AccessibilityService() {
 
     // Resume after the user finishes navigating or interacting with the target app.
     private val manualTouchResumeRunnable = Runnable {
-        if (!accountBrowseTouchActive && MonitorStore.isRunning(this) &&
-            isAccountBrowseModeEnabled()
+        if (!accountBrowseInitialSwipeCompleted && !accountBrowseTouchActive &&
+            MonitorStore.isRunning(this) && isAccountBrowseModeEnabled()
         ) {
             accountBrowsePhase = AccountBrowsePhase.IDLE
             accountBrowsePauseReason = ""
@@ -199,9 +200,11 @@ class FreedomAccessibilityService : AccessibilityService() {
         if (eventPackage != targetPackage || eventPackage == packageName) return
 
         if (event.eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED &&
-            accountBrowsePhase == AccountBrowsePhase.WAIT_FOR_SCROLL_SETTLE
+            accountBrowsePhase == AccountBrowsePhase.WAIT_FOR_SCROLL_SETTLE &&
+            !accountBrowseScrollEventSeen
         ) {
             accountBrowseScrollEventSeen = true
+            addLog("首次屏幕滑动期间检测到目标应用列表滚动事件")
         }
 
         if (!isAccountBrowseModeEnabled()) {
@@ -330,6 +333,7 @@ class FreedomAccessibilityService : AccessibilityService() {
         accountBrowseTouchActive = false
         accountBrowseGestureInFlight = false
         accountBrowseScrollEventSeen = false
+        accountBrowseInitialSwipeCompleted = false
         accountBrowseFallbackScrollAttempted = false
     }
 
@@ -356,7 +360,7 @@ class FreedomAccessibilityService : AccessibilityService() {
             AccountBrowsePhase.IDLE,
             AccountBrowsePhase.PAUSED -> return
             AccountBrowsePhase.WAIT_FOR_LIST_SCROLL -> performFeedScroll()
-            AccountBrowsePhase.WAIT_FOR_SCROLL_SETTLE -> openVisibleFeedCard()
+            AccountBrowsePhase.WAIT_FOR_SCROLL_SETTLE -> verifyInitialSwipe()
             AccountBrowsePhase.WAIT_FOR_DETAIL_LOAD -> checkDetailPageLoaded()
             AccountBrowsePhase.DETAIL_DWELL -> returnFromDetailPage()
             AccountBrowsePhase.WAIT_FOR_LIST_RETURN -> checkFeedListReturned()
@@ -378,33 +382,17 @@ class FreedomAccessibilityService : AccessibilityService() {
         return root
     }
 
+    /**
+     * First-stage verification: dispatch one screen-coordinate swipe only.
+     * No feed tab, RecyclerView, scroll-node or card lookup is performed before dispatch.
+     */
     private fun performFeedScroll() {
         val root = obtainTargetRootOrPause() ?: return
-        if (!isMomoDynamicFeedPage(root)) {
-            runCatching { root.recycle() }
-            pauseAccountBrowse("没有确认当前位于陌陌动态列表；为避免误操作，已暂停")
-            return
-        }
+        runCatching { root.recycle() }
 
-        accountBrowseSourceFingerprint = pageFingerprint(root).signature
-        val scrollNode = try {
-            findScrollableFeedContainer(root)
-        } finally {
-            runCatching { root.recycle() }
-        }
-        if (scrollNode == null) {
-            pauseAccountBrowse("没有识别到可滚动的动态列表；已暂停")
-            return
-        }
-
-        val bounds = Rect()
-        val validBounds = runCatching {
-            scrollNode.getBoundsInScreen(bounds)
-            bounds.width() >= MIN_GESTURE_WIDTH_PX && bounds.height() >= MIN_GESTURE_HEIGHT_PX
-        }.getOrDefault(false)
-        if (!validBounds) {
-            runCatching { scrollNode.recycle() }
-            pauseAccountBrowse("动态列表尺寸不足，无法安全执行滑动")
+        val bounds = screenSwipeBounds()
+        if (bounds.width() < MIN_GESTURE_WIDTH_PX || bounds.height() < MIN_GESTURE_HEIGHT_PX) {
+            pauseAccountBrowse("当前屏幕可用区域太小，无法安全执行首次滑动")
             return
         }
 
@@ -418,6 +406,11 @@ class FreedomAccessibilityService : AccessibilityService() {
         accountBrowseScrollEventSeen = false
         accountBrowseFallbackScrollAttempted = false
         accountBrowseGestureInFlight = true
+        addLog(
+            "首次坐标滑动开始：区域 ${bounds.width()}×${bounds.height()}，" +
+                "持续 ${profile.durationMs} 毫秒；本次不进行控件或动态卡片识别"
+        )
+
         val accepted = runCatching {
             dispatchGesture(gesture, object : AccessibilityService.GestureResultCallback() {
                 override fun onCompleted(gestureDescription: GestureDescription?) {
@@ -425,14 +418,14 @@ class FreedomAccessibilityService : AccessibilityService() {
                     if (accountBrowsePhase != AccountBrowsePhase.WAIT_FOR_SCROLL_SETTLE ||
                         !MonitorStore.isRunning(this@FreedomAccessibilityService)
                     ) return
-                    addLog("动态列表滑动完成；正在等待页面稳定")
+                    addLog("Android 已完成首次屏幕滑动手势；正在检查滚动事件")
                     scheduleAccountBrowseStep(SCROLL_SETTLE_MS)
                 }
 
                 override fun onCancelled(gestureDescription: GestureDescription?) {
                     accountBrowseGestureInFlight = false
                     if (accountBrowsePhase == AccountBrowsePhase.WAIT_FOR_SCROLL_SETTLE) {
-                        pauseAccountBrowse("滑动被系统或用户操作中断；请重新启动后继续")
+                        pauseAccountBrowse("首次屏幕滑动被系统或用户操作中断")
                     }
                 }
             }, mainHandler)
@@ -440,22 +433,31 @@ class FreedomAccessibilityService : AccessibilityService() {
 
         if (!accepted) {
             accountBrowseGestureInFlight = false
-            accountBrowseFallbackScrollAttempted = true
-            val fallbackScrolled = runCatching {
-                scrollNode.performAction(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD)
-            }.getOrDefault(false)
-            runCatching { scrollNode.recycle() }
-            if (fallbackScrolled) {
-                addLog("动态列表已通过无障碍滚动动作移动；正在等待页面稳定")
-                scheduleAccountBrowseStep(SCROLL_SETTLE_MS)
-            } else {
-                pauseAccountBrowse("系统未接受滑动手势，备用滚动动作也未成功")
-            }
+            pauseAccountBrowse("Android 未接受首次屏幕滑动手势；未执行节点滚动备用操作")
             return
         }
 
-        runCatching { scrollNode.recycle() }
-        addLog("动态列表正在平滑滑动（${profile.durationMs} 毫秒）")
+        addLog("首次屏幕滑动手势已提交；等待系统完成回调")
+    }
+
+    /** Use display coordinates directly; this does not depend on AccessibilityNodeInfo bounds. */
+    private fun screenSwipeBounds(): Rect {
+        val metrics = resources.displayMetrics
+        return Rect(0, 0, metrics.widthPixels, metrics.heightPixels)
+    }
+
+    /** End this diagnostic cycle after the first swipe; card opening is deliberately deferred. */
+    private fun verifyInitialSwipe() {
+        if (accountBrowsePhase != AccountBrowsePhase.WAIT_FOR_SCROLL_SETTLE) return
+        accountBrowseInitialSwipeCompleted = true
+
+        if (accountBrowseScrollEventSeen) {
+            addLog("首次滑动结果：已收到目标应用 TYPE_VIEW_SCROLLED 事件")
+            pauseAccountBrowse("首次滑动已完成并记录；本阶段到此结束，尚未启动动态卡片点击")
+        } else {
+            addLog("首次滑动结果：手势回调已完成，但未收到 TYPE_VIEW_SCROLLED 事件；无法确认列表是否实际移动")
+            pauseAccountBrowse("首次滑动结果待人工确认；请检查画面是否发生移动后再重新启动")
+        }
     }
 
     private fun loadScrollGestureProfile(): ScrollGestureProfile {
