@@ -7,7 +7,6 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.graphics.Color
-import android.graphics.Path
 import android.graphics.Rect
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
@@ -49,10 +48,6 @@ import java.text.SimpleDateFormat
 import java.util.ArrayDeque
 import java.util.Date
 import java.util.Locale
-import kotlin.math.PI
-import kotlin.math.cos
-import kotlin.math.hypot
-import kotlin.math.sin
 import kotlin.random.Random
 
 class FreedomAccessibilityService : AccessibilityService() {
@@ -154,6 +149,18 @@ class FreedomAccessibilityService : AccessibilityService() {
                 dynamicTabContentGapDp = DYNAMIC_TAB_CONTENT_GAP_DP,
                 pageFingerprintMaxNodes = PAGE_FINGERPRINT_MAX_NODES,
                 fingerprintSizeBucketPx = FINGERPRINT_SIZE_BUCKET_PX,
+                minListWidthRatio = MIN_LIST_WIDTH_RATIO,
+                minListHeightRatio = MIN_LIST_HEIGHT_RATIO
+            )
+        )
+    }
+
+    private val momoFeedGestureController by lazy(LazyThreadSafetyMode.NONE) {
+        MomoFeedGestureController(
+            context = this,
+            pageInspector = momoPageInspector,
+            onLog = ::addLog,
+            config = MomoFeedGestureController.Config(
                 minListWidthRatio = MIN_LIST_WIDTH_RATIO,
                 minListHeightRatio = MIN_LIST_HEIGHT_RATIO
             )
@@ -1558,45 +1565,8 @@ class FreedomAccessibilityService : AccessibilityService() {
 
     /** Resolve the same visible feed container used by the readiness gate and return
      * its screen-space bounds, clipped below the Dynamic tab row and to the display. */
-    private fun resolveFeedGestureTarget(root: AccessibilityNodeInfo): FeedGestureTarget? {
-        val tabInspection = inspectDynamicTabRow(root)
-        val tabEvidence = tabInspection.evidence ?: run {
-            addLog("无法取得首次滑动区域：${tabInspection.reason}")
-            return null
-        }
-        val listNode = findVisibleFeedContainer(root, tabEvidence.contentTop) ?: run {
-            addLog("无法取得首次滑动区域：动态标签下方没有可见列表容器")
-            return null
-        }
-        return try {
-            val rawBounds = Rect()
-            listNode.getBoundsInScreen(rawBounds)
-            val metrics = resources.displayMetrics
-            val clipped = Rect(
-                maxOf(rawBounds.left, 0),
-                maxOf(rawBounds.top, tabEvidence.contentTop, 0),
-                minOf(rawBounds.right, metrics.widthPixels),
-                minOf(rawBounds.bottom, metrics.heightPixels)
-            )
-            val className = listNode.className?.toString()?.substringAfterLast('.') ?: "Unknown"
-            if (clipped.width() < MIN_GESTURE_WIDTH_PX ||
-                clipped.height() < MIN_GESTURE_HEIGHT_PX
-            ) {
-                addLog(
-                    "目标列表有效滑动区域过小：class=$className，" +
-                        "原始边界=$rawBounds，有效边界=$clipped"
-                )
-                null
-            } else {
-                FeedGestureTarget(clipped, className)
-            }
-        } catch (error: Exception) {
-            addLog("读取动态列表屏幕边界失败：${error.javaClass.simpleName}")
-            null
-        } finally {
-            runCatching { listNode.recycle() }
-        }
-    }
+    private fun resolveFeedGestureTarget(root: AccessibilityNodeInfo): FeedGestureTarget? =
+        momoFeedGestureController.resolveFeedGestureTarget(root)
 
     /**
      * First-stage verification: dispatch one swipe inside the confirmed visible feed container.
@@ -1772,165 +1742,17 @@ class FreedomAccessibilityService : AccessibilityService() {
     }
 
     /** Capture a small, readable sample of visible text nodes and their screen positions. */
-    private fun captureVisibleFeedNodeSnapshot(root: AccessibilityNodeInfo): String {
-        val queue = ArrayDeque<AccessibilityNodeInfo>()
-        queue.add(AccessibilityNodeInfo.obtain(root))
-        val lines = ArrayList<String>(SNAPSHOT_MAX_TEXT_NODES)
-        var visited = 0
-        val screenHeight = resources.displayMetrics.heightPixels
-        try {
-            while (queue.isNotEmpty() && visited < SNAPSHOT_MAX_NODES &&
-                lines.size < SNAPSHOT_MAX_TEXT_NODES
-            ) {
-                val node = queue.removeFirst()
-                visited++
-                try {
-                    if (runCatching { node.isVisibleToUser }.getOrDefault(false)) {
-                        val bounds = Rect()
-                        runCatching { node.getBoundsInScreen(bounds) }
-                        val text = runCatching { node.text?.toString().orEmpty().trim() }
-                            .getOrDefault("")
-                        val description = runCatching { node.contentDescription?.toString().orEmpty().trim() }
-                            .getOrDefault("")
-                        val content = sequenceOf(text, description)
-                            .firstOrNull { it.isNotBlank() }
-                            .orEmpty()
-                        if (content.isNotBlank() && bounds.top >= (screenHeight * SNAPSHOT_TOP_RATIO).toInt() &&
-                            bounds.top < (screenHeight * SNAPSHOT_BOTTOM_RATIO).toInt()
-                        ) {
-                            val nodeClass = node.className?.toString().orEmpty().substringAfterLast('.')
-                            lines.add(
-                                "$nodeClass:${content.take(SNAPSHOT_TEXT_LENGTH)}@" +
-                                    "${bounds.left},${bounds.top},${bounds.right},${bounds.bottom}"
-                            )
-                        }
-                    }
+    private fun captureVisibleFeedNodeSnapshot(root: AccessibilityNodeInfo): String =
+        momoFeedGestureController.captureVisibleFeedNodeSnapshot(root)
 
-                    val childCount = runCatching { node.childCount }.getOrDefault(0)
-                    for (index in 0 until childCount) {
-                        if (visited + queue.size >= SNAPSHOT_MAX_NODES ||
-                            lines.size >= SNAPSHOT_MAX_TEXT_NODES
-                        ) break
-                        val child = runCatching { node.getChild(index) }.getOrNull() ?: continue
-                        queue.add(child)
-                    }
-                } finally {
-                    runCatching { node.recycle() }
-                }
-            }
-        } finally {
-            while (queue.isNotEmpty()) {
-                runCatching { queue.removeFirst().recycle() }
-            }
-        }
-        return lines.joinToString(" | ").take(SNAPSHOT_MAX_LOG_LENGTH)
-    }
-
-    private fun loadScrollGestureProfile(): ScrollGestureProfile {
-        val prefs = getSharedPreferences(ACCOUNT_BROWSE_PREFS, Context.MODE_PRIVATE)
-        return ScrollGestureProfile(
-            durationMs = prefs.getLong(KEY_BROWSE_GESTURE_DURATION_MS, DEFAULT_GESTURE_DURATION_MS)
-                .coerceIn(MIN_GESTURE_DURATION_MS, MAX_GESTURE_DURATION_MS),
-            curveOffsetRatio = (prefs.getFloat(KEY_BROWSE_GESTURE_CURVE_OFFSET, DEFAULT_CURVE_OFFSET_RATIO))
-                .coerceIn(0f, MAX_CURVE_OFFSET_RATIO),
-            microPerturbationFrequencyHz = GestureTuning.currentFrequencyHz(this)
-        )
-    }
+    private fun loadScrollGestureProfile(): ScrollGestureProfile =
+        momoFeedGestureController.loadScrollGestureProfile()
 
     /** Create fresh in-bounds endpoints and a cosine-timed cubic Bezier scroll path. */
     private fun createSmoothScrollPath(
         bounds: Rect,
         profile: ScrollGestureProfile
-    ): ScrollGesturePlan? {
-        val density = resources.displayMetrics.density.coerceAtLeast(1f)
-        val horizontalInset = maxOf(
-            (8f * density).toInt(),
-            (bounds.width() * 0.04f).toInt()
-        ).coerceAtMost(bounds.width() / 4)
-        val verticalInset = (8f * density).toInt().coerceAtMost(bounds.height() / 8)
-
-        val safeLeft = bounds.left + horizontalInset
-        val safeRight = bounds.right - horizontalInset
-        val safeTop = bounds.top + verticalInset
-        val safeBottom = bounds.bottom - verticalInset
-        val safeWidth = (safeRight - safeLeft).toFloat()
-        val safeHeight = (safeBottom - safeTop).toFloat()
-        if (safeWidth < 80f || safeHeight < 120f) return null
-
-        fun randomBetween(min: Float, max: Float): Float =
-            min + Random.nextFloat() * (max - min)
-
-        // Select a new start/end point from the currently visible list area on every swipe.
-        val startX = (safeLeft + safeWidth * randomBetween(0.18f, 0.82f)).toInt()
-        val endX = (
-            startX + safeWidth * randomBetween(-0.025f, 0.025f)
-        ).toInt().coerceIn(safeLeft, safeRight)
-        val startY = (safeTop + safeHeight * randomBetween(0.68f, 0.82f)).toInt()
-        val endY = (safeTop + safeHeight * randomBetween(0.22f, 0.38f)).toInt()
-
-        val startXf = startX.toFloat()
-        val startYf = startY.toFloat()
-        val endXf = endX.toFloat()
-        val endYf = endY.toFloat()
-        val curveLimit = (bounds.width() * profile.curveOffsetRatio)
-            .coerceAtMost(bounds.width() * MAX_CURVE_OFFSET_RATIO)
-        val control1X = (startXf + randomBetween(-curveLimit, curveLimit))
-            .coerceIn(safeLeft.toFloat(), safeRight.toFloat())
-        val control2X = (endXf + randomBetween(-curveLimit, curveLimit))
-            .coerceIn(safeLeft.toFloat(), safeRight.toFloat())
-        val verticalDistance = endYf - startYf
-        val control1Y = startYf + verticalDistance / 3f
-        val control2Y = startYf + verticalDistance * 2f / 3f
-
-        val path = Path()
-        val useMicroPerturbation = ENABLE_SCROLL_MICRO_PERTURBATION
-        val steps = if (useMicroPerturbation) {
-            MICRO_PERTURBATION_PATH_STEPS
-        } else {
-            GESTURE_PATH_STEPS
-        }
-
-        for (step in 0..steps) {
-            val t = step.toFloat() / steps.toFloat()
-            // 2.1: cosine ease-in-out controls progress along the Bezier curve.
-            val progress = (0.5 - 0.5 * cos(PI * t.toDouble())).toFloat()
-            val inverse = 1f - progress
-            val inverseSquared = inverse * inverse
-            val progressSquared = progress * progress
-
-            val x = inverseSquared * inverse * startXf +
-                3f * inverseSquared * progress * control1X +
-                3f * inverse * progressSquared * control2X +
-                progressSquared * progress * endXf
-            val y = inverseSquared * inverse * startYf +
-                3f * inverseSquared * progress * control1Y +
-                3f * inverse * progressSquared * control2Y +
-                progressSquared * progress * endYf
-
-            var pathX = x
-            var pathY = y
-            if (useMicroPerturbation && step > 0 && step < steps) {
-                // 5.1: calibrated device frequency, 1.2 px offset along the local curve normal.
-                val tangentX = 3f * inverseSquared * (control1X - startXf) +
-                    6f * inverse * progress * (control2X - control1X) +
-                    3f * progressSquared * (endXf - control2X)
-                val tangentY = 3f * inverseSquared * (control1Y - startYf) +
-                    6f * inverse * progress * (control2Y - control1Y) +
-                    3f * progressSquared * (endYf - control2Y)
-                val tangentLength = hypot(tangentX.toDouble(), tangentY.toDouble())
-                    .toFloat().coerceAtLeast(1f)
-                val elapsedSeconds = t * profile.durationMs / 1_000f
-                val wave = sin(
-                    2.0 * PI * profile.microPerturbationFrequencyHz * elapsedSeconds.toDouble()
-                ).toFloat() * MICRO_PERTURBATION_AMPLITUDE_PX
-                pathX += (-tangentY / tangentLength) * wave
-                pathY += (tangentX / tangentLength) * wave
-            }
-
-            if (step == 0) path.moveTo(pathX, pathY) else path.lineTo(pathX, pathY)
-        }
-        return ScrollGesturePlan(path, startX, startY, endX, endY)
-    }
+    ): ScrollGesturePlan? = momoFeedGestureController.createSmoothScrollPath(bounds, profile)
 
     private fun openVisibleFeedCard() {
         // dispatchGesture() can be accepted by Android without producing a real list scroll
@@ -2668,82 +2490,7 @@ class FreedomAccessibilityService : AccessibilityService() {
      */
     private fun findScrollableFeedContainer(
         root: AccessibilityNodeInfo
-    ): AccessibilityNodeInfo? {
-        val queue = ArrayDeque<AccessibilityNodeInfo>()
-        queue.add(AccessibilityNodeInfo.obtain(root))
-
-        val metrics = resources.displayMetrics
-        val screenWidth = metrics.widthPixels
-        val screenHeight = metrics.heightPixels
-        val minimumWidth = (screenWidth * MIN_LIST_WIDTH_RATIO).toInt()
-        val minimumHeight = (screenHeight * MIN_LIST_HEIGHT_RATIO).toInt()
-        val minimumComposerWidth = (screenWidth * MIN_COMPOSER_WIDTH_RATIO).toInt()
-
-        var bestNode: AccessibilityNodeInfo? = null
-        var bestArea = 0L
-        var hasBottomTextEntry = false
-        var visited = 0
-
-        try {
-            while (queue.isNotEmpty() && visited < MonitorStore.MAX_NODES_PER_SCAN) {
-                val node = queue.removeFirst()
-                visited++
-
-                try {
-                    val bounds = Rect()
-                    runCatching { node.getBoundsInScreen(bounds) }
-
-                    if (node.isVisibleToUser && node.isEditable &&
-                        bounds.bottom >= (screenHeight * COMPOSER_BOTTOM_RATIO).toInt() &&
-                        bounds.width() >= minimumComposerWidth
-                    ) {
-                        hasBottomTextEntry = true
-                    }
-
-                    val className = node.className?.toString().orEmpty()
-                    val isKnownVerticalList =
-                        className.endsWith("RecyclerView") ||
-                        className.endsWith("ListView") ||
-                        className.endsWith("AbsListView") ||
-                        className.endsWith("ScrollView") ||
-                        className.endsWith("NestedScrollView") ||
-                        className.endsWith("WebView")
-
-                    if (node.isVisibleToUser && node.isScrollable && isKnownVerticalList) {
-                        val width = bounds.width()
-                        val height = bounds.height()
-                        if (width >= minimumWidth && height >= minimumHeight) {
-                            val area = width.toLong() * height.toLong()
-                            if (area > bestArea) {
-                                runCatching { bestNode?.recycle() }
-                                bestNode = AccessibilityNodeInfo.obtain(node)
-                                bestArea = area
-                            }
-                        }
-                    }
-
-                    val childCount = runCatching { node.childCount }.getOrDefault(0)
-                    for (index in 0 until childCount) {
-                        if (visited + queue.size >= MonitorStore.MAX_NODES_PER_SCAN) break
-                        val child = runCatching { node.getChild(index) }.getOrNull() ?: continue
-                        queue.add(child)
-                    }
-                } finally {
-                    runCatching { node.recycle() }
-                }
-            }
-        } finally {
-            while (queue.isNotEmpty()) {
-                runCatching { queue.removeFirst().recycle() }
-            }
-        }
-
-        if (hasBottomTextEntry) {
-            runCatching { bestNode?.recycle() }
-            return null
-        }
-        return bestNode
-    }
+    ): AccessibilityNodeInfo? = momoFeedGestureController.findScrollableFeedContainer(root)
 
     private fun resolveAppLabel(packageName: String): String = runCatching {
         val info = packageManager.getApplicationInfo(packageName, 0)
@@ -2794,8 +2541,6 @@ class FreedomAccessibilityService : AccessibilityService() {
 
         private const val ACCOUNT_BROWSE_PREFS = "freedom_main_ui"
         private const val ACCOUNT_BROWSE_KEY = "keep_account_mode_enabled"
-        private const val KEY_BROWSE_GESTURE_DURATION_MS = "account_browse_gesture_duration_ms"
-        private const val KEY_BROWSE_GESTURE_CURVE_OFFSET = "account_browse_gesture_curve_offset"
         private const val MOMO_PACKAGE = "com.immomo.momo"
         private const val MOMO_DYNAMIC_TAB_LABEL = "动态"
         private const val MOMO_NEARBY_TAB_LABEL = "附近"
@@ -2859,34 +2604,15 @@ class FreedomAccessibilityService : AccessibilityService() {
         private const val REQUIRED_STABLE_PAGE_SAMPLES = 2
         private const val MIN_RETURN_SNAPSHOT_MATCH_LINES = 3
         private const val RETURN_SNAPSHOT_MATCH_RATIO = 0.70
-        private const val SNAPSHOT_MAX_NODES = 500
-        private const val SNAPSHOT_MAX_TEXT_NODES = 8
-        private const val SNAPSHOT_TEXT_LENGTH = 36
-        private const val SNAPSHOT_MAX_LOG_LENGTH = 520
-        private const val SNAPSHOT_TOP_RATIO = 0.18f
-        private const val SNAPSHOT_BOTTOM_RATIO = 0.92f
         private const val MIN_DETAIL_NODE_COUNT = 12
         private const val PAGE_FINGERPRINT_MAX_NODES = 500
         private const val FINGERPRINT_SIZE_BUCKET_PX = 24
 
-        private const val DEFAULT_GESTURE_DURATION_MS = 620L
-        private const val MIN_GESTURE_DURATION_MS = 350L
-        private const val MAX_GESTURE_DURATION_MS = 1_200L
-        private const val DEFAULT_CURVE_OFFSET_RATIO = 0.012f
-        private const val MAX_CURVE_OFFSET_RATIO = 0.04f
-        private const val MIN_GESTURE_WIDTH_PX = 220
-        private const val MIN_GESTURE_HEIGHT_PX = 300
-        private const val GESTURE_PATH_STEPS = 32
-        private const val ENABLE_SCROLL_MICRO_PERTURBATION = true
-        private const val MICRO_PERTURBATION_AMPLITUDE_PX = 1.2f
-        private const val MICRO_PERTURBATION_PATH_STEPS = 100
         private const val MIN_FEED_CARD_WIDTH_RATIO = 0.75f
         private const val MIN_FEED_CARD_HEIGHT_RATIO = 0.18f
 
         private const val MIN_LIST_WIDTH_RATIO = 0.58f
         private const val MIN_LIST_HEIGHT_RATIO = 0.28f
-        private const val MIN_COMPOSER_WIDTH_RATIO = 0.35f
-        private const val COMPOSER_BOTTOM_RATIO = 0.62f
 
         private const val LOG_DETAIL_SEPARATOR = "\u001F"
     }

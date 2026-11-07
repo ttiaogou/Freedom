@@ -74,3 +74,8 @@
 - 原有弹窗候选扫描上限、候选数量、节点文本数量/长度上限、识别分数、几何范围、关键词集合和节点回收顺序保持不变。可点击祖先查找仍调用 Service 的既有辅助函数，避免改变点击目标尺寸与深度约束。
 - 页面导航、状态机、卡片过滤、点击、返回和手势执行均未迁入或改写。
 - 本阶段无新权限、广播、持久化键、依赖或用户可见功能。完整 Android 构建仍需 GitHub Actions 验证。
+
+
+## Stage 5 — Feed gesture planning
+
+`MomoFeedGestureController` owns feed-list target discovery, scrollable-container selection, bounded visible-node snapshots, persisted gesture-profile loading, and path construction. It returns `FeedGestureTarget`, `ScrollGestureProfile`, and `ScrollGesturePlan` data only. It does not create `GestureDescription`, call `dispatchGesture`, toggle overlay touch passthrough, schedule work, or mutate browse phases. `FreedomAccessibilityService` retains the actual gesture dispatch and all completion/cancellation/recovery behavior.

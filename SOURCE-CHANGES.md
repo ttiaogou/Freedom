@@ -69,3 +69,11 @@
 - 关闭控件的可点击祖先仍使用 Service 原有 `findClickableAncestor()` 约束；不改变可点击目标范围。
 - 未修改陌陌页面导航、卡片过滤、自动浏览状态机、点击/返回/滑动顺序和计时参数。
 - 本次完成静态结构/引用核对；容器未安装 Android SDK/Gradle，未执行 `assembleDebug`，需以 GitHub Actions 和真机测试为准。
+
+
+## Stage 5 — 动态列表手势规划拆分（2026-11-07）
+
+- 新增 `accessibility/browse/MomoFeedGestureController.kt`，集中管理动态列表手势目标定位、滚动列表容器查找、可见节点快照、手势参数读取和滑动路径规划。
+- `FreedomAccessibilityService` 继续负责创建 `GestureDescription`、悬浮窗触摸穿透、`dispatchGesture()`、系统回调、暂停/重试和自动浏览阶段转换。
+- 保留原有列表/输入框屏蔽阈值、手势时长范围、曲线偏移范围、32/100 个路径采样点、微扰频率和幅度、快照节点/文本上限及偏好设置键。
+- 原有 Service 调用点通过薄代理转发，避免改动状态机中的调用顺序。
