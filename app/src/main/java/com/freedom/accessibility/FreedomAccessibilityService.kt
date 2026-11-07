@@ -23,6 +23,7 @@ import android.widget.TextView
 import com.freedom.data.MonitorActions
 import com.freedom.data.MonitorStore
 import com.freedom.accessibility.browse.MomoDynamicCardSelector
+import com.freedom.accessibility.browse.MomoPageInspector
 import com.freedom.accessibility.browse.AccountBrowsePhase
 import com.freedom.accessibility.browse.DetailPageIdentityInspection
 import com.freedom.accessibility.browse.DynamicTabInspection
@@ -35,7 +36,6 @@ import com.freedom.accessibility.browse.PageFingerprint
 import com.freedom.accessibility.browse.PopupInspection
 import com.freedom.accessibility.browse.ScrollGesturePlan
 import com.freedom.accessibility.browse.ScrollGestureProfile
-import com.freedom.accessibility.browse.TabLabelEvidence
 import com.freedom.accessibility.event.AccessibilityEventFormatter
 import com.freedom.accessibility.scan.AccessibilityTreeScanner
 import com.freedom.accessibility.scheduling.AccountBrowseScheduler
@@ -130,6 +130,32 @@ class FreedomAccessibilityService : AccessibilityService() {
                     accountBrowsePhase != AccountBrowsePhase.IDLE
             },
             onStep = { performAccountBrowseStep() }
+        )
+    }
+
+    private val momoPageInspector by lazy(LazyThreadSafetyMode.NONE) {
+        MomoPageInspector(
+            context = this,
+            dp = ::dp,
+            config = MomoPageInspector.Config(
+                targetPackage = MOMO_PACKAGE,
+                detailActivityClass = MOMO_DYNAMIC_DETAIL_ACTIVITY,
+                minDetailNodeCount = MIN_DETAIL_NODE_COUNT,
+                homeNavLabels = MOMO_HOME_NAV_LABELS,
+                homeTabLabel = MOMO_HOME_TAB_LABEL,
+                homeNavLowerBandRatio = HOME_NAV_LOWER_BAND_RATIO,
+                dynamicTabLabels = DYNAMIC_TAB_LABELS,
+                dynamicTabLabel = MOMO_DYNAMIC_TAB_LABEL,
+                nearbyTabLabel = MOMO_NEARBY_TAB_LABEL,
+                aiTabLabel = MOMO_AI_TAB_LABEL,
+                dynamicTabUpperBandRatio = DYNAMIC_TAB_UPPER_BAND_RATIO,
+                dynamicTabRowToleranceDp = DYNAMIC_TAB_ROW_TOLERANCE_DP,
+                dynamicTabContentGapDp = DYNAMIC_TAB_CONTENT_GAP_DP,
+                pageFingerprintMaxNodes = PAGE_FINGERPRINT_MAX_NODES,
+                fingerprintSizeBucketPx = FINGERPRINT_SIZE_BUCKET_PX,
+                minListWidthRatio = MIN_LIST_WIDTH_RATIO,
+                minListHeightRatio = MIN_LIST_HEIGHT_RATIO
+            )
         )
     }
 
@@ -1396,71 +1422,8 @@ class FreedomAccessibilityService : AccessibilityService() {
         scheduleAccountBrowseStep(PAGE_STATE_POLL_MS)
     }
 
-    private fun inspectHomeBottomNav(root: AccessibilityNodeInfo): HomeBottomNavEvidence? {
-        val lowerBandTop = (resources.displayMetrics.heightPixels * HOME_NAV_LOWER_BAND_RATIO).toInt()
-        val rowTolerance = maxOf(dp(DYNAMIC_TAB_ROW_TOLERANCE_DP), (resources.displayMetrics.heightPixels * 0.04f).toInt())
-        val labels = ArrayList<TabLabelEvidence>()
-        val queue = ArrayDeque<Pair<AccessibilityNodeInfo, Boolean>>()
-        queue.add(AccessibilityNodeInfo.obtain(root) to false)
-        var visited = 0
-        try {
-            while (queue.isNotEmpty() && visited < PAGE_FINGERPRINT_MAX_NODES) {
-                val (node, selectedInPath) = queue.removeFirst()
-                visited++
-                try {
-                    val selected = selectedInPath || node.isSelected || node.isChecked
-                    val bounds = Rect()
-                    runCatching { node.getBoundsInScreen(bounds) }
-                    val text = runCatching { node.text?.toString()?.trim().orEmpty() }.getOrDefault("")
-                    val description = runCatching { node.contentDescription?.toString()?.trim().orEmpty() }
-                        .getOrDefault("")
-                    val label = when {
-                        text in MOMO_HOME_NAV_LABELS -> text
-                        description in MOMO_HOME_NAV_LABELS -> description
-                        else -> ""
-                    }
-                    if (label.isNotEmpty() && node.isVisibleToUser && bounds.width() > 0 &&
-                        bounds.height() > 0 && bounds.centerY() >= lowerBandTop
-                    ) {
-                        labels.add(TabLabelEvidence(label, Rect(bounds), selected))
-                    }
-                    val childCount = runCatching { node.childCount }.getOrDefault(0)
-                    for (index in 0 until childCount) {
-                        if (visited + queue.size >= PAGE_FINGERPRINT_MAX_NODES) break
-                        val child = runCatching { node.getChild(index) }.getOrNull() ?: continue
-                        queue.add(child to selected)
-                    }
-                } finally {
-                    runCatching { node.recycle() }
-                }
-            }
-        } finally {
-            while (queue.isNotEmpty()) runCatching { queue.removeFirst().first.recycle() }
-        }
-
-        val homeLabels = labels.filter { it.label == MOMO_HOME_TAB_LABEL }
-        for (home in homeLabels) {
-            val peerLabels = labels.filter {
-                it.label != MOMO_HOME_TAB_LABEL &&
-                    kotlin.math.abs(it.bounds.centerY() - home.bounds.centerY()) <= rowTolerance
-            }
-            if (peerLabels.isEmpty()) continue
-            val selectedLabels = (listOf(home) + peerLabels).filter { it.selected }.map { it.label }.distinct()
-            val selectionKnown = selectedLabels.size == 1
-            val homeSelected = selectionKnown && selectedLabels.single() == MOMO_HOME_TAB_LABEL
-            return HomeBottomNavEvidence(
-                homeBounds = Rect(home.bounds),
-                homeSelected = homeSelected,
-                selectionKnown = selectionKnown,
-                diagnostic = if (selectionKnown) {
-                    "底部导航选中项=${selectedLabels.single()}"
-                } else {
-                    "底部导航存在，但选中状态未能唯一确认"
-                }
-            )
-        }
-        return null
-    }
+    private fun inspectHomeBottomNav(root: AccessibilityNodeInfo): HomeBottomNavEvidence? =
+        momoPageInspector.inspectHomeBottomNav(root)
 
     private fun findClickableNodeForLabel(
         root: AccessibilityNodeInfo,
@@ -2392,35 +2355,16 @@ class FreedomAccessibilityService : AccessibilityService() {
     }
 
     /**
-     * A detail page is identified by its known Momo Activity and page role, not by exact equality
-     * of every descendant node. The detail's images, text and RecyclerView children may continue
-     * changing while the same LuaViewActivity remains active.
+     * The inspector handles the read-only page check; current Activity values remain owned by
+     * the service's active navigation session.
      */
     private fun inspectCurrentDynamicDetailIdentity(
         root: AccessibilityNodeInfo
-    ): DetailPageIdentityInspection {
-        val packageName = runCatching { root.packageName?.toString().orEmpty() }
-            .getOrDefault("")
-        val fingerprint = pageFingerprint(root)
-        val feedPage = isMomoDynamicFeedPage(root)
-        val expectedActivity = accountBrowseDetailActivityClass
-            .ifBlank { MOMO_DYNAMIC_DETAIL_ACTIVITY }
-        val currentActivity = accountBrowseCurrentActivityClass
-        val identityConfirmed = packageName == MOMO_PACKAGE &&
-            !feedPage &&
-            expectedActivity == MOMO_DYNAMIC_DETAIL_ACTIVITY &&
-            currentActivity == expectedActivity &&
-            fingerprint.nodeCount >= MIN_DETAIL_NODE_COUNT
-
-        val reason = when {
-            packageName != MOMO_PACKAGE -> "当前窗口包名不是陌陌：$packageName"
-            feedPage -> "当前页面已经识别为动态列表"
-            currentActivity != expectedActivity -> "Activity 不匹配：当前=${currentActivity.ifBlank { "未知" }}，预期=$expectedActivity"
-            fingerprint.nodeCount < MIN_DETAIL_NODE_COUNT -> "详情页面可见节点不足：${fingerprint.nodeCount}"
-            else -> "Activity=$currentActivity；详情节点=${fingerprint.nodeCount}"
-        }
-        return DetailPageIdentityInspection(feedPage, identityConfirmed, fingerprint, reason)
-    }
+    ): DetailPageIdentityInspection = momoPageInspector.inspectCurrentDynamicDetailIdentity(
+        root = root,
+        expectedActivity = accountBrowseDetailActivityClass.ifBlank { MOMO_DYNAMIC_DETAIL_ACTIVITY },
+        currentActivity = accountBrowseCurrentActivityClass
+    )
 
     /** Machine-detected page uncertainty should enter the same verified navigator, not dead-end PAUSED. */
     private fun beginDynamicNavigationRecovery(reason: String) {
@@ -2848,7 +2792,7 @@ class FreedomAccessibilityService : AccessibilityService() {
     }
 
     private fun isMomoDynamicFeedPage(root: AccessibilityNodeInfo): Boolean =
-        inspectMomoFeedReadiness(root).fingerprint != null
+        momoPageInspector.isMomoDynamicFeedPage(root)
 
     /**
      * Momo's target feed is the top-level Home page's inner "动态" tab.
@@ -2856,86 +2800,8 @@ class FreedomAccessibilityService : AccessibilityService() {
      * be used as the feed-tab marker. We identify the top tab row by its visible
      * labels (动态 / 附近 / AI小陌), then validate a visible list below that row.
      */
-    private fun inspectMomoFeedReadiness(root: AccessibilityNodeInfo): FeedReadinessInspection {
-        val packageName = runCatching { root.packageName?.toString().orEmpty() }.getOrDefault("")
-        if (packageName != MOMO_PACKAGE) {
-            return FeedReadinessInspection(null, "当前窗口不是陌陌：$packageName")
-        }
-
-        val tabInspection = inspectDynamicTabRow(root)
-        val tabEvidence = tabInspection.evidence
-            ?: return FeedReadinessInspection(null, tabInspection.reason)
-        if (tabEvidence.selectionKnown && !tabEvidence.dynamicSelected) {
-            return FeedReadinessInspection(null, "首页顶部当前选中项不是‘动态’；${tabEvidence.diagnostic}")
-        }
-
-        val listNode = findVisibleFeedContainer(root, tabEvidence.contentTop)
-            ?: return FeedReadinessInspection(null, "已确认首页顶部动态标签行，但下方没有找到足够大的可见列表容器")
-
-        return try {
-            val bounds = Rect()
-            listNode.getBoundsInScreen(bounds)
-            val metrics = resources.displayMetrics
-            val minWidth = (metrics.widthPixels * MIN_LIST_WIDTH_RATIO).toInt()
-            val visibleContentTop = maxOf(bounds.top, tabEvidence.contentTop)
-            val visibleContentHeight = bounds.bottom - visibleContentTop
-            val minHeight = (metrics.heightPixels * MIN_LIST_HEIGHT_RATIO).toInt()
-
-            if (!listNode.isVisibleToUser) {
-                return FeedReadinessInspection(null, "列表容器存在，但当前不可见")
-            }
-            if (bounds.width() < minWidth || visibleContentHeight < minHeight) {
-                return FeedReadinessInspection(
-                    null,
-                    "列表有效区域尺寸不足：宽=${bounds.width()}，有效高=$visibleContentHeight"
-                )
-            }
-
-            val contentBounds = Rect(bounds)
-            contentBounds.top = visibleContentTop
-            var visibleChildren = 0
-            val childCount = runCatching { listNode.childCount }.getOrDefault(0)
-            for (index in 0 until childCount) {
-                val child = runCatching { listNode.getChild(index) }.getOrNull() ?: continue
-                try {
-                    val childBounds = Rect()
-                    child.getBoundsInScreen(childBounds)
-                    if (child.isVisibleToUser && childBounds.width() > 0 && childBounds.height() > 0 &&
-                        Rect.intersects(contentBounds, childBounds)
-                    ) {
-                        visibleChildren++
-                    }
-                } finally {
-                    runCatching { child.recycle() }
-                }
-            }
-            if (visibleChildren == 0) {
-                return FeedReadinessInspection(null, "列表容器和尺寸有效，但当前没有可见列表项目")
-            }
-
-            val className = listNode.className?.toString().orEmpty().substringAfterLast('.')
-            val signature = listOf(
-                className,
-                bounds.left / FINGERPRINT_SIZE_BUCKET_PX,
-                visibleContentTop / FINGERPRINT_SIZE_BUCKET_PX,
-                bounds.width() / FINGERPRINT_SIZE_BUCKET_PX,
-                visibleContentHeight / FINGERPRINT_SIZE_BUCKET_PX,
-                when {
-                    visibleChildren <= 1 -> 1
-                    visibleChildren <= 3 -> 2
-                    visibleChildren <= 6 -> 3
-                    else -> 4
-                }
-            ).joinToString(":")
-            FeedReadinessInspection(
-                PageFingerprint(signature = signature, nodeCount = visibleChildren),
-                "${tabEvidence.diagnostic}；列表=$className，当前可见项目=$visibleChildren"
-            )
-        } finally {
-            runCatching { listNode.recycle() }
-        }
-    }
-
+    private fun inspectMomoFeedReadiness(root: AccessibilityNodeInfo): FeedReadinessInspection =
+        momoPageInspector.inspectMomoFeedReadiness(root)
 
     /**
      * Locate the upper horizontal tab row. Resource IDs are deliberately not required:
@@ -2944,206 +2810,16 @@ class FreedomAccessibilityService : AccessibilityService() {
      * so the caller can actively click Dynamic. If selection semantics are unavailable,
      * the same-row navigation labels provide a bounded structural fallback.
      */
-    private fun inspectDynamicTabRow(root: AccessibilityNodeInfo): DynamicTabInspection {
-        val metrics = resources.displayMetrics
-        val upperBandBottom = (metrics.heightPixels * DYNAMIC_TAB_UPPER_BAND_RATIO).toInt()
-        val rowTolerance = maxOf(dp(DYNAMIC_TAB_ROW_TOLERANCE_DP), (metrics.heightPixels * 0.04f).toInt())
-        val labels = ArrayList<TabLabelEvidence>()
-        val queue = ArrayDeque<Pair<AccessibilityNodeInfo, Boolean>>()
-        queue.add(AccessibilityNodeInfo.obtain(root) to false)
-        var visited = 0
+    private fun inspectDynamicTabRow(root: AccessibilityNodeInfo): DynamicTabInspection =
+        momoPageInspector.inspectDynamicTabRow(root)
 
-        try {
-            while (queue.isNotEmpty() && visited < PAGE_FINGERPRINT_MAX_NODES) {
-                val (node, selectedInPath) = queue.removeFirst()
-                visited++
-                try {
-                    val selected = selectedInPath || node.isSelected || node.isChecked
-                    val bounds = Rect()
-                    runCatching { node.getBoundsInScreen(bounds) }
-                    val text = runCatching { node.text?.toString()?.trim().orEmpty() }.getOrDefault("")
-                    val description = runCatching { node.contentDescription?.toString()?.trim().orEmpty() }
-                        .getOrDefault("")
-                    val label = when {
-                        text in DYNAMIC_TAB_LABELS -> text
-                        description in DYNAMIC_TAB_LABELS -> description
-                        else -> ""
-                    }
-                    if (label.isNotEmpty() && node.isVisibleToUser && bounds.width() > 0 &&
-                        bounds.height() > 0 && bounds.top >= 0 && bounds.centerY() <= upperBandBottom
-                    ) {
-                        labels.add(TabLabelEvidence(label, Rect(bounds), selected))
-                    }
-
-                    val childCount = runCatching { node.childCount }.getOrDefault(0)
-                    for (index in 0 until childCount) {
-                        if (visited + queue.size >= PAGE_FINGERPRINT_MAX_NODES) break
-                        val child = runCatching { node.getChild(index) }.getOrNull() ?: continue
-                        queue.add(child to selected)
-                    }
-                } finally {
-                    runCatching { node.recycle() }
-                }
-            }
-        } finally {
-            while (queue.isNotEmpty()) runCatching { queue.removeFirst().first.recycle() }
-        }
-
-        val dynamicLabels = labels.filter { it.label == MOMO_DYNAMIC_TAB_LABEL }
-        val nearbyLabels = labels.filter { it.label == MOMO_NEARBY_TAB_LABEL }
-        val aiLabels = labels.filter { it.label == MOMO_AI_TAB_LABEL }
-        if (dynamicLabels.isEmpty()) {
-            return DynamicTabInspection(null, "屏幕顶部区域没有识别到‘动态’标签")
-        }
-
-        var bestRow: List<TabLabelEvidence>? = null
-        var bestScore = -1
-        for (dynamic in dynamicLabels) {
-            val sameRowNearby = nearbyLabels.filter {
-                kotlin.math.abs(it.bounds.centerY() - dynamic.bounds.centerY()) <= rowTolerance &&
-                    it.bounds.centerX() > dynamic.bounds.centerX()
-            }.minByOrNull { kotlin.math.abs(it.bounds.centerY() - dynamic.bounds.centerY()) }
-            val sameRowAi = aiLabels.filter {
-                kotlin.math.abs(it.bounds.centerY() - dynamic.bounds.centerY()) <= rowTolerance &&
-                    it.bounds.centerX() > dynamic.bounds.centerX()
-            }.minByOrNull { kotlin.math.abs(it.bounds.centerY() - dynamic.bounds.centerY()) }
-
-            // The photo shows these three labels in one horizontal row. Requiring at least
-            // one neighbor avoids matching unrelated "动态" text elsewhere in the page.
-            if (sameRowNearby != null || sameRowAi != null) {
-                val row = listOfNotNull(dynamic, sameRowNearby, sameRowAi)
-                val score = (if (sameRowNearby != null) 1 else 0) + (if (sameRowAi != null) 1 else 0)
-                if (score > bestScore) {
-                    bestRow = row
-                    bestScore = score
-                }
-            }
-        }
-
-        val row = bestRow ?: return DynamicTabInspection(
-            null,
-            "识别到顶部‘动态’，但未找到同一行的‘附近’或‘AI小陌’标签，无法确认是首页顶部导航"
-        )
-        val dynamic = row.first { it.label == MOMO_DYNAMIC_TAB_LABEL }
-        val selectedLabels = row.filter { it.selected }.map { it.label }.distinct()
-        val selectionKnown = selectedLabels.size == 1
-        val dynamicSelected = selectionKnown && selectedLabels.single() == MOMO_DYNAMIC_TAB_LABEL
-
-        val rowBottom = row.maxOf { it.bounds.bottom }
-        val contentTop = rowBottom + dp(DYNAMIC_TAB_CONTENT_GAP_DP)
-        val selectionDescription = when {
-            dynamicSelected -> "顶部‘动态’标签已选中"
-            selectionKnown -> "顶部导航当前选中项为‘${selectedLabels.single()}’；可以主动切换到‘动态’"
-            selectedLabels.size > 1 -> "Tab选中状态存在祖先节点歧义，按顶部标签行结构识别"
-            else -> "无障碍节点未暴露Tab选中状态，按‘动态/附近/AI小陌’同排结构识别"
-        }
-        val neighborDescription = if (bestScore == 2) "附近与AI小陌同排" else "附近或AI小陌同排"
-        return DynamicTabInspection(
-            DynamicTabRowEvidence(
-                contentTop = contentTop,
-                diagnostic = "$selectionDescription，$neighborDescription",
-                dynamicBounds = Rect(dynamic.bounds),
-                dynamicSelected = dynamicSelected,
-                selectionKnown = selectionKnown
-            ),
-            ""
-        )
-    }
-
-    /** Finds a visible list-like container below the confirmed top Dynamic-tab row. */
     private fun findVisibleFeedContainer(
         root: AccessibilityNodeInfo,
         contentTop: Int
-    ): AccessibilityNodeInfo? {
-        val queue = ArrayDeque<AccessibilityNodeInfo>()
-        queue.add(AccessibilityNodeInfo.obtain(root))
-        val metrics = resources.displayMetrics
-        val minWidth = (metrics.widthPixels * MIN_LIST_WIDTH_RATIO).toInt()
-        val minHeight = (metrics.heightPixels * MIN_LIST_HEIGHT_RATIO).toInt()
-        var bestNode: AccessibilityNodeInfo? = null
-        var bestArea = 0L
-        var visited = 0
-        try {
-            while (queue.isNotEmpty() && visited < PAGE_FINGERPRINT_MAX_NODES) {
-                val node = queue.removeFirst()
-                visited++
-                try {
-                    val bounds = Rect()
-                    runCatching { node.getBoundsInScreen(bounds) }
-                    val visibleTop = maxOf(bounds.top, contentTop)
-                    val visibleHeight = bounds.bottom - visibleTop
-                    val className = node.className?.toString().orEmpty()
-                    val isListLike = className.endsWith("RecyclerView") ||
-                        className.endsWith("ListView") || className.endsWith("AbsListView") ||
-                        className.endsWith("ScrollView") || className.endsWith("NestedScrollView") ||
-                        className.endsWith("WebView")
-                    if (node.isVisibleToUser && isListLike && bounds.width() >= minWidth &&
-                        visibleHeight >= minHeight
-                    ) {
-                        val area = bounds.width().toLong() * visibleHeight.toLong()
-                        if (area > bestArea) {
-                            runCatching { bestNode?.recycle() }
-                            bestNode = AccessibilityNodeInfo.obtain(node)
-                            bestArea = area
-                        }
-                    }
+    ): AccessibilityNodeInfo? = momoPageInspector.findVisibleFeedContainer(root, contentTop)
 
-                    val childCount = runCatching { node.childCount }.getOrDefault(0)
-                    for (index in 0 until childCount) {
-                        if (visited + queue.size >= PAGE_FINGERPRINT_MAX_NODES) break
-                        val child = runCatching { node.getChild(index) }.getOrNull() ?: continue
-                        queue.add(child)
-                    }
-                } finally {
-                    runCatching { node.recycle() }
-                }
-            }
-        } finally {
-            while (queue.isNotEmpty()) runCatching { queue.removeFirst().recycle() }
-        }
-        return bestNode
-    }
-
-    private fun pageFingerprint(root: AccessibilityNodeInfo): PageFingerprint {
-        val queue = ArrayDeque<Pair<AccessibilityNodeInfo, Int>>()
-        queue.add(AccessibilityNodeInfo.obtain(root) to 0)
-        val structure = ArrayList<String>()
-        var visibleCount = 0
-        var visited = 0
-        try {
-            while (queue.isNotEmpty() && visited < PAGE_FINGERPRINT_MAX_NODES) {
-                val (node, depth) = queue.removeFirst()
-                visited++
-                try {
-                    if (node.isVisibleToUser) {
-                        visibleCount++
-                        val className = node.className?.toString().orEmpty().substringAfterLast('.')
-                        val viewId = runCatching { node.viewIdResourceName.orEmpty() }.getOrDefault("")
-                        val bounds = Rect()
-                        runCatching { node.getBoundsInScreen(bounds) }
-                        structure.add(
-                            "$depth:$className:$viewId:${node.isClickable}:${node.isScrollable}:" +
-                                "${bounds.width() / FINGERPRINT_SIZE_BUCKET_PX}:${bounds.height() / FINGERPRINT_SIZE_BUCKET_PX}"
-                        )
-                    }
-                    val childCount = runCatching { node.childCount }.getOrDefault(0)
-                    for (index in 0 until childCount) {
-                        if (visited + queue.size >= PAGE_FINGERPRINT_MAX_NODES) break
-                        val child = runCatching { node.getChild(index) }.getOrNull() ?: continue
-                        queue.add(child to depth + 1)
-                    }
-                } finally {
-                    runCatching { node.recycle() }
-                }
-            }
-        } finally {
-            while (queue.isNotEmpty()) runCatching { queue.removeFirst().first.recycle() }
-        }
-        return PageFingerprint(
-            signature = "$visibleCount:${structure.joinToString("|").hashCode()}",
-            nodeCount = visibleCount
-        )
-    }
+    private fun pageFingerprint(root: AccessibilityNodeInfo): PageFingerprint =
+        momoPageInspector.pageFingerprint(root)
 
     private fun randomBrowseDelayMs(): Long =
         Random.nextLong(MIN_BROWSE_DELAY_MS, MAX_BROWSE_DELAY_MS + 1L)

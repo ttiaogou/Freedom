@@ -9,7 +9,7 @@ app/src/main/java/com/freedom/
 ├── MainActivity.kt                 # 主界面、运行启停、权限与系统文档导出入口
 ├── accessibility/
 │   ├── FreedomAccessibilityService.kt  # Android 无障碍生命周期、事件入口和自动浏览状态机
-│   ├── browse/                     # 陌陌动态卡片识别和自动浏览模型
+│   ├── browse/                     # 陌陌页面识别、卡片筛选和自动浏览模型（含 MomoPageInspector）
 │   ├── event/                      # 无障碍事件描述格式化
 │   ├── gesture/                    # 手势参数、设备采样计算与校准执行控制器
 │   ├── scan/                        # 无障碍节点树扫描和快照
@@ -43,4 +43,4 @@ Freedom 需要用户主动开启无障碍服务和悬浮窗权限。前台伴随
 
 ## 本次结构整理
 
-参阅 [ARCHITECTURE.md](ARCHITECTURE.md) 和 [SOURCE-CHANGES.md](SOURCE-CHANGES.md)。目前完成第一阶段职责拆分和第二阶段设备手势校准执行拆分；均不新增自动化功能。Android 编译和真机验证仍应通过 GitHub Actions 与实际设备完成。
+参阅 [ARCHITECTURE.md](ARCHITECTURE.md) 和 [SOURCE-CHANGES.md](SOURCE-CHANGES.md)。目前完成第一阶段职责拆分、第二阶段设备手势校准执行拆分和第三阶段陌陌页面识别拆分；均不新增自动化功能。Android 编译和真机验证仍应通过 GitHub Actions 与实际设备完成。

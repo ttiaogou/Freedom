@@ -47,4 +47,14 @@
 - 保留原有校准 Action、Extra、包名限定、前台包名检查、屏幕边界校验、四组采样次数、路径控制点、350ms/700ms/350ms/250ms 时间参数和日志/广播顺序。
 - 没有修改自动浏览状态机、自动浏览手势逻辑、页面识别、节点扫描、UI 校准采样器或 GestureTuning 的设备参数计算。
 - 本阶段仅移动职责和建立回调边界，不新增用户功能或第三方依赖。
-- 本地完成控制器独立 Kotlin 编译检查（使用最小 Android API stub）及静态引用/生命周期核对；未执行 Android `assembleDebug`，最终以 GitHub Actions 和真机测试为准。\n
+- 本地完成控制器独立 Kotlin 编译检查（使用最小 Android API stub）及静态引用/生命周期核对；未执行 Android `assembleDebug`，最终以 GitHub Actions 和真机测试为准。
+
+
+## Stage 3 — Momo page inspection extraction (2026-11-07)
+
+- Added `app/src/main/java/com/freedom/accessibility/browse/MomoPageInspector.kt`.
+- Moved page-only evidence collection and readiness logic: Home bottom-navigation inspection, Dynamic top-tab inspection, feed readiness, visible feed-container lookup, and page fingerprint calculation.
+- Kept `FreedomAccessibilityService` as the owner of state-machine decisions and preserved its private call points as delegates.
+- Moved the read-only detail identity check into the inspector; Activity/session values are passed in by the service. Navigation actions, popup dismissal, and gesture execution remain in the service.
+- Passed the exact existing package/label/threshold/node-limit values into the inspector; no behavior constants were tuned.
+- No new features or dependencies. Full Android compilation still needs GitHub Actions validation.

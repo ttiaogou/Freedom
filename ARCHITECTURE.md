@@ -54,3 +54,13 @@
 本阶段没有新增权限、Manifest 声明、持久化键、Intent Action、第三方依赖或用户可见功能。
 
 静态检查已确认旧校准状态字段/方法不再由 Service 持有，接收器在连接与销毁时仍由 Service 配对注册/注销；新控制器已使用 Kotlin 编译器和最小 Android API stub 做独立语法/类型形状检查。当前环境没有 Android SDK/Gradle，完整 `assembleDebug` 与真机校准仍需通过 GitHub Actions 和设备确认。
+
+
+## Stage 3 — Momo page inspection extraction (2026-11-07)
+
+- Extracted the existing Home bottom-navigation evidence, Dynamic-tab row inspection, feed-readiness check, visible feed-container lookup, and page fingerprint into `accessibility/browse/MomoPageInspector.kt`.
+- The inspector returns the existing `HomeBottomNavEvidence`, `DynamicTabInspection`, `FeedReadinessInspection`, and `PageFingerprint` data types. Its thresholds, labels, scan cap, bounds calculations, child counting, and node recycling are supplied from the same existing service constants and retain their prior values.
+- `FreedomAccessibilityService` keeps its existing private entry points as thin delegates so existing state-machine call sites and action ordering are unchanged.
+- The detail-page identity check also lives in the inspector; the service passes its current/expected Activity values because those belong to the live navigation session. Navigation click-target lookup, popup handling, gestures, and all state transitions remain in the service.
+- `MomoPageInspector` is read-only: it does not click, scroll, navigate, schedule callbacks, or alter account-browse state.
+- No UI behavior, timing, gesture parameters, package filters, or third-party dependencies were changed.
