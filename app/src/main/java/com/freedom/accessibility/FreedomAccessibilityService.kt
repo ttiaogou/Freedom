@@ -30,6 +30,7 @@ import com.freedom.accessibility.browse.AccountBrowseController
 import com.freedom.accessibility.browse.AccountBrowsePhase
 import com.freedom.accessibility.browse.AccountBrowseSessionState
 import com.freedom.accessibility.browse.DetailPageIdentityInspection
+import com.freedom.accessibility.browse.DetailDwellScrollPolicy
 import com.freedom.accessibility.browse.DynamicTabInspection
 import com.freedom.accessibility.browse.DynamicTabRowEvidence
 import com.freedom.accessibility.browse.FeedGestureTarget
@@ -182,6 +183,10 @@ class FreedomAccessibilityService : AccessibilityService() {
     private var accountBrowseDetailDwellDueAt: Long
         get() = accountBrowseSession.detailDwellDueAt
         set(value) { accountBrowseSession.detailDwellDueAt = value }
+
+    private var accountBrowseDetailDwellStartedAt: Long
+        get() = accountBrowseSession.detailDwellStartedAt
+        set(value) { accountBrowseSession.detailDwellStartedAt = value }
 
     private var accountBrowseDetailDwellRemainingMs: Long
         get() = accountBrowseSession.detailDwellRemainingMs
@@ -1069,6 +1074,7 @@ class FreedomAccessibilityService : AccessibilityService() {
                                 accountBrowseDetailFingerprint = ""
                                 accountBrowseProgrammaticActionLabel = ""
                                 accountBrowseDetailDwellDueAt = 0L
+                                accountBrowseDetailDwellStartedAt = 0L
                                 accountBrowseDetailDwellRemainingMs = 0L
                                 accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_FEED_STABLE
                                 accountBrowseDeadlineAt = System.currentTimeMillis() + INITIAL_FEED_STABILITY_TIMEOUT_MS
@@ -2001,7 +2007,8 @@ class FreedomAccessibilityService : AccessibilityService() {
                 val dwell = randomBrowseDelayMs()
                 accountBrowsePhase = AccountBrowsePhase.DETAIL_DWELL
                 accountBrowseDetailDwellRemainingMs = dwell
-                accountBrowseDetailDwellDueAt = System.currentTimeMillis() + dwell
+                accountBrowseDetailDwellStartedAt = System.currentTimeMillis()
+                accountBrowseDetailDwellDueAt = accountBrowseDetailDwellStartedAt + dwell
                 addLog("动态详情已确认载入；本次阅读停留 ${dwell / 1000.0} 秒")
                 scheduleAccountBrowseStep(dwell)
                 return
@@ -2220,7 +2227,8 @@ class FreedomAccessibilityService : AccessibilityService() {
         if (accountBrowseStableSamples >= REQUIRED_STABLE_PAGE_SAMPLES) {
             accountBrowseImageBrowserActive = false
             accountBrowseImageBrowserReturnActivityClass = ""
-            accountBrowseDetailDwellDueAt = System.currentTimeMillis() + accountBrowseDetailDwellRemainingMs
+            accountBrowseDetailDwellStartedAt = System.currentTimeMillis()
+            accountBrowseDetailDwellDueAt = accountBrowseDetailDwellStartedAt + accountBrowseDetailDwellRemainingMs
             accountBrowsePhase = AccountBrowsePhase.DETAIL_DWELL
             val remaining = accountBrowseDetailDwellRemainingMs
             addLog(
@@ -2280,6 +2288,15 @@ class FreedomAccessibilityService : AccessibilityService() {
             accountBrowseCurrentActivityClass == MOMO_DYNAMIC_DETAIL_ACTIVITY &&
             className.substringAfterLast('.') == "RecyclerView"
 
+    private fun isDetailDwellStartupScroll(eventType: Int, className: String, now: Long): Boolean =
+        DetailDwellScrollPolicy.shouldIgnore(
+            isScrollEvent = eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED,
+            isDetailActivity = accountBrowseCurrentActivityClass == MOMO_DYNAMIC_DETAIL_ACTIVITY,
+            isDetailDwell = accountBrowsePhase == AccountBrowsePhase.DETAIL_DWELL,
+            isRecyclerView = className.substringAfterLast('.') == "RecyclerView",
+            elapsedSinceDwellStartMs = now - accountBrowseDetailDwellStartedAt
+        )
+
     private fun isNavigationVerificationScroll(eventType: Int, className: String): Boolean =
         eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED &&
             accountBrowsePhase == AccountBrowsePhase.VERIFY_NAVIGATION_ACTION &&
@@ -2288,6 +2305,8 @@ class FreedomAccessibilityService : AccessibilityService() {
     private fun classifyInteractionEventOrigin(eventType: Int, now: Long, className: String): String = when {
         isDetailLoadContainerScroll(eventType, className) ->
             "动态详情加载期间 RecyclerView 的容器滚动/布局事件；缺少独立触摸证据，不按用户操作处理"
+        isDetailDwellStartupScroll(eventType, className, now) ->
+            "动态详情刚确认载入；2 秒缓冲期内 RecyclerView 滚动/布局事件不单独认定为用户操作"
         isNavigationVerificationScroll(eventType, className) ->
             "导航动作后的页面切换/列表加载事件；正在验证页面层级，单独的 RecyclerView 滚动不足以认定为用户操作"
         eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED &&
@@ -2342,6 +2361,10 @@ class FreedomAccessibilityService : AccessibilityService() {
         if (isProgrammaticInteractionEvent(eventType, now)) return
         if (isDetailLoadContainerScroll(eventType, className)) {
             addLog("详情页面正在初始化；检测到 RecyclerView 滚动/布局事件，但没有独立用户触摸证据，来源标记为待确认，不触发暂停")
+            return
+        }
+        if (isDetailDwellStartupScroll(eventType, className, now)) {
+            addLog("动态详情刚确认载入；2 秒缓冲期内检测到 RecyclerView 滚动/布局事件，没有独立触摸证据，不触发暂停")
             return
         }
         if (isNavigationVerificationScroll(eventType, className)) {

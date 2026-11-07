@@ -38,6 +38,7 @@ internal class AccountBrowseSessionState {
     var imageBrowserReturnActivityClass = ""
     var imageBrowserActive = false
     var detailDwellDueAt = 0L
+    var detailDwellStartedAt = 0L
     var detailDwellRemainingMs = 0L
     var ignoreManualEventsUntil = 0L
     var programmaticActionLabel = ""
@@ -101,6 +102,7 @@ internal class AccountBrowseSessionState {
         imageBrowserReturnActivityClass = ""
         imageBrowserActive = false
         detailDwellDueAt = 0L
+        detailDwellStartedAt = 0L
         detailDwellRemainingMs = 0L
         ignoreManualEventsUntil = 0L
         programmaticActionLabel = ""
