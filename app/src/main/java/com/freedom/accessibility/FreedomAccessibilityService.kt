@@ -20,6 +20,7 @@ import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.widget.TextView
+import com.freedom.BuildConfig
 import com.freedom.data.MonitorActions
 import com.freedom.data.MonitorStore
 import com.freedom.accessibility.browse.MomoDynamicCardSelector
@@ -66,6 +67,7 @@ class FreedomAccessibilityService : AccessibilityService() {
     private var lastEventAt = 0L
     private var scanQueued = false
     private var targetReceiverRegistered = false
+    private var debugRecoveryTestReceiverRegistered = false
 
     private var accountBrowsePhase: AccountBrowsePhase
         get() = accountBrowseController.phase
@@ -495,6 +497,41 @@ class FreedomAccessibilityService : AccessibilityService() {
         }
     }
 
+    /** This receiver is registered only in Debug builds and is never exported. */
+    private val debugRecoveryTestReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (!BuildConfig.DEBUG ||
+                intent?.action != ACTION_DEBUG_SIMULATE_RETURN_POSITION_FAILURE
+            ) return
+
+            if (!MonitorStore.isRunning(this@FreedomAccessibilityService) ||
+                !isAccountBrowseModeEnabled() ||
+                MonitorStore.targetPackage(this@FreedomAccessibilityService) != MOMO_PACKAGE
+            ) {
+                addLog("Debug 恢复专项测试未执行：监听未运行、养号模式未开启，或目标应用不是陌陌")
+                return
+            }
+            if (accountBrowseTouchActive) {
+                addLog("Debug 恢复专项测试未执行：当前仍检测到屏幕触摸；请停止触摸后重新触发")
+                return
+            }
+            if (accountBrowseFeedRefreshRecoveryActive ||
+                accountBrowsePhase == AccountBrowsePhase.REFRESH_DYNAMIC_FEED ||
+                accountBrowsePhase == AccountBrowsePhase.VERIFY_DYNAMIC_FEED_REFRESH
+            ) {
+                addLog("Debug 恢复专项测试未重复触发：当前已经处于动态刷新恢复流程")
+                return
+            }
+
+            mainHandler.removeCallbacks(manualTouchResumeRunnable)
+            accountBrowseManualResumeAllowed = false
+            accountBrowsePausedContext = null
+            accountBrowsePauseReason = ""
+            addLog("Debug 专项测试指令已收到；模拟一次返回位置验证失败，转入正式主动刷新恢复流程")
+            beginDynamicFeedRefreshRecovery("Debug 专项测试：模拟返回位置验证失败")
+        }
+    }
+
     private val scanRunnable = Runnable {
         scanQueued = false
         accessibilityTreeScanner.scanActiveWindow()
@@ -535,6 +572,20 @@ class FreedomAccessibilityService : AccessibilityService() {
                 registerReceiver(refreshReceiver, filter)
             }
             refreshReceiverRegistered = true
+        }
+        if (BuildConfig.DEBUG && !debugRecoveryTestReceiverRegistered) {
+            val filter = IntentFilter(ACTION_DEBUG_SIMULATE_RETURN_POSITION_FAILURE)
+            if (Build.VERSION.SDK_INT >= 33) {
+                registerReceiver(
+                    debugRecoveryTestReceiver,
+                    filter,
+                    Context.RECEIVER_NOT_EXPORTED
+                )
+            } else {
+                @Suppress("DEPRECATION")
+                registerReceiver(debugRecoveryTestReceiver, filter)
+            }
+            debugRecoveryTestReceiverRegistered = true
         }
         if (!gestureCalibrationReceiverRegistered) {
             val filter = IntentFilter().apply {
@@ -3160,6 +3211,10 @@ class FreedomAccessibilityService : AccessibilityService() {
             runCatching { unregisterReceiver(refreshReceiver) }
             refreshReceiverRegistered = false
         }
+        if (debugRecoveryTestReceiverRegistered) {
+            runCatching { unregisterReceiver(debugRecoveryTestReceiver) }
+            debugRecoveryTestReceiverRegistered = false
+        }
         if (gestureCalibrationReceiverRegistered) {
             runCatching { unregisterReceiver(gestureCalibrationController.receiver) }
             gestureCalibrationReceiverRegistered = false
@@ -3169,6 +3224,9 @@ class FreedomAccessibilityService : AccessibilityService() {
     }
 
     companion object {
+        const val ACTION_DEBUG_SIMULATE_RETURN_POSITION_FAILURE =
+            "com.freedom.action.DEBUG_SIMULATE_RETURN_POSITION_FAILURE"
+
         private const val SCAN_DEBOUNCE_MS = 350L
 
         private const val ACCOUNT_BROWSE_PREFS = "freedom_main_ui"

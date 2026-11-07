@@ -15,6 +15,8 @@ import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.os.Bundle
 import android.provider.Settings
 import android.view.Gravity
@@ -229,9 +231,25 @@ class MainActivity : Activity() {
         root.addView(View(this), LinearLayout.LayoutParams(-1, 0, 1f))
 
         val bottom = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.END or Gravity.CENTER_VERTICAL
             setPadding(dp(16), dp(8), dp(20), dp(14))
             setBackgroundColor(Color.WHITE)
+        }
+
+        if (BuildConfig.DEBUG) {
+            val debugRecoveryButton = Button(this).apply {
+                text = "模拟返回位置验证失败"
+                textSize = 12f
+                isAllCaps = false
+                setOnClickListener { confirmDebugReturnRecoveryTest() }
+            }
+            bottom.addView(
+                debugRecoveryButton,
+                LinearLayout.LayoutParams(0, dp(52), 1f).apply {
+                    marginEnd = dp(12)
+                }
+            )
         }
 
         runButton = ImageButton(this).apply {
@@ -246,6 +264,75 @@ class MainActivity : Activity() {
 
         setContentView(root)
         refreshScreen()
+    }
+
+    /** Debug-only entry that drives the real feed-refresh recovery path on demand. */
+    private fun confirmDebugReturnRecoveryTest() {
+        if (!BuildConfig.DEBUG) return
+
+        if (!MonitorStore.isRunning(this) || !keepAccountCheckBox.isChecked) {
+            Toast.makeText(
+                this,
+                "请先开启监听并选择养号模式，再运行恢复专项测试",
+                Toast.LENGTH_LONG
+            ).show()
+            return
+        }
+        if (!isAccessibilityEnabled()) {
+            Toast.makeText(this, "无障碍服务尚未连接，不能触发恢复测试", Toast.LENGTH_LONG).show()
+            return
+        }
+
+        val targetPackage = MonitorStore.targetPackage(this)
+        if (targetPackage != DEBUG_MOMO_PACKAGE) {
+            Toast.makeText(
+                this,
+                "本专项测试仅适用于目标应用设置为陌陌",
+                Toast.LENGTH_LONG
+            ).show()
+            return
+        }
+
+        val momoLaunchIntent = packageManager.getLaunchIntentForPackage(DEBUG_MOMO_PACKAGE)
+        if (momoLaunchIntent == null) {
+            Toast.makeText(this, "没有找到已安装的陌陌应用", Toast.LENGTH_LONG).show()
+            return
+        }
+
+        AlertDialog.Builder(this)
+            .setTitle("Debug 恢复专项测试")
+            .setMessage(
+                "此操作会中断当前自动浏览，并模拟一次‘返回位置验证失败’。\n\n" +
+                    "Freedom 将打开陌陌，主动识别首页和动态标签，执行首页连续双击刷新，" +
+                    "验证刷新后列表稳定，再尝试恢复自动浏览。\n\n" +
+                    "测试开始后请不要触摸手机屏幕；刷新成功后程序可能继续自动浏览，" +
+                    "请在看到恢复成功日志后手动停止监听。"
+            )
+            .setNegativeButton("取消", null)
+            .setPositiveButton("打开陌陌并测试") { _, _ ->
+                MonitorStore.addLog(
+                    this,
+                    timestamp() + "  Debug 恢复专项测试已请求；准备打开陌陌并模拟返回位置验证失败"
+                )
+                runCatching {
+                    startActivity(momoLaunchIntent)
+                }.onSuccess {
+                    Handler(Looper.getMainLooper()).postDelayed({
+                        sendBroadcast(
+                            Intent(FreedomAccessibilityService.ACTION_DEBUG_SIMULATE_RETURN_POSITION_FAILURE)
+                                .setPackage(packageName)
+                        )
+                        Toast.makeText(
+                            this,
+                            "已发送恢复测试指令；请保持屏幕不触摸并查看运行日志",
+                            Toast.LENGTH_LONG
+                        ).show()
+                    }, DEBUG_RECOVERY_TRIGGER_DELAY_MS)
+                }.onFailure {
+                    Toast.makeText(this, "无法打开陌陌：${it.message ?: "未知错误"}", Toast.LENGTH_LONG).show()
+                }
+            }
+            .show()
     }
 
     private fun toggleMonitoring() {
@@ -714,6 +801,8 @@ class MainActivity : Activity() {
         private const val REQUEST_MEDIA_PERMISSION = 2001
         private const val REQUEST_EXPORT_LOGS = 2002
         private const val REQUEST_NOTIFICATION_PERMISSION = 2003
+        private const val DEBUG_MOMO_PACKAGE = "com.immomo.momo"
+        private const val DEBUG_RECOVERY_TRIGGER_DELAY_MS = 1_000L
         private val PACKAGE_PATTERN = Regex("^[A-Za-z][A-Za-z0-9_]*(\\.[A-Za-z][A-Za-z0-9_]*)+$")
     }
 }
