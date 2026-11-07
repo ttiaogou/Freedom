@@ -122,3 +122,14 @@
 - 两处“已经处于 PAUSED 时记录人工接管上下文”的重复代码改为调用 Controller 的同一方法；保留第一次上下文快照不被覆盖的规则。
 - 未更改状态枚举、各阶段处理动作、导航/弹窗重试参数、手势参数、延时常量、广播、持久化键或权限；无新功能和第三方依赖。
 - 本地完成 reset 字段顺序与原 Service 逐项对照、Controller 独立 Kotlin 编译/行为顺序检查、引用和差异检查；当前环境没有 Android SDK/Gradle，未执行完整 `assembleDebug` 或真机回归，仍须通过 GitHub Actions 验证。
+
+
+## Stage 10 — 最终结构整理（2026-11-07）
+
+- 基线：用户上传的 `Freedom(20261107-131555).zip`，Git HEAD `f5203d9`，包含第九阶段尚未提交的工作区变更。
+- 从 `FreedomAccessibilityService.kt` 移除 53 个逐字段兼容代理属性；所有会话字段引用改为直接读取/写入 `accountBrowseSession.<field>`，该引用仍指向 `accountBrowseController.session` 唯一实例。
+- 保留 `accountBrowsePhase` 的单一代理，以确保写入继续经过 `AccountBrowseController.transitionTo()`；保留 `performAccountBrowseStep()` 对 `performStep()` 的 Service 入口。
+- 清理 `MainActivity.kt`、`MonitorOverlay.kt`、`ConfigPanel.kt` 和 Service 中由组件抽取遗留的未使用 imports。
+- 更新架构文档，明确 Service 的平台职责与 Controller 的阶段/会话职责边界。
+- 未改变字段类型/默认值、状态枚举、状态分派、pause/reset/recovery 顺序、Android 系统调用、计时常量、自动操作行为、Manifest、Gradle 配置或依赖。
+- 本地完成字段映射与引用检查、未使用 import 静态检查、XML 解析和源码差异审查。当前环境没有 Android SDK/Gradle，未执行完整 `assembleDebug` 或真机回归；需由 GitHub Actions 和设备完成最终验收。

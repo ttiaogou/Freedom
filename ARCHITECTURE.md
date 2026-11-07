@@ -26,6 +26,8 @@
 
 页面识别、导航重试、滑动派发与完成回调、详情停留、图片浏览返回及目标应用事件处理仍由 `FreedomAccessibilityService` 执行；自动浏览的阶段状态、会话数据和 pause/reset/manual-resume/recovery 协调由 `AccountBrowseController` 持有并编排，平台副作用仍通过 Service 回调完成。
 
+Service 直接通过 `accountBrowseSession` 访问 `AccountBrowseController.session` 中的会话字段；不再保留逐字段转发的兼容属性。`accountBrowsePhase` 仍保留单一读写入口，以保证所有阶段赋值继续经过 Controller。
+
 ## 明确未做
 
 - 没有更换 Android View UI 技术。
@@ -123,3 +125,13 @@
 - 页面不确定时的恢复仍保留原有暂停上下文只在为空时创建、先清理悬浮窗/调度、再清理导航尝试字段、进入 `WAIT_FOR_DYNAMIC_TAB` 并安排下一步的顺序。
 - `pauseAccountBrowse()`、`resetAccountBrowseSession()`、`beginDynamicNavigationRecovery()` 在 Service 中保留为兼容入口；不迁移 AccessibilityService 生命周期、实际手势、页面识别、导航动作或 Handler 所有权。
 - 本阶段没有改变阶段枚举、超时数值、静默时长、页面识别规则、点击/滑动行为和用户操作方式；没有新增权限、广播、持久化键或第三方依赖。
+
+
+## Stage 10 — 最终结构整理
+
+- 移除 `FreedomAccessibilityService` 中 53 个逐字段转发属性；原有业务代码改为直接访问唯一的 `accountBrowseSession` 对象。字段仍由同一个 `AccountBrowseController.session` 实例持有，不创建第二份状态，也不改变字段名、类型和默认值。
+- 保留 `accountBrowsePhase` 作为 Controller 的唯一阶段读写边界；阶段写入仍调用 `transitionTo()`，自动浏览步骤仍经 `performStep()` 分派。
+- 保留 Service 中需要承接 Android 平台副作用的入口与回调，不把 AccessibilityService 生命周期、系统事件、Handler、窗口管理或实际手势派发移入纯 Kotlin Controller。
+- 清理此前组件抽取后遗留的未使用 Kotlin imports；没有删除仍被调用的方法或修改第三方依赖。
+- 未调整状态转换顺序、会话字段、时序常量、页面识别、导航/弹窗重试、手势轨迹或用户交互。
+- 本次最终整理仍需在 Android SDK/Gradle 环境执行完整 `assembleDebug`，并进行真机回归；本地容器缺少 Gradle/Android SDK，不能声称完整 APK 构建通过。

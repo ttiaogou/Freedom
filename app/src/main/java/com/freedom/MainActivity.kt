@@ -1,7 +1,6 @@
 package com.freedom
 
 import android.app.Activity
-import android.app.Dialog
 import android.app.AlertDialog
 import android.content.BroadcastReceiver
 import android.content.ComponentName
@@ -11,7 +10,6 @@ import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.Typeface
-import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.os.Build
@@ -23,15 +21,11 @@ import android.view.ViewGroup
 import android.view.WindowInsets
 import android.widget.Button
 import android.widget.CheckBox
-import android.widget.EditText
 import android.widget.ImageButton
 import android.widget.LinearLayout
-import android.widget.ScrollView
-import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
 import com.freedom.accessibility.FreedomAccessibilityService
-import com.freedom.accessibility.gesture.GestureTuning
 import com.freedom.data.MonitorActions
 import com.freedom.data.MonitorStore
 import com.freedom.overlay.MonitorOverlay
