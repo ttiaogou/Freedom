@@ -49,15 +49,21 @@ object MonitorOverlay {
     private var touchPassthrough = false
 
     fun show(context: Context): Boolean {
+        val appContext = context.applicationContext
+        if (!MonitorStore.isOverlayEnabled(appContext) ||
+            !MonitorStore.isFloatingLogEnabled(appContext)
+        ) {
+            hide()
+            return false
+        }
         if (attached) {
-            update(context)
+            update(appContext)
             return true
         }
-        if (Build.VERSION.SDK_INT >= 23 && !android.provider.Settings.canDrawOverlays(context)) {
+        if (Build.VERSION.SDK_INT >= 23 && !android.provider.Settings.canDrawOverlays(appContext)) {
             return false
         }
 
-        val appContext = context.applicationContext
         val wm = appContext.getSystemService(Context.WINDOW_SERVICE) as? WindowManager ?: return false
         windowManager = wm
         expanded = false
@@ -380,6 +386,8 @@ object MonitorOverlay {
         }
     }
 
+    fun isAttached(): Boolean = attached && rootView != null
+
     /**
      * Temporarily removes the monitor panel from the touch path while an accessibility
      * gesture is dispatched. The root view is made INVISIBLE as well as NOT_TOUCHABLE;
@@ -394,7 +402,6 @@ object MonitorOverlay {
         val view = rootView
         val params = layoutParams
         if (!attached || view == null || params == null) {
-            touchPassthrough = enabled
             return true
         }
 
@@ -435,6 +442,12 @@ object MonitorOverlay {
     fun update(context: Context) {
         val appContext = context.applicationContext
         mainHandler.post {
+            if (!MonitorStore.isOverlayEnabled(appContext) ||
+                !MonitorStore.isFloatingLogEnabled(appContext)
+            ) {
+                hide()
+                return@post
+            }
             if (!attached) return@post
 
             val snapshot = MonitorStore.snapshot(appContext)

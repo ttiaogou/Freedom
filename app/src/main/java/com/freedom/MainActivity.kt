@@ -35,9 +35,6 @@ import com.freedom.data.MonitorActions
 import com.freedom.data.MonitorStore
 import com.freedom.overlay.MonitorOverlay
 import com.freedom.stability.MonitorKeepAliveService
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
 
 class MainActivity : Activity() {
 
@@ -55,32 +52,6 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         buildScreen()
-    }
-
-    @Suppress("DEPRECATION")
-    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-        super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode != REQUEST_EXPORT_LOGS || resultCode != RESULT_OK) return
-        val uri = data?.data ?: return
-        val currentLogs = MonitorStore.logs(this)
-        val exportText = buildString {
-            appendLine("Freedom 运行日志")
-            appendLine("导出时间：${SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(Date())}")
-            appendLine("记录数量：${currentLogs.size}")
-            appendLine("保留范围：应用内最近记录（最多 300 条）")
-            appendLine()
-            append(formatLogLines(currentLogs, includeTechnicalDetails = true))
-        }
-        val saved = runCatching {
-            val output = contentResolver.openOutputStream(uri)
-                ?: error("无法打开所选文件")
-            output.use { it.write(exportText.toByteArray(Charsets.UTF_8)) }
-        }
-        if (saved.isSuccess) {
-            Toast.makeText(this, "日志已导出（${currentLogs.size} 条）", Toast.LENGTH_LONG).show()
-        } else {
-            Toast.makeText(this, "日志导出失败：${saved.exceptionOrNull()?.message ?: "未知错误"}", Toast.LENGTH_LONG).show()
-        }
     }
 
     override fun onResume() {
@@ -352,6 +323,7 @@ class MainActivity : Activity() {
             if (isAccessibilityEnabled()) "已授权" else "未授权 · 点击前往设置",
             if (isAccessibilityEnabled()) "已授权" else "去授权"
         ) {
+            dialog.dismiss()
             startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
         }
         addConfigActionRow(
@@ -359,6 +331,7 @@ class MainActivity : Activity() {
             if (Settings.canDrawOverlays(this)) "已允许在其他应用上层显示" else "未授权 · 点击前往设置",
             if (Settings.canDrawOverlays(this)) "已允许" else "去授权"
         ) {
+            dialog.dismiss()
             requestOverlayPermission()
         }
         addConfigSwitchRow(
@@ -389,6 +362,7 @@ class MainActivity : Activity() {
         addConfigActionRow(
             rows, "⚙", "后台运行设置", "查看系统电池和应用后台限制设置", "打开"
         ) {
+            dialog.dismiss()
             openAppDetailsSettings()
         }
 
@@ -409,15 +383,24 @@ class MainActivity : Activity() {
             }
         }
         addConfigSwitchRow(
-            rows, "▤", "悬浮日志", "控制展开后是否显示实时事件日志",
+            rows, "▤", "悬浮日志", "关闭时隐藏整个实时监控悬浮窗；开启时显示悬浮窗及日志",
             MonitorStore.isFloatingLogEnabled(this)
         ) { enabled ->
             MonitorStore.setFloatingLogEnabled(this, enabled)
-            MonitorOverlay.update(this)
+            if (enabled) {
+                if (MonitorStore.isOverlayEnabled(this) && MonitorStore.isRunning(this) &&
+                    Settings.canDrawOverlays(this)
+                ) {
+                    MonitorOverlay.show(this)
+                }
+            } else {
+                MonitorOverlay.hide()
+            }
         }
         addConfigActionRow(
             rows, "◎", "监控目标", MonitorStore.targetPackage(this), "修改"
         ) {
+            dialog.dismiss()
             showTargetEditor()
         }
 
@@ -425,6 +408,7 @@ class MainActivity : Activity() {
         addConfigActionRow(
             rows, "▧", "照片和视频访问（可选）", "当前监控功能不依赖此权限", "设置"
         ) {
+            dialog.dismiss()
             requestPhotoPermission()
         }
         addConfigActionRow(
@@ -749,23 +733,13 @@ class MainActivity : Activity() {
                     .ifBlank { "暂无运行记录" }
             }
         }
-        val exportButton = Button(this).apply {
-            text = "导出日志"
-            isAllCaps = false
-            setOnClickListener { exportLogs() }
-        }
-        val actionRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            addView(detailsToggle, LinearLayout.LayoutParams(0, -2, 1f))
-            addView(exportButton, LinearLayout.LayoutParams(0, -2, 1f))
-        }
         val scroll = ScrollView(this).apply {
             addView(view)
             setPadding(dp(4), 0, dp(4), 0)
         }
         val container = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            addView(actionRow, LinearLayout.LayoutParams(-1, -2))
+            addView(detailsToggle, LinearLayout.LayoutParams(-1, -2))
             addView(scroll, LinearLayout.LayoutParams(-1, dp(420)))
         }
         AlertDialog.Builder(this)
@@ -777,20 +751,6 @@ class MainActivity : Activity() {
                 refreshScreen()
             }
             .show()
-    }
-
-    private fun exportLogs() {
-        val filenameTime = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
-        val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
-            addCategory(Intent.CATEGORY_OPENABLE)
-            type = "text/plain"
-            putExtra(Intent.EXTRA_TITLE, "Freedom-运行日志-$filenameTime.txt")
-        }
-        runCatching {
-            startActivityForResult(intent, REQUEST_EXPORT_LOGS)
-        }.onFailure {
-            Toast.makeText(this, "无法打开文件保存界面：${it.message}", Toast.LENGTH_LONG).show()
-        }
     }
 
     private fun formatLogLines(
@@ -912,7 +872,6 @@ class MainActivity : Activity() {
         private const val KEY_KEEP_ACCOUNT_MODE = "keep_account_mode_enabled"
         private const val LOG_DETAIL_SEPARATOR = "\u001F"
         private const val REQUEST_MEDIA_PERMISSION = 2001
-        private const val REQUEST_EXPORT_LOGS = 2002
         private val PACKAGE_PATTERN = Regex("^[A-Za-z][A-Za-z0-9_]*(\\.[A-Za-z][A-Za-z0-9_]*)+$")
     }
 }

@@ -79,6 +79,11 @@ class FreedomAccessibilityService : AccessibilityService() {
         val reason: String
     )
 
+    private data class FeedGestureTarget(
+        val bounds: Rect,
+        val className: String
+    )
+
     private data class ScrollGestureProfile(
         val durationMs: Long,
         val curveOffsetRatio: Float,
@@ -189,16 +194,19 @@ class FreedomAccessibilityService : AccessibilityService() {
                 MonitorKeepAliveService.stop(this)
                 MonitorStore.addLog(this, "恢复监听失败：悬浮窗授权已失效，请重新授权后启动")
             } else {
-                if (MonitorStore.isOverlayEnabled(this)) {
+                if (MonitorStore.isOverlayEnabled(this) && MonitorStore.isFloatingLogEnabled(this)) {
                     MonitorOverlay.show(this)
                 }
-                if (MonitorStore.isKeepAliveEnabled(this) && MonitorStore.isOverlayEnabled(this)) {
+                if (MonitorStore.isKeepAliveEnabled(this) && MonitorStore.isOverlayEnabled(this) &&
+                    MonitorStore.isFloatingLogEnabled(this)
+                ) {
                     // Android 15 background FGS starts require a visible overlay for the SYSTEM_ALERT_WINDOW exemption.
                     // The overlay is attached above before attempting to restore the foreground companion.
                     mainHandler.postDelayed({
                         if (MonitorStore.isRunning(this) &&
                             MonitorStore.isKeepAliveEnabled(this) &&
                             MonitorStore.isOverlayEnabled(this) &&
+                            MonitorStore.isFloatingLogEnabled(this) &&
                             Settings.canDrawOverlays(this)) {
                             MonitorKeepAliveService.start(this)
                         }
@@ -587,6 +595,11 @@ class FreedomAccessibilityService : AccessibilityService() {
 
     /** Temporarily remove the live monitor window from the touch path for the swipe. */
     private fun enableMonitorOverlayTouchPassthrough(): Boolean {
+        if (!MonitorOverlay.isAttached()) {
+            accountBrowseOverlayPassthroughActive = false
+            addLog("实时监控悬浮窗当前未附加（配置中‘悬浮日志’已关闭）；本次滑动不经过悬浮窗")
+            return true
+        }
         val before = MonitorOverlay.touchStateDescription()
         val enabled = MonitorOverlay.setTouchPassthrough(true)
         if (!enabled) {
@@ -619,25 +632,66 @@ class FreedomAccessibilityService : AccessibilityService() {
         return false
     }
 
+    /** Resolve the same visible feed container used by the readiness gate and return
+     * its screen-space bounds, clipped below the Dynamic tab row and to the display. */
+    private fun resolveFeedGestureTarget(root: AccessibilityNodeInfo): FeedGestureTarget? {
+        val tabInspection = inspectDynamicTabRow(root)
+        val tabEvidence = tabInspection.evidence ?: run {
+            addLog("无法取得首次滑动区域：${tabInspection.reason}")
+            return null
+        }
+        val listNode = findVisibleFeedContainer(root, tabEvidence.contentTop) ?: run {
+            addLog("无法取得首次滑动区域：动态标签下方没有可见列表容器")
+            return null
+        }
+        return try {
+            val rawBounds = Rect()
+            listNode.getBoundsInScreen(rawBounds)
+            val metrics = resources.displayMetrics
+            val clipped = Rect(
+                maxOf(rawBounds.left, 0),
+                maxOf(rawBounds.top, tabEvidence.contentTop, 0),
+                minOf(rawBounds.right, metrics.widthPixels),
+                minOf(rawBounds.bottom, metrics.heightPixels)
+            )
+            val className = listNode.className?.toString()?.substringAfterLast('.') ?: "Unknown"
+            if (clipped.width() < MIN_GESTURE_WIDTH_PX ||
+                clipped.height() < MIN_GESTURE_HEIGHT_PX
+            ) {
+                addLog(
+                    "目标列表有效滑动区域过小：class=$className，" +
+                        "原始边界=$rawBounds，有效边界=$clipped"
+                )
+                null
+            } else {
+                FeedGestureTarget(clipped, className)
+            }
+        } catch (error: Exception) {
+            addLog("读取动态列表屏幕边界失败：${error.javaClass.simpleName}")
+            null
+        } finally {
+            runCatching { listNode.recycle() }
+        }
+    }
+
     /**
-     * First-stage verification: dispatch one screen-coordinate swipe only.
-     * No feed tab, RecyclerView, scroll-node or card lookup is performed before dispatch.
+     * First-stage verification: dispatch one swipe inside the confirmed visible feed container.
+     * Card recognition and card interaction remain deferred until after this initial scroll check.
      */
     private fun performFeedScroll() {
         val root = obtainTargetRootOrPause() ?: return
-        accountBrowseSourceSnapshot = try {
-            captureVisibleFeedNodeSnapshot(root)
+        val target = try {
+            accountBrowseSourceSnapshot = captureVisibleFeedNodeSnapshot(root)
+            resolveFeedGestureTarget(root)
         } finally {
             runCatching { root.recycle() }
+        } ?: run {
+            pauseAccountBrowse("无法定位首页动态列表的有效滑动区域；未发送首次滑动")
+            return
         }
         addLog("首次滑动前可见节点快照：${accountBrowseSourceSnapshot.ifBlank { "未提取到可见文字节点" }}")
 
-        val bounds = screenSwipeBounds()
-        if (bounds.width() < MIN_GESTURE_WIDTH_PX || bounds.height() < MIN_GESTURE_HEIGHT_PX) {
-            pauseAccountBrowse("当前屏幕可用区域太小，无法安全执行首次滑动")
-            return
-        }
-
+        val bounds = target.bounds
         val profile = loadScrollGestureProfile()
         val path = createSmoothScrollPath(bounds, profile)
         val gesture = GestureDescription.Builder()
@@ -652,51 +706,55 @@ class FreedomAccessibilityService : AccessibilityService() {
         accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_SCROLL_SETTLE
         accountBrowseScrollEventSeen = false
         accountBrowseFallbackScrollAttempted = false
-        accountBrowseGestureInFlight = true
+        accountBrowseGestureInFlight = false
         val startX = bounds.centerX()
         val startY = (bounds.top + bounds.height() * SCROLL_START_FRACTION).toInt()
         val endX = bounds.centerX()
         val endY = (bounds.top + bounds.height() * SCROLL_END_FRACTION).toInt()
         addLog(
-            "首次坐标滑动开始：起点 ($startX,$startY)，终点 ($endX,$endY)，" +
-                "屏幕区域 ${bounds.width()}×${bounds.height()}，持续 ${profile.durationMs} 毫秒；" +
-                "本次不进行动态卡片识别"
+            "首次列表区域坐标滑动准备：容器=${target.className}，边界=$bounds，" +
+                "起点 ($startX,$startY)，终点 ($endX,$endY)，" +
+                "持续 ${profile.durationMs} 毫秒"
         )
 
-        val accepted = runCatching {
-            dispatchGesture(gesture, object : AccessibilityService.GestureResultCallback() {
-                override fun onCompleted(gestureDescription: GestureDescription?) {
-                    accountBrowseGestureInFlight = false
-                    if (accountBrowsePhase != AccountBrowsePhase.WAIT_FOR_SCROLL_SETTLE ||
-                        !MonitorStore.isRunning(this@FreedomAccessibilityService)
-                    ) return
-                    addLog("Android 已完成首次屏幕滑动手势；正在检查滚动事件")
-                    scheduleAccountBrowseStep(SCROLL_SETTLE_MS)
-                }
-
-                override fun onCancelled(gestureDescription: GestureDescription?) {
-                    accountBrowseGestureInFlight = false
-                    if (accountBrowsePhase == AccountBrowsePhase.WAIT_FOR_SCROLL_SETTLE) {
-                        pauseAccountBrowse("首次屏幕滑动被系统或用户操作中断")
+        // Give WindowManager a short frame interval to apply any overlay visibility/flag change.
+        mainHandler.postDelayed({
+            if (accountBrowsePhase != AccountBrowsePhase.WAIT_FOR_SCROLL_SETTLE ||
+                accountBrowseTouchActive || !MonitorStore.isRunning(this)
+            ) {
+                accountBrowseGestureInFlight = false
+                restoreMonitorOverlayTouchPassthrough()
+                return@postDelayed
+            }
+            accountBrowseGestureInFlight = true
+            val accepted = runCatching {
+                dispatchGesture(gesture, object : AccessibilityService.GestureResultCallback() {
+                    override fun onCompleted(gestureDescription: GestureDescription?) {
+                        accountBrowseGestureInFlight = false
+                        if (accountBrowsePhase != AccountBrowsePhase.WAIT_FOR_SCROLL_SETTLE ||
+                            !MonitorStore.isRunning(this@FreedomAccessibilityService)
+                        ) return
+                        addLog("Android 已完成首次屏幕滑动手势；正在检查滚动事件")
+                        scheduleAccountBrowseStep(SCROLL_SETTLE_MS)
                     }
-                }
-            }, mainHandler)
-        }.getOrDefault(false)
 
-        addLog("dispatchGesture 返回：accepted=$accepted")
-        if (!accepted) {
-            accountBrowseGestureInFlight = false
-            pauseAccountBrowse("Android 未接受首次屏幕滑动手势；未执行节点滚动备用操作")
-            return
-        }
+                    override fun onCancelled(gestureDescription: GestureDescription?) {
+                        accountBrowseGestureInFlight = false
+                        if (accountBrowsePhase == AccountBrowsePhase.WAIT_FOR_SCROLL_SETTLE) {
+                            pauseAccountBrowse("首次屏幕滑动被系统或用户操作中断")
+                        }
+                    }
+                }, mainHandler)
+            }.getOrDefault(false)
 
-        addLog("首次屏幕滑动手势已提交；等待系统完成回调")
-    }
-
-    /** Use display coordinates directly; this does not depend on AccessibilityNodeInfo bounds. */
-    private fun screenSwipeBounds(): Rect {
-        val metrics = resources.displayMetrics
-        return Rect(0, 0, metrics.widthPixels, metrics.heightPixels)
+            addLog("dispatchGesture 返回：accepted=$accepted")
+            if (!accepted) {
+                accountBrowseGestureInFlight = false
+                pauseAccountBrowse("Android 未接受首次屏幕滑动手势；未执行节点滚动备用操作")
+                return@postDelayed
+            }
+            addLog("首次列表区域滑动手势已提交；等待系统完成回调")
+        }, SWIPE_WINDOW_SYNC_DELAY_MS)
     }
 
     /** End this diagnostic cycle after the first swipe; card opening is deliberately deferred. */
@@ -1782,6 +1840,7 @@ class FreedomAccessibilityService : AccessibilityService() {
         private const val PAGE_STATE_POLL_MS = 300L
         private const val SCROLL_SETTLE_MS = 850L
         private const val MONITOR_OVERLAY_PASSTHROUGH_WATCHDOG_MS = 5_000L
+        private const val SWIPE_WINDOW_SYNC_DELAY_MS = 120L
         private const val MANUAL_TOUCH_RESUME_MS = 2_500L
         private const val INITIAL_FEED_STABILITY_TIMEOUT_MS = 10_000L
         private const val REQUIRED_STABLE_FEED_SAMPLES = 3
