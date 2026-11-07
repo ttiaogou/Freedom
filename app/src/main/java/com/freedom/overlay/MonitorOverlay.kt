@@ -50,9 +50,7 @@ object MonitorOverlay {
 
     fun show(context: Context): Boolean {
         val appContext = context.applicationContext
-        if (!MonitorStore.isOverlayEnabled(appContext) ||
-            !MonitorStore.isFloatingLogEnabled(appContext)
-        ) {
+        if (!MonitorStore.isFloatingLogEnabled(appContext)) {
             hide()
             return false
         }
@@ -442,9 +440,7 @@ object MonitorOverlay {
     fun update(context: Context) {
         val appContext = context.applicationContext
         mainHandler.post {
-            if (!MonitorStore.isOverlayEnabled(appContext) ||
-                !MonitorStore.isFloatingLogEnabled(appContext)
-            ) {
+            if (!MonitorStore.isFloatingLogEnabled(appContext)) {
                 hide()
                 return@post
             }
@@ -486,29 +482,54 @@ object MonitorOverlay {
         }
     }
 
+    /**
+     * Remove the overlay idempotently. WindowManager operations are serialized on the
+     * main thread, and the singleton state is cleared before removal so queued updates
+     * cannot act on a stale View after the settings switch is turned off.
+     */
     fun hide() {
-        mainHandler.post {
-            val view = rootView
-            if (attached && view != null) {
-                runCatching { windowManager?.removeView(view) }
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            mainHandler.post { hideOnMainThread() }
+            return
+        }
+        hideOnMainThread()
+    }
+
+    private fun hideOnMainThread() {
+        val viewToRemove = rootView
+        val manager = windowManager
+        val wasAttached = attached
+
+        // Clear shared state first. This makes repeated hide() calls safe and prevents
+        // a later update() from seeing a half-removed overlay.
+        attached = false
+        expanded = false
+        touchPassthrough = false
+        rootView = null
+        statusView = null
+        appView = null
+        pageView = null
+        eventLabelView = null
+        eventView = null
+        technicalDetailsButton = null
+        showTechnicalDetails = false
+        nodeView = null
+        contentContainer = null
+        scrollView = null
+        collapseButton = null
+        layoutParams = null
+        windowManager = null
+
+        if (wasAttached && viewToRemove != null && manager != null) {
+            try {
+                manager.removeViewImmediate(viewToRemove)
+            } catch (_: IllegalArgumentException) {
+                // The window was already detached by Android; treat as successfully hidden.
+            } catch (_: WindowManager.BadTokenException) {
+                // The host token is no longer valid; local state is already cleared.
+            } catch (e: Exception) {
+                android.util.Log.e("MonitorOverlay", "Failed to remove monitor overlay", e)
             }
-            attached = false
-            expanded = false
-            touchPassthrough = false
-            rootView = null
-            statusView = null
-            appView = null
-            pageView = null
-            eventLabelView = null
-            eventView = null
-            technicalDetailsButton = null
-            showTechnicalDetails = false
-            nodeView = null
-            contentContainer = null
-            scrollView = null
-            collapseButton = null
-            layoutParams = null
-            windowManager = null
         }
     }
 

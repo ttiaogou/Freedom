@@ -67,6 +67,11 @@ class MainActivity : Activity() {
             receiverRegistered = true
         }
 
+        // The 悬浮日志 switch is the sole user-facing overlay control. Mirror it to the
+        // legacy internal flag so existing service-side checks remain compatible.
+        val floatingLogEnabled = MonitorStore.isFloatingLogEnabled(this)
+        MonitorStore.setOverlayEnabled(this, floatingLogEnabled)
+
         // Preserve the latest version's permission validation and recovery behaviour.
         if (MonitorStore.isRunning(this) &&
             (!isAccessibilityEnabled() || !Settings.canDrawOverlays(this))
@@ -76,7 +81,7 @@ class MainActivity : Activity() {
             MonitorOverlay.hide()
             MonitorStore.addLog(this, timestamp() + "  授权状态异常，监听已停止")
         } else if (MonitorStore.isRunning(this)) {
-            if (MonitorStore.isOverlayEnabled(this)) {
+            if (MonitorStore.isFloatingLogEnabled(this)) {
                 MonitorOverlay.show(this)
             } else {
                 MonitorOverlay.hide()
@@ -244,7 +249,7 @@ class MainActivity : Activity() {
             )
         }
 
-        if (MonitorStore.isOverlayEnabled(this) && !MonitorOverlay.show(this)) {
+        if (MonitorStore.isFloatingLogEnabled(this) && !MonitorOverlay.show(this)) {
             MonitorStore.setRunning(this, false)
             MonitorKeepAliveService.stop(this)
             Toast.makeText(
@@ -368,33 +373,34 @@ class MainActivity : Activity() {
 
         addConfigSection(rows, "脚本配置")
         addConfigSwitchRow(
-            rows, "◌", "悬浮按钮", "控制实时监控悬浮窗的显示",
-            MonitorStore.isOverlayEnabled(this)
-        ) { enabled ->
-            MonitorStore.setOverlayEnabled(this, enabled)
-            if (enabled) {
-                if (!Settings.canDrawOverlays(this)) {
-                    requestOverlayPermission()
-                } else if (MonitorStore.isRunning(this)) {
-                    MonitorOverlay.show(this)
-                }
-            } else {
-                MonitorOverlay.hide()
-            }
-        }
-        addConfigSwitchRow(
             rows, "▤", "悬浮日志", "关闭时隐藏整个实时监控悬浮窗；开启时显示悬浮窗及日志",
             MonitorStore.isFloatingLogEnabled(this)
         ) { enabled ->
-            MonitorStore.setFloatingLogEnabled(this, enabled)
-            if (enabled) {
-                if (MonitorStore.isOverlayEnabled(this) && MonitorStore.isRunning(this) &&
-                    Settings.canDrawOverlays(this)
-                ) {
-                    MonitorOverlay.show(this)
+            runCatching {
+                // Persist the user's choice before changing the WindowManager overlay.
+                MonitorStore.setFloatingLogEnabled(this, enabled)
+                // Keep the legacy internal overlay flag synchronized for the accessibility
+                // service; the separate "悬浮按钮" setting row has been removed.
+                MonitorStore.setOverlayEnabled(this, enabled)
+                if (enabled) {
+                    if (MonitorStore.isRunning(this) && Settings.canDrawOverlays(this)) {
+                        MonitorOverlay.show(this)
+                    }
+                } else {
+                    // hide() is now synchronous and idempotent on the main thread.
+                    MonitorOverlay.hide()
                 }
-            } else {
-                MonitorOverlay.hide()
+            }.onFailure { error ->
+                MonitorStore.addLog(
+                    this,
+                    timestamp() + "  切换悬浮日志失败：${error.javaClass.simpleName}: " +
+                        (error.message ?: "无详细信息")
+                )
+                Toast.makeText(
+                    this,
+                    "切换悬浮日志失败，请查看运行记录",
+                    Toast.LENGTH_LONG
+                ).show()
             }
         }
         addConfigActionRow(
