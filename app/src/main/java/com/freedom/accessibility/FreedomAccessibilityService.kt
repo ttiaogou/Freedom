@@ -22,6 +22,7 @@ import android.view.accessibility.AccessibilityNodeInfo
 import android.widget.TextView
 import com.freedom.data.MonitorActions
 import com.freedom.data.MonitorStore
+import com.freedom.accessibility.browse.MomoDynamicCardSelector
 import com.freedom.overlay.MonitorOverlay
 import com.freedom.stability.MonitorKeepAliveService
 import java.text.SimpleDateFormat
@@ -48,6 +49,7 @@ class FreedomAccessibilityService : AccessibilityService() {
         FIRST_SWIPE_COUNTDOWN,
         WAIT_FOR_LIST_SCROLL,
         WAIT_FOR_SCROLL_SETTLE,
+        WAIT_FOR_CARD_OPEN,
         WAIT_FOR_DETAIL_LOAD,
         DETAIL_DWELL,
         WAIT_FOR_LIST_RETURN,
@@ -115,6 +117,9 @@ class FreedomAccessibilityService : AccessibilityService() {
     private var accountBrowseSwipeCount = 0
     private var accountBrowseFallbackScrollAttempted = false
     private var accountBrowseSourceSnapshot = ""
+    private var accountBrowseReturnedStableSamples = 0
+    private var accountBrowseLastReturnedSnapshot = ""
+    private var accountBrowseReturnMismatchLogged = false
     private var accountBrowseCountdownRemaining = 0
     private var accountBrowseOverlayPassthroughActive = false
 
@@ -622,6 +627,9 @@ class FreedomAccessibilityService : AccessibilityService() {
         accountBrowseDeadlineAt = 0L
         accountBrowseSourceFingerprint = ""
         accountBrowseSourceSnapshot = ""
+        accountBrowseReturnedStableSamples = 0
+        accountBrowseLastReturnedSnapshot = ""
+        accountBrowseReturnMismatchLogged = false
         accountBrowseDetailFingerprint = ""
         accountBrowseLastStableFingerprint = ""
         accountBrowseStableSamples = 0
@@ -665,6 +673,7 @@ class FreedomAccessibilityService : AccessibilityService() {
             AccountBrowsePhase.FIRST_SWIPE_COUNTDOWN -> runFirstSwipeCountdown()
             AccountBrowsePhase.WAIT_FOR_LIST_SCROLL -> performFeedScroll()
             AccountBrowsePhase.WAIT_FOR_SCROLL_SETTLE -> verifyInitialSwipe()
+            AccountBrowsePhase.WAIT_FOR_CARD_OPEN -> openVisibleFeedCard()
             AccountBrowsePhase.WAIT_FOR_DETAIL_LOAD -> checkDetailPageLoaded()
             AccountBrowsePhase.DETAIL_DWELL -> returnFromDetailPage()
             AccountBrowsePhase.WAIT_FOR_LIST_RETURN -> checkFeedListReturned()
@@ -1056,13 +1065,12 @@ class FreedomAccessibilityService : AccessibilityService() {
                 "前后节点快照${if (snapshotsDiffer) "发生变化" else "未显示明显差异"}"
         )
 
-        accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_LIST_SCROLL
-        val delay = randomScrollIntervalMs()
+        accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_CARD_OPEN
         addLog(
-            "动态列表已停止滚动；下一轮滑动将在随机等待 ${delay / 1000.0} 秒后进行。" +
-                "累计已确认滑动=$accountBrowseSwipeCount 轮"
+            "动态列表已停止滚动；累计已确认滑动=$accountBrowseSwipeCount 轮，" +
+                "等待列表稳定后识别并打开一条普通动态"
         )
-        scheduleAccountBrowseStep(delay)
+        scheduleAccountBrowseStep(CARD_OPEN_SETTLE_MS)
     }
 
     /** Capture a small, readable sample of visible text nodes and their screen positions. */
@@ -1260,103 +1268,95 @@ class FreedomAccessibilityService : AccessibilityService() {
         }
 
         val root = obtainTargetRootOrPause() ?: return
-        if (!isMomoDynamicFeedPage(root)) {
+        var scrollNode: AccessibilityNodeInfo? = null
+        var cardNode: AccessibilityNodeInfo? = null
+        try {
+            if (!isMomoDynamicFeedPage(root)) {
+                pauseAccountBrowse("滑动后页面不再是可识别的陌陌动态列表；已暂停")
+                return
+            }
+
+            val listNode = findScrollableFeedContainer(root)
+            if (listNode == null) {
+                pauseAccountBrowse("滑动后未找到动态列表；已暂停")
+                return
+            }
+            scrollNode = listNode
+
+            // Save the exact list state immediately before opening the card. The same
+            // list-only snapshot is compared after Back to avoid scrolling from an
+            // unverified or shifted position.
+            accountBrowseSourceFingerprint = pageFingerprint(root).signature
+            accountBrowseSourceSnapshot = captureVisibleFeedNodeSnapshot(listNode)
+            cardNode = findClickableFeedCard(listNode)
+        } finally {
+            runCatching { scrollNode?.recycle() }
             runCatching { root.recycle() }
-            pauseAccountBrowse("滑动后页面不再是可识别的陌陌动态列表；已暂停")
-            return
         }
 
-        val scrollNode = try {
-            findScrollableFeedContainer(root)
-        } finally {
-            runCatching { root.recycle() }
-        }
-        if (scrollNode == null) {
-            pauseAccountBrowse("滑动后未找到动态列表；已暂停")
-            return
-        }
-
-        val cardNode = try {
-            findClickableFeedCard(scrollNode)
-        } finally {
-            runCatching { scrollNode.recycle() }
-        }
         if (cardNode == null) {
-            pauseAccountBrowse("没有找到安全可识别的动态卡片；没有点击任何控件")
+            pauseAccountBrowse("没有找到可安全打开的普通动态卡片；直播间动态已过滤，本轮没有点击任何控件")
             return
         }
 
-        val currentRoot = obtainTargetRootOrPause()
-        if (currentRoot == null) {
-            runCatching { cardNode.recycle() }
-            return
+        val clicked = try {
+            cardNode?.performAction(AccessibilityNodeInfo.ACTION_CLICK) == true
+        } catch (_: Exception) {
+            false
+        } finally {
+            runCatching { cardNode?.recycle() }
         }
-        accountBrowseSourceFingerprint = pageFingerprint(currentRoot).signature
-        runCatching { currentRoot.recycle() }
-
-        val clicked = runCatching {
-            cardNode.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-        }.getOrDefault(false)
-        runCatching { cardNode.recycle() }
 
         if (!clicked) {
             pauseAccountBrowse("动态卡片未接受无障碍点击；已停止本轮操作")
             return
         }
 
+        accountBrowseReturnedStableSamples = 0
+        accountBrowseLastReturnedSnapshot = ""
+        accountBrowseReturnMismatchLogged = false
         accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_DETAIL_LOAD
         accountBrowseDeadlineAt = System.currentTimeMillis() + DETAIL_LOAD_TIMEOUT_MS
         accountBrowseLastStableFingerprint = ""
         accountBrowseStableSamples = 0
-        addLog("已打开一条动态；正在确认详情页面是否成功载入")
+        addLog("已点击一条符合条件的普通动态；正在确认详情页面是否成功载入")
         scheduleAccountBrowseStep(PAGE_STATE_POLL_MS)
     }
 
-    /** Only direct, large, fully visible, clickable children of the feed list qualify as cards. */
+    /** Select a direct visible card from the feed list; detailed rules live in browse/. */
     private fun findClickableFeedCard(
         scrollNode: AccessibilityNodeInfo
     ): AccessibilityNodeInfo? {
-        val listBounds = Rect()
-        runCatching { scrollNode.getBoundsInScreen(listBounds) }
         val minWidth = (resources.displayMetrics.widthPixels * MIN_FEED_CARD_WIDTH_RATIO).toInt()
         val minHeight = (resources.displayMetrics.heightPixels * MIN_FEED_CARD_HEIGHT_RATIO).toInt()
-        val childCount = runCatching { scrollNode.childCount }.getOrDefault(0)
-
-        var bestNode: AccessibilityNodeInfo? = null
-        var bestTop = Int.MAX_VALUE
-        var bestArea = 0L
-        for (index in 0 until childCount) {
-            val child = runCatching { scrollNode.getChild(index) }.getOrNull() ?: continue
-            try {
-                val bounds = Rect()
-                runCatching { child.getBoundsInScreen(bounds) }
-                if (!child.isVisibleToUser || !child.isClickable || child.isEditable) continue
-                if (bounds.width() < minWidth || bounds.height() < minHeight) continue
-                if (bounds.top < listBounds.top || bounds.bottom > listBounds.bottom) continue
-
-                val area = bounds.width().toLong() * bounds.height().toLong()
-                if (bounds.top < bestTop || (bounds.top == bestTop && area > bestArea)) {
-                    runCatching { bestNode?.recycle() }
-                    bestNode = AccessibilityNodeInfo.obtain(child)
-                    bestTop = bounds.top
-                    bestArea = area
-                }
-            } finally {
-                runCatching { child.recycle() }
-            }
+        val result = MomoDynamicCardSelector.select(
+            scrollNode = scrollNode,
+            minWidthPx = minWidth,
+            minHeightPx = minHeight
+        )
+        if (result.skippedLiveStreamCount > 0) {
+            addLog("卡片筛选：已跳过 ${result.skippedLiveStreamCount} 条疑似直播间动态")
         }
-        return bestNode
+        if (result.node == null) {
+            addLog("卡片筛选未通过：${result.reason}；检查候选=${result.inspectedCardCount}，缺少内容证据=${result.rejectedWithoutContentCount}")
+        } else {
+            addLog("卡片筛选通过：已找到可见、完整且具有内容证据的普通动态")
+        }
+        return result.node
     }
 
     private fun checkDetailPageLoaded() {
         val root = obtainTargetRootOrPause() ?: return
-        val fingerprint = try {
-            pageFingerprint(root)
+        val pageState = try {
+            isMomoDynamicFeedPage(root) to pageFingerprint(root)
         } finally {
             runCatching { root.recycle() }
         }
+        val isFeedPage = pageState.first
+        val fingerprint = pageState.second
 
-        if (fingerprint.signature != accountBrowseSourceFingerprint &&
+        if (!isFeedPage &&
+            fingerprint.signature != accountBrowseSourceFingerprint &&
             fingerprint.nodeCount >= MIN_DETAIL_NODE_COUNT
         ) {
             if (fingerprint.signature == accountBrowseLastStableFingerprint) {
@@ -1387,12 +1387,15 @@ class FreedomAccessibilityService : AccessibilityService() {
 
     private fun returnFromDetailPage() {
         val root = obtainTargetRootOrPause() ?: return
-        val fingerprint = try {
-            pageFingerprint(root)
+        val pageState = try {
+            isMomoDynamicFeedPage(root) to pageFingerprint(root)
         } finally {
             runCatching { root.recycle() }
         }
-        if (fingerprint.signature != accountBrowseDetailFingerprint ||
+        val isFeedPage = pageState.first
+        val fingerprint = pageState.second
+        if (isFeedPage ||
+            fingerprint.signature != accountBrowseDetailFingerprint ||
             fingerprint.signature == accountBrowseSourceFingerprint
         ) {
             pauseAccountBrowse("阅读期间页面结构发生变化；为避免返回到错误页面，已暂停")
@@ -1404,6 +1407,9 @@ class FreedomAccessibilityService : AccessibilityService() {
             return
         }
         accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_LIST_RETURN
+        accountBrowseReturnedStableSamples = 0
+        accountBrowseLastReturnedSnapshot = ""
+        accountBrowseReturnMismatchLogged = false
         accountBrowseDeadlineAt = System.currentTimeMillis() + LIST_RETURN_TIMEOUT_MS
         addLog("阅读停留结束；正在确认已返回动态列表")
         scheduleAccountBrowseStep(PAGE_STATE_POLL_MS)
@@ -1411,22 +1417,88 @@ class FreedomAccessibilityService : AccessibilityService() {
 
     private fun checkFeedListReturned() {
         val root = obtainTargetRootOrPause() ?: return
-        val isFeedList = try {
-            isMomoDynamicFeedPage(root)
+        val returnState = try {
+            if (!isMomoDynamicFeedPage(root)) {
+                false to ""
+            } else {
+                val listNode = findScrollableFeedContainer(root)
+                if (listNode == null) {
+                    true to ""
+                } else {
+                    try {
+                        true to captureVisibleFeedNodeSnapshot(listNode)
+                    } finally {
+                        runCatching { listNode.recycle() }
+                    }
+                }
+            }
         } finally {
             runCatching { root.recycle() }
         }
+        val isFeedList = returnState.first
+        val currentSnapshot = returnState.second
 
-        if (isFeedList) {
-            accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_LIST_SCROLL
-            val delay = randomScrollIntervalMs()
-            addLog("已返回陌陌动态列表；下一次滑动将在随机等待 ${delay / 1000.0} 秒后进行")
-            scheduleAccountBrowseStep(delay)
-        } else if (System.currentTimeMillis() >= accountBrowseDeadlineAt) {
-            pauseAccountBrowse("返回后没有重新识别到动态列表；请检查页面并重新启动")
+        if (isFeedList && isFeedPositionRestored(accountBrowseSourceSnapshot, currentSnapshot)) {
+            if (currentSnapshot == accountBrowseLastReturnedSnapshot) {
+                accountBrowseReturnedStableSamples++
+            } else {
+                accountBrowseLastReturnedSnapshot = currentSnapshot
+                accountBrowseReturnedStableSamples = 1
+            }
+
+            if (accountBrowseReturnedStableSamples >= REQUIRED_STABLE_PAGE_SAMPLES) {
+                accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_LIST_SCROLL
+                accountBrowseReturnedStableSamples = 0
+                accountBrowseLastReturnedSnapshot = ""
+                accountBrowseReturnMismatchLogged = false
+                val delay = randomScrollIntervalMs()
+                addLog(
+                    "已返回原动态列表，位置快照连续 ${REQUIRED_STABLE_PAGE_SAMPLES} 次匹配；" +
+                        "下一轮滑动将在随机等待 ${delay / 1000.0} 秒后进行"
+                )
+                scheduleAccountBrowseStep(delay)
+                return
+            }
+        } else if (isFeedList) {
+            accountBrowseReturnedStableSamples = 0
+            accountBrowseLastReturnedSnapshot = ""
+            if (!accountBrowseReturnMismatchLogged) {
+                addLog(
+                    "已识别动态列表，但当前可见内容与打开动态前的位置快照不匹配；" +
+                        "暂不继续滑动，等待列表位置恢复并稳定"
+                )
+                accountBrowseReturnMismatchLogged = true
+            }
+        }
+
+        if (System.currentTimeMillis() >= accountBrowseDeadlineAt) {
+            pauseAccountBrowse(
+                if (isFeedList) {
+                    "已返回动态列表，但无法确认恢复到打开动态前的位置；为避免跳过内容，已暂停"
+                } else {
+                    "返回后没有重新识别到动态列表；请检查页面并重新启动"
+                }
+            )
         } else {
             scheduleAccountBrowseStep(PAGE_STATE_POLL_MS)
         }
+    }
+
+    /** A return is accepted only when several list-specific visible nodes and bounds match. */
+    private fun isFeedPositionRestored(
+        expectedSnapshot: String,
+        currentSnapshot: String
+    ): Boolean {
+        if (expectedSnapshot.isBlank() || currentSnapshot.isBlank()) return false
+        val expected = expectedSnapshot.split(" | ").filter { it.isNotBlank() }.toSet()
+        val current = currentSnapshot.split(" | ").filter { it.isNotBlank() }.toSet()
+        val comparableCount = minOf(expected.size, current.size)
+        if (comparableCount < MIN_RETURN_SNAPSHOT_MATCH_LINES) return false
+        val requiredMatches = maxOf(
+            MIN_RETURN_SNAPSHOT_MATCH_LINES,
+            kotlin.math.ceil(comparableCount * RETURN_SNAPSHOT_MATCH_RATIO).toInt()
+        )
+        return expected.intersect(current).size >= requiredMatches
     }
 
     private fun isMomoDynamicFeedPage(root: AccessibilityNodeInfo): Boolean =
@@ -2182,6 +2254,7 @@ class FreedomAccessibilityService : AccessibilityService() {
         private const val LIST_RETURN_TIMEOUT_MS = 10_000L
         private const val PAGE_STATE_POLL_MS = 300L
         private const val SCROLL_SETTLE_MS = 850L
+        private const val CARD_OPEN_SETTLE_MS = 500L
         private const val MONITOR_OVERLAY_PASSTHROUGH_WATCHDOG_MS = 5_000L
         private const val SWIPE_WINDOW_SYNC_DELAY_MS = 120L
         private const val MANUAL_TOUCH_RESUME_MS = 2_500L
@@ -2190,6 +2263,8 @@ class FreedomAccessibilityService : AccessibilityService() {
         private const val FIRST_SWIPE_COUNTDOWN_SECONDS = 3
         private const val FIRST_SWIPE_COUNTDOWN_STEP_MS = 1_000L
         private const val REQUIRED_STABLE_PAGE_SAMPLES = 2
+        private const val MIN_RETURN_SNAPSHOT_MATCH_LINES = 3
+        private const val RETURN_SNAPSHOT_MATCH_RATIO = 0.70
         private const val SNAPSHOT_MAX_NODES = 500
         private const val SNAPSHOT_MAX_TEXT_NODES = 8
         private const val SNAPSHOT_TEXT_LENGTH = 36
