@@ -108,6 +108,22 @@ class FreedomAccessibilityService : AccessibilityService() {
         val reason: String
     )
 
+    private data class PopupInspection(
+        val container: AccessibilityNodeInfo?,
+        val closeTarget: AccessibilityNodeInfo?,
+        val dismissable: Boolean,
+        val critical: Boolean,
+        val signature: String,
+        val description: String
+    )
+
+    private data class DetailPageIdentityInspection(
+        val isFeedPage: Boolean,
+        val identityConfirmed: Boolean,
+        val fingerprint: PageFingerprint,
+        val reason: String
+    )
+
     private data class FeedGestureTarget(
         val bounds: Rect,
         val className: String
@@ -134,6 +150,7 @@ class FreedomAccessibilityService : AccessibilityService() {
     private var accountBrowseDeadlineAt = 0L
     private var accountBrowseSourceFingerprint = ""
     private var accountBrowseDetailFingerprint = ""
+    private var accountBrowseDetailActivityClass = ""
     private var accountBrowseLastStableFingerprint = ""
     private var accountBrowseStableSamples = 0
     private var accountBrowseTouchActive = false
@@ -175,6 +192,12 @@ class FreedomAccessibilityService : AccessibilityService() {
     private var accountBrowseDynamicTabClickConfirmed = false
     private var accountBrowseNotTargetForegroundLogged = false
     private var accountBrowseRootUnavailableLogged = false
+    private var accountBrowseLastPopupSignature = ""
+    private var accountBrowsePopupDismissPending = false
+    private var accountBrowsePopupDismissDeadlineAt = 0L
+    private var accountBrowsePopupNextAttemptAt = 0L
+    private var accountBrowsePopupActionAttempts = 0
+    private var accountBrowsePopupExhaustedLogged = false
 
     // Device-only gesture calibration state. Calibration strokes are restricted to
     // Freedom's own calibration surface and never target the selected third-party app.
@@ -836,8 +859,15 @@ class FreedomAccessibilityService : AccessibilityService() {
         accountBrowseLastReturnedSnapshot = ""
         accountBrowseReturnMismatchLogged = false
         accountBrowseDetailFingerprint = ""
+        accountBrowseDetailActivityClass = ""
         accountBrowseLastStableFingerprint = ""
         accountBrowseStableSamples = 0
+        accountBrowseLastPopupSignature = ""
+        accountBrowsePopupDismissPending = false
+        accountBrowsePopupDismissDeadlineAt = 0L
+        accountBrowsePopupNextAttemptAt = 0L
+        accountBrowsePopupActionAttempts = 0
+        accountBrowsePopupExhaustedLogged = false
         accountBrowseTouchActive = false
         accountBrowseManualResumeAllowed = false
         accountBrowseTouchStartedDuringGesture = false
@@ -939,6 +969,312 @@ class FreedomAccessibilityService : AccessibilityService() {
     }
 
     /**
+     * Inspect an exposed dialog/popup before navigation or browsing. Only an explicit,
+     * non-consequential close action is automated. Permission, account, payment, deletion,
+     * agreement and confirmation prompts remain for the user to handle.
+     */
+    private fun handleMomoPopup(root: AccessibilityNodeInfo): Boolean {
+        val popup = inspectMomoPopup(root)
+        val now = System.currentTimeMillis()
+
+        if (accountBrowsePopupDismissPending) {
+            if (popup == null) {
+                accountBrowsePopupDismissPending = false
+                accountBrowsePopupDismissDeadlineAt = 0L
+                accountBrowsePopupNextAttemptAt = 0L
+                accountBrowsePopupActionAttempts = 0
+                accountBrowsePopupExhaustedLogged = false
+                accountBrowseLastPopupSignature = ""
+                addLog("弹窗关闭已验证：重新扫描后未发现原弹窗；继续当前页面导航/浏览步骤")
+                return false
+            }
+            recyclePopupInspection(popup)
+            if (now < accountBrowsePopupDismissDeadlineAt) {
+                scheduleAccountBrowseStep(POPUP_VERIFY_POLL_MS)
+                return true
+            }
+            accountBrowsePopupDismissPending = false
+            accountBrowsePopupDismissDeadlineAt = 0L
+            accountBrowsePopupNextAttemptAt = now + POPUP_RETRY_DELAY_MS
+            addLog("弹窗关闭动作已提交，但页面仍报告弹窗存在；等待重新分析关闭方式，不执行页面点击或滑动")
+            scheduleAccountBrowseStep(POPUP_RETRY_DELAY_MS)
+            return true
+        }
+
+        if (popup == null) {
+            if (accountBrowseLastPopupSignature.isNotBlank()) {
+                accountBrowseLastPopupSignature = ""
+                accountBrowsePopupActionAttempts = 0
+                accountBrowsePopupExhaustedLogged = false
+                accountBrowsePopupNextAttemptAt = 0L
+            }
+            return false
+        }
+
+        val isNewPopup = popup.signature != accountBrowseLastPopupSignature
+        if (isNewPopup) {
+            accountBrowseLastPopupSignature = popup.signature
+            accountBrowsePopupActionAttempts = 0
+            accountBrowsePopupExhaustedLogged = false
+            accountBrowsePopupNextAttemptAt = 0L
+        }
+
+        if (popup.critical) {
+            if (isNewPopup) {
+                addLog("识别到需要用户决定的弹窗：${popup.description}；检测到权限/账号/支付/删除/协议等重要内容，不自动确认或关闭")
+            }
+            recyclePopupInspection(popup)
+            scheduleAccountBrowseStep(POPUP_BLOCKED_RECHECK_MS)
+            return true
+        }
+
+        if (now < accountBrowsePopupNextAttemptAt) {
+            recyclePopupInspection(popup)
+            scheduleAccountBrowseStep((accountBrowsePopupNextAttemptAt - now).coerceAtLeast(POPUP_VERIFY_POLL_MS))
+            return true
+        }
+
+        val hasSafeDismissMethod = popup.dismissable && popup.container != null
+        val hasExplicitCloseTarget = popup.closeTarget != null
+        if (!hasSafeDismissMethod && !hasExplicitCloseTarget) {
+            if (!accountBrowsePopupExhaustedLogged) {
+                addLog("弹窗已识别，但没有暴露可确认的安全关闭方式；保持等待用户处理，不使用屏幕外部点击或盲目返回")
+                accountBrowsePopupExhaustedLogged = true
+            }
+            recyclePopupInspection(popup)
+            scheduleAccountBrowseStep(POPUP_BLOCKED_RECHECK_MS)
+            return true
+        }
+
+        if (accountBrowsePopupActionAttempts >= MAX_POPUP_DISMISS_ATTEMPTS) {
+            if (!accountBrowsePopupExhaustedLogged) {
+                addLog("已识别弹窗，但两次安全关闭尝试后仍无法确认关闭；交由用户处理，不执行动态导航或滑动")
+                accountBrowsePopupExhaustedLogged = true
+            }
+            recyclePopupInspection(popup)
+            scheduleAccountBrowseStep(POPUP_BLOCKED_RECHECK_MS)
+            return true
+        }
+
+        var actionDescription = "没有可确认的安全关闭控件"
+        var dismissed = false
+        if (popup.dismissable && popup.container != null) {
+            actionDescription = "AccessibilityNodeInfo.ACTION_DISMISS"
+            dismissed = runCatching {
+                popup.container.performAction(AccessibilityNodeInfo.ACTION_DISMISS)
+            }.getOrDefault(false)
+        }
+        if (!dismissed && popup.closeTarget != null) {
+            actionDescription = "明确关闭控件（${popup.description}）"
+            dismissed = runCatching {
+                popup.closeTarget.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+            }.getOrDefault(false)
+        }
+        accountBrowsePopupActionAttempts++
+        recyclePopupInspection(popup)
+
+        if (!dismissed) {
+            if (isNewPopup || accountBrowsePopupActionAttempts == 1) {
+                addLog("弹窗识别：${popup.description}；未发现可执行的安全关闭方式（${actionDescription}）；不使用屏幕外部点击或盲目返回")
+            }
+            accountBrowsePopupNextAttemptAt = now + POPUP_RETRY_DELAY_MS
+            scheduleAccountBrowseStep(POPUP_BLOCKED_RECHECK_MS)
+            return true
+        }
+
+        accountBrowsePopupDismissPending = true
+        accountBrowsePopupDismissDeadlineAt = now + POPUP_DISMISS_VERIFY_TIMEOUT_MS
+        accountBrowseProgrammaticActionLabel = if (actionDescription.contains("ACTION_DISMISS")) {
+            "Freedom ACTION_DISMISS 弹窗关闭"
+        } else {
+            "Freedom ACTION_CLICK $actionDescription 弹窗关闭"
+        }
+        accountBrowseIgnoreManualEventsUntil = now + POPUP_DISMISS_VERIFY_TIMEOUT_MS
+        addLog("识别到可安全关闭的陌陌弹窗：${popup.description}；采用 $actionDescription；等待重新扫描验证关闭结果")
+        scheduleAccountBrowseStep(POPUP_VERIFY_POLL_MS)
+        return true
+    }
+
+    private fun inspectMomoPopup(root: AccessibilityNodeInfo): PopupInspection? {
+        val metrics = resources.displayMetrics
+        val screenWidth = metrics.widthPixels
+        val screenHeight = metrics.heightPixels
+        val queue = ArrayDeque<AccessibilityNodeInfo>()
+        val candidates = ArrayList<Pair<AccessibilityNodeInfo, Int>>()
+        queue.add(AccessibilityNodeInfo.obtain(root))
+        var visited = 0
+
+        try {
+            while (queue.isNotEmpty() && visited < PAGE_FINGERPRINT_MAX_NODES) {
+                val node = queue.removeFirst()
+                visited++
+                try {
+                    if (node.isVisibleToUser) {
+                        val className = node.className?.toString().orEmpty()
+                        val simpleClass = className.substringAfterLast('.')
+                        val bounds = Rect()
+                        runCatching { node.getBoundsInScreen(bounds) }
+                        val dismissable = runCatching { node.isDismissable }.getOrDefault(false)
+                        val dialogClass = simpleClass.contains("Dialog", ignoreCase = true) ||
+                            simpleClass.contains("Popup", ignoreCase = true) ||
+                            simpleClass.contains("BottomSheet", ignoreCase = true)
+                        val centeredOverlay = bounds.width() >= (screenWidth * 0.55f).toInt() &&
+                            bounds.width() < (screenWidth * 0.99f).toInt() &&
+                            bounds.height() >= (screenHeight * 0.16f).toInt() &&
+                            bounds.height() < (screenHeight * 0.88f).toInt() &&
+                            kotlin.math.abs(bounds.centerX() - screenWidth / 2) <= (screenWidth * 0.20f).toInt() &&
+                            bounds.centerY() in (screenHeight * 0.20f).toInt()..(screenHeight * 0.82f).toInt()
+                        val score = when {
+                            dismissable -> 100
+                            dialogClass -> 90
+                            centeredOverlay -> 20
+                            else -> 0
+                        }
+                        if (score > 0 && candidates.size < 12) {
+                            candidates.add(AccessibilityNodeInfo.obtain(node) to score)
+                        }
+                    }
+
+                    val childCount = runCatching { node.childCount }.getOrDefault(0)
+                    for (index in 0 until childCount) {
+                        if (visited + queue.size >= PAGE_FINGERPRINT_MAX_NODES) break
+                        val child = runCatching { node.getChild(index) }.getOrNull() ?: continue
+                        queue.add(child)
+                    }
+                } finally {
+                    runCatching { node.recycle() }
+                }
+            }
+        } finally {
+            while (queue.isNotEmpty()) runCatching { queue.removeFirst().recycle() }
+        }
+
+        val ordered = candidates.sortedByDescending { it.second }
+        for ((container, score) in ordered) {
+            val texts = collectPopupTexts(container)
+            val joinedText = texts.joinToString(" ").take(360)
+            val closeTarget = findPopupCloseTarget(container)
+            val popupCue = texts.any { text ->
+                POPUP_CONTENT_CUES.any { cue -> text.contains(cue, ignoreCase = true) }
+            }
+            val hasModalSemantics = score >= 90
+            if (!hasModalSemantics && (!popupCue || closeTarget == null)) {
+                runCatching { container.recycle() }
+                runCatching { closeTarget?.recycle() }
+                continue
+            }
+
+            val critical = texts.any { text ->
+                POPUP_CRITICAL_CUES.any { cue -> text.contains(cue, ignoreCase = true) }
+            }
+            val dismissable = runCatching { container.isDismissable }.getOrDefault(false)
+            val bounds = Rect()
+            runCatching { container.getBoundsInScreen(bounds) }
+            val description = joinedText.ifBlank {
+                "${container.className?.toString()?.substringAfterLast('.') ?: "未知弹窗"}，区域=${bounds.toShortString()}"
+            }
+            val signature = listOf(
+                container.className?.toString().orEmpty(),
+                bounds.toShortString(),
+                texts.take(5).joinToString("|")
+            ).joinToString(":").hashCode().toString()
+            for ((other, _) in ordered) {
+                if (other !== container) runCatching { other.recycle() }
+            }
+            return PopupInspection(container, closeTarget, dismissable, critical, signature, description)
+        }
+
+        for ((container, _) in ordered) runCatching { container.recycle() }
+        return null
+    }
+
+    private fun collectPopupTexts(container: AccessibilityNodeInfo): List<String> {
+        val result = ArrayList<String>()
+        val queue = ArrayDeque<AccessibilityNodeInfo>()
+        queue.add(AccessibilityNodeInfo.obtain(container))
+        var visited = 0
+        try {
+            while (queue.isNotEmpty() && visited < 180) {
+                val node = queue.removeFirst()
+                visited++
+                try {
+                    if (node.isVisibleToUser) {
+                        val text = runCatching { node.text?.toString()?.trim().orEmpty() }.getOrDefault("")
+                        val description = runCatching { node.contentDescription?.toString()?.trim().orEmpty() }
+                            .getOrDefault("")
+                        for (value in listOf(text, description)) {
+                            if (value.isNotBlank() && value !in result && result.size < 24) {
+                                result.add(value.take(100))
+                            }
+                        }
+                    }
+                    val childCount = runCatching { node.childCount }.getOrDefault(0)
+                    for (index in 0 until childCount) {
+                        if (visited + queue.size >= 180) break
+                        val child = runCatching { node.getChild(index) }.getOrNull() ?: continue
+                        queue.add(child)
+                    }
+                } finally {
+                    runCatching { node.recycle() }
+                }
+            }
+        } finally {
+            while (queue.isNotEmpty()) runCatching { queue.removeFirst().recycle() }
+        }
+        return result
+    }
+
+    private fun findPopupCloseTarget(container: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+        val queue = ArrayDeque<AccessibilityNodeInfo>()
+        queue.add(AccessibilityNodeInfo.obtain(container))
+        var visited = 0
+        try {
+            while (queue.isNotEmpty() && visited < 180) {
+                val node = queue.removeFirst()
+                visited++
+                try {
+                    if (node.isVisibleToUser) {
+                        val text = runCatching { node.text?.toString()?.trim().orEmpty() }.getOrDefault("")
+                        val description = runCatching { node.contentDescription?.toString()?.trim().orEmpty() }
+                            .getOrDefault("")
+                        val viewId = runCatching { node.viewIdResourceName.orEmpty() }.getOrDefault("")
+                        val label = sequenceOf(text, description).firstOrNull { it.isNotBlank() }.orEmpty()
+                        val safeLabel = POPUP_SAFE_CLOSE_LABELS.any { label.equals(it, ignoreCase = true) }
+                        val safeId = viewId.substringAfterLast('/').let { id ->
+                            id.contains("close", ignoreCase = true) ||
+                                id.contains("dismiss", ignoreCase = true) ||
+                                id.contains("cancel", ignoreCase = true)
+                        }
+                        val dangerousLabel = POPUP_CRITICAL_CUES.any { label.contains(it, ignoreCase = true) }
+                        if ((safeLabel || safeId) && !dangerousLabel) {
+                            val bounds = Rect()
+                            runCatching { node.getBoundsInScreen(bounds) }
+                            val target = findClickableAncestor(node, bounds)
+                            if (target != null) return target
+                        }
+                    }
+                    val childCount = runCatching { node.childCount }.getOrDefault(0)
+                    for (index in 0 until childCount) {
+                        if (visited + queue.size >= 180) break
+                        val child = runCatching { node.getChild(index) }.getOrNull() ?: continue
+                        queue.add(child)
+                    }
+                } finally {
+                    runCatching { node.recycle() }
+                }
+            }
+        } finally {
+            while (queue.isNotEmpty()) runCatching { queue.removeFirst().recycle() }
+        }
+        return null
+    }
+
+    private fun recyclePopupInspection(popup: PopupInspection) {
+        runCatching { popup.container?.recycle() }
+        runCatching { popup.closeTarget?.recycle() }
+    }
+
+    /**
      * Analyze the current Momo page and actively navigate to Home -> Dynamic.
      * A click or Back is never treated as successful until the next page inspection verifies it.
      */
@@ -950,7 +1286,15 @@ class FreedomAccessibilityService : AccessibilityService() {
                 val activePackage = runCatching { root.packageName?.toString().orEmpty() }
                     .getOrDefault("")
                 if (activePackage != MOMO_PACKAGE) {
-                    reason = "陌陌当前不在前台；保留导航上下文，不对其他应用执行操作"
+                    val externalPopup = inspectMomoPopup(root)
+                    if (externalPopup != null) {
+                        reason = "当前前台为外部系统窗口/弹窗：${externalPopup.description}；需要用户处理，不对其他应用执行关闭或点击"
+                        recyclePopupInspection(externalPopup)
+                    } else {
+                        reason = "陌陌当前不在前台；保留导航上下文，不对其他应用执行操作"
+                    }
+                } else if (handleMomoPopup(root)) {
+                    return
                 } else {
                     accountBrowseNotTargetForegroundLogged = false
                     accountBrowseRootUnavailableLogged = false
@@ -1007,6 +1351,9 @@ class FreedomAccessibilityService : AccessibilityService() {
                             ) {
                                 accountBrowseImageBrowserActive = false
                                 accountBrowseImageBrowserReturnActivityClass = ""
+                                accountBrowseDetailActivityClass = ""
+                                accountBrowseDetailFingerprint = ""
+                                accountBrowseProgrammaticActionLabel = ""
                                 accountBrowseDetailDwellDueAt = 0L
                                 accountBrowseDetailDwellRemainingMs = 0L
                                 accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_FEED_STABLE
@@ -1092,11 +1439,30 @@ class FreedomAccessibilityService : AccessibilityService() {
         }
     }
 
+    /**
+     * Only issue Back for page types whose relationship to the current dynamic task is known.
+     * An unfamiliar Momo Activity may be a chat, profile, permission flow, or another main page;
+     * treating every non-MainTab Activity as a child page can accidentally leave the intended task.
+     */
     private fun isKnownMomoChildPage(): Boolean {
         val activity = accountBrowseCurrentActivityClass
-        return activity.isNotBlank() &&
-            activity != MOMO_MAIN_ACTIVITY &&
-            activity != packageName
+        return when (activity) {
+            MOMO_FEED_IMAGE_BROWSER_ACTIVITY -> accountBrowseImageBrowserActive ||
+                accountBrowsePausedContext?.imageBrowserActive == true
+            MOMO_DYNAMIC_DETAIL_ACTIVITY ->
+                accountBrowseDetailActivityClass == MOMO_DYNAMIC_DETAIL_ACTIVITY ||
+                    accountBrowseDetailFingerprint.isNotBlank() ||
+                    accountBrowsePausedContext?.detailFingerprint?.isNotBlank() == true ||
+                    (accountBrowsePausedContext?.phaseName?.let { phaseName ->
+                        phaseName in setOf(
+                            AccountBrowsePhase.WAIT_FOR_DETAIL_LOAD.name,
+                            AccountBrowsePhase.DETAIL_DWELL.name,
+                            AccountBrowsePhase.WAIT_FOR_IMAGE_BROWSER_RETURN.name,
+                            AccountBrowsePhase.WAIT_FOR_DETAIL_RESTABILIZE.name
+                        )
+                    } == true) || accountBrowseProgrammaticActionLabel.contains("动态卡片")
+            else -> false
+        }
     }
 
     private fun submitNavigationClick(
@@ -1198,6 +1564,10 @@ class FreedomAccessibilityService : AccessibilityService() {
                 accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_DYNAMIC_TAB
             }
             scheduleAccountBrowseStep(PAGE_STATE_POLL_MS)
+            return
+        }
+        if (handleMomoPopup(root)) {
+            runCatching { root.recycle() }
             return
         }
 
@@ -1443,6 +1813,10 @@ class FreedomAccessibilityService : AccessibilityService() {
             scheduleOrTimeoutFeedStability()
             return
         }
+        if (handleMomoPopup(root)) {
+            runCatching { root.recycle() }
+            return
+        }
 
         val inspection = try {
             inspectMomoFeedReadiness(root)
@@ -1592,8 +1966,20 @@ class FreedomAccessibilityService : AccessibilityService() {
         }
         val activePackage = runCatching { root.packageName?.toString().orEmpty() }.getOrDefault("")
         if (activePackage != MOMO_PACKAGE) {
+            val externalPopup = inspectMomoPopup(root)
+            if (externalPopup != null) {
+                addLog("检测到陌陌以外的系统窗口/弹窗：${externalPopup.description}；不对系统或其他应用执行点击，等待用户处理后重新定位动态")
+                recyclePopupInspection(externalPopup)
+                runCatching { root.recycle() }
+                beginDynamicNavigationRecovery("检测到陌陌外部系统窗口，需要用户先处理")
+                return null
+            }
             runCatching { root.recycle() }
             pauseAccountBrowse("当前没有打开陌陌；自动浏览已暂停")
+            return null
+        }
+        if (handleMomoPopup(root)) {
+            runCatching { root.recycle() }
             return null
         }
         return root
@@ -2189,6 +2575,7 @@ class FreedomAccessibilityService : AccessibilityService() {
         val fingerprint = pageState.second
 
         if (!isFeedPage &&
+            accountBrowseCurrentActivityClass == MOMO_DYNAMIC_DETAIL_ACTIVITY &&
             fingerprint.signature != accountBrowseSourceFingerprint &&
             fingerprint.nodeCount >= MIN_DETAIL_NODE_COUNT
         ) {
@@ -2200,6 +2587,8 @@ class FreedomAccessibilityService : AccessibilityService() {
             }
             if (accountBrowseStableSamples >= REQUIRED_STABLE_PAGE_SAMPLES) {
                 accountBrowseDetailFingerprint = fingerprint.signature
+                accountBrowseDetailActivityClass = accountBrowseCurrentActivityClass
+                    .ifBlank { MOMO_DYNAMIC_DETAIL_ACTIVITY }
                 val dwell = randomBrowseDelayMs()
                 accountBrowsePhase = AccountBrowsePhase.DETAIL_DWELL
                 accountBrowseDetailDwellRemainingMs = dwell
@@ -2214,7 +2603,7 @@ class FreedomAccessibilityService : AccessibilityService() {
         }
 
         if (System.currentTimeMillis() >= accountBrowseDeadlineAt) {
-            pauseAccountBrowse("等待详情页面超时，无法确认动态已经载入；没有继续执行返回操作")
+            beginDynamicNavigationRecovery("等待动态详情超时；当前 Activity=${accountBrowseCurrentActivityClass.ifBlank { "未知" }}，重新分析当前页面层级")
         } else {
             scheduleAccountBrowseStep(PAGE_STATE_POLL_MS)
         }
@@ -2222,25 +2611,41 @@ class FreedomAccessibilityService : AccessibilityService() {
 
     private fun returnFromDetailPage() {
         val root = obtainTargetRootOrPause() ?: return
-        val pageState = try {
-            isMomoDynamicFeedPage(root) to pageFingerprint(root)
+        val identity = try {
+            inspectCurrentDynamicDetailIdentity(root)
         } finally {
             runCatching { root.recycle() }
         }
-        val isFeedPage = pageState.first
-        val fingerprint = pageState.second
-        if (isFeedPage ||
-            fingerprint.signature != accountBrowseDetailFingerprint ||
-            fingerprint.signature == accountBrowseSourceFingerprint
-        ) {
-            pauseAccountBrowse("阅读期间页面结构发生变化；为避免返回到错误页面，已暂停")
+
+        if (identity.isFeedPage) {
+            addLog("详情停留结束时重新扫描发现已经回到动态列表；不再重复执行返回，直接验证原列表位置")
+            accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_LIST_RETURN
+            accountBrowseReturnedStableSamples = 0
+            accountBrowseLastReturnedSnapshot = ""
+            accountBrowseReturnMismatchLogged = false
+            accountBrowseDeadlineAt = System.currentTimeMillis() + LIST_RETURN_TIMEOUT_MS
+            scheduleAccountBrowseStep(PAGE_STATE_POLL_MS)
             return
+        }
+
+        if (!identity.identityConfirmed) {
+            addLog("详情停留结束时无法确认当前页面仍是原动态详情：${identity.reason}；交由主动导航重新分析页面层级，不执行猜测性返回")
+            beginDynamicNavigationRecovery("详情页面身份验证未通过：${identity.reason}")
+            return
+        }
+
+        if (identity.fingerprint.signature != accountBrowseDetailFingerprint) {
+            addLog(
+                "动态详情内容结构在阅读期间发生变化（可见节点=${identity.fingerprint.nodeCount}）；" +
+                    "但 Activity 和详情页面身份仍然匹配，按正常内容更新处理，不触发暂停"
+            )
+            accountBrowseDetailFingerprint = identity.fingerprint.signature
         }
 
         accountBrowseProgrammaticActionLabel = "Freedom GLOBAL_ACTION_BACK 返回详情"
         accountBrowseIgnoreManualEventsUntil = System.currentTimeMillis() + 1_500L
         if (!performGlobalAction(GLOBAL_ACTION_BACK)) {
-            pauseAccountBrowse("系统未能执行返回操作；请手动返回动态列表后重新启动")
+            beginDynamicNavigationRecovery("详情页面身份已确认，但系统未接受返回操作")
             return
         }
         accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_LIST_RETURN
@@ -2248,7 +2653,73 @@ class FreedomAccessibilityService : AccessibilityService() {
         accountBrowseLastReturnedSnapshot = ""
         accountBrowseReturnMismatchLogged = false
         accountBrowseDeadlineAt = System.currentTimeMillis() + LIST_RETURN_TIMEOUT_MS
-        addLog("阅读停留结束；正在确认已返回动态列表")
+        addLog("动态详情身份已确认；阅读停留结束，正在返回并验证原动态列表位置")
+        scheduleAccountBrowseStep(PAGE_STATE_POLL_MS)
+    }
+
+    /**
+     * A detail page is identified by its known Momo Activity and page role, not by exact equality
+     * of every descendant node. The detail's images, text and RecyclerView children may continue
+     * changing while the same LuaViewActivity remains active.
+     */
+    private fun inspectCurrentDynamicDetailIdentity(
+        root: AccessibilityNodeInfo
+    ): DetailPageIdentityInspection {
+        val packageName = runCatching { root.packageName?.toString().orEmpty() }
+            .getOrDefault("")
+        val fingerprint = pageFingerprint(root)
+        val feedPage = isMomoDynamicFeedPage(root)
+        val expectedActivity = accountBrowseDetailActivityClass
+            .ifBlank { MOMO_DYNAMIC_DETAIL_ACTIVITY }
+        val currentActivity = accountBrowseCurrentActivityClass
+        val identityConfirmed = packageName == MOMO_PACKAGE &&
+            !feedPage &&
+            expectedActivity == MOMO_DYNAMIC_DETAIL_ACTIVITY &&
+            currentActivity == expectedActivity &&
+            fingerprint.nodeCount >= MIN_DETAIL_NODE_COUNT
+
+        val reason = when {
+            packageName != MOMO_PACKAGE -> "当前窗口包名不是陌陌：$packageName"
+            feedPage -> "当前页面已经识别为动态列表"
+            currentActivity != expectedActivity -> "Activity 不匹配：当前=${currentActivity.ifBlank { "未知" }}，预期=$expectedActivity"
+            fingerprint.nodeCount < MIN_DETAIL_NODE_COUNT -> "详情页面可见节点不足：${fingerprint.nodeCount}"
+            else -> "Activity=$currentActivity；详情节点=${fingerprint.nodeCount}"
+        }
+        return DetailPageIdentityInspection(feedPage, identityConfirmed, fingerprint, reason)
+    }
+
+    /** Machine-detected page uncertainty should enter the same verified navigator, not dead-end PAUSED. */
+    private fun beginDynamicNavigationRecovery(reason: String) {
+        if (accountBrowsePausedContext == null) {
+            accountBrowsePausedContext = ManualResumeContext(
+                phaseName = accountBrowsePhase.name,
+                activityClass = accountBrowseCurrentActivityClass,
+                sourceFingerprint = accountBrowseSourceFingerprint,
+                detailFingerprint = accountBrowseDetailFingerprint,
+                imageBrowserActive = accountBrowseImageBrowserActive,
+                lastProgrammaticAction = accountBrowseProgrammaticActionLabel,
+                capturedAt = System.currentTimeMillis()
+            )
+        }
+        GestureTrailOverlay.clear()
+        restoreMonitorOverlayTouchPassthrough()
+        mainHandler.removeCallbacks(accountBrowseRunnable)
+        accountBrowseStepPending = false
+        accountBrowsePauseReason = reason
+        accountBrowseManualResumeAllowed = false
+        accountBrowseNavigationActionKey = ""
+        accountBrowseNavigationBeforeActivity = ""
+        accountBrowseNavigationBeforeFingerprint = ""
+        accountBrowseNavigationActionDeadlineAt = 0L
+        accountBrowseNavigationActionAttempts = 0
+        accountBrowseRecoveryBackAttempts = 0
+        accountBrowseRecoveryHomeClickAttempts = 0
+        accountBrowseRecoveryDynamicClickAttempts = 0
+        accountBrowseDynamicTabClickConfirmed = false
+        accountBrowseLastDynamicTabWaitReason = ""
+        accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_DYNAMIC_TAB
+        accountBrowseDeadlineAt = System.currentTimeMillis() + INITIAL_DYNAMIC_TAB_WAIT_TIMEOUT_MS
+        addLog("页面状态需要重新定位：$reason；启动主动导航，重新识别页面层级并验证动态标签")
         scheduleAccountBrowseStep(PAGE_STATE_POLL_MS)
     }
 
@@ -2344,50 +2815,51 @@ class FreedomAccessibilityService : AccessibilityService() {
 
     private fun waitForDetailRestabilize() {
         val root = obtainTargetRootOrPause() ?: return
-        val state = try {
-            isMomoDynamicFeedPage(root) to pageFingerprint(root)
+        val identity = try {
+            inspectCurrentDynamicDetailIdentity(root)
         } finally {
             runCatching { root.recycle() }
         }
-        val isFeedPage = state.first
-        val fingerprint = state.second
 
-        if (accountBrowseCurrentActivityClass != accountBrowseImageBrowserReturnActivityClass) {
-            pauseAccountBrowse("图片浏览器返回后的 Activity 与原动态详情不一致；已停止自动操作")
-            return
-        }
-        if (isFeedPage) {
-            pauseAccountBrowse("图片浏览器退出后已回到动态列表而非原详情页；保留暂停状态，等待手动重新进入动态")
-            return
-        }
-
-        if (fingerprint.nodeCount >= MIN_DETAIL_NODE_COUNT &&
-            fingerprint.signature != accountBrowseSourceFingerprint
-        ) {
-            if (fingerprint.signature == accountBrowseLastStableFingerprint) {
-                accountBrowseStableSamples++
-            } else {
-                accountBrowseLastStableFingerprint = fingerprint.signature
-                accountBrowseStableSamples = 1
-            }
-
-            if (accountBrowseStableSamples >= REQUIRED_STABLE_PAGE_SAMPLES) {
-                accountBrowseDetailFingerprint = fingerprint.signature
+        val expectedActivity = accountBrowseImageBrowserReturnActivityClass
+            .ifBlank { accountBrowseDetailActivityClass.ifBlank { MOMO_DYNAMIC_DETAIL_ACTIVITY } }
+        if (accountBrowseCurrentActivityClass != expectedActivity || !identity.identityConfirmed) {
+            if (identity.isFeedPage) {
+                addLog("退出图片浏览器后已经回到动态列表；直接验证列表状态，不重复返回")
                 accountBrowseImageBrowserActive = false
-                accountBrowseDetailDwellDueAt = System.currentTimeMillis() + accountBrowseDetailDwellRemainingMs
-                accountBrowsePhase = AccountBrowsePhase.DETAIL_DWELL
-                val remaining = accountBrowseDetailDwellRemainingMs
-                addLog("原动态详情页面已连续 ${REQUIRED_STABLE_PAGE_SAMPLES} 次确认稳定；已更新页面指纹，继续剩余阅读时间 ${remaining / 1000.0} 秒")
-                scheduleAccountBrowseStep(remaining.coerceAtLeast(300L))
+                accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_LIST_RETURN
+                accountBrowseDeadlineAt = System.currentTimeMillis() + LIST_RETURN_TIMEOUT_MS
+                accountBrowseReturnedStableSamples = 0
+                accountBrowseLastReturnedSnapshot = ""
+                scheduleAccountBrowseStep(PAGE_STATE_POLL_MS)
                 return
             }
-        } else {
-            accountBrowseLastStableFingerprint = ""
-            accountBrowseStableSamples = 0
+            beginDynamicNavigationRecovery("图片浏览器返回后未能确认原动态详情身份：${identity.reason}")
+            return
+        }
+
+        // The content fingerprint may change while images and text finish loading. Two
+        // consecutive identity checks on the expected detail Activity are sufficient;
+        // descendant equality is intentionally not required.
+        accountBrowseStableSamples++
+        accountBrowseDetailFingerprint = identity.fingerprint.signature
+        accountBrowseDetailActivityClass = expectedActivity
+        if (accountBrowseStableSamples >= REQUIRED_STABLE_PAGE_SAMPLES) {
+            accountBrowseImageBrowserActive = false
+            accountBrowseImageBrowserReturnActivityClass = ""
+            accountBrowseDetailDwellDueAt = System.currentTimeMillis() + accountBrowseDetailDwellRemainingMs
+            accountBrowsePhase = AccountBrowsePhase.DETAIL_DWELL
+            val remaining = accountBrowseDetailDwellRemainingMs
+            addLog(
+                "图片浏览器已返回原动态详情；页面身份连续 ${REQUIRED_STABLE_PAGE_SAMPLES} 次确认，" +
+                    "内容节点变化不影响页面身份；继续剩余阅读时间 ${remaining / 1000.0} 秒"
+            )
+            scheduleAccountBrowseStep(remaining.coerceAtLeast(300L))
+            return
         }
 
         if (System.currentTimeMillis() >= accountBrowseDeadlineAt) {
-            pauseAccountBrowse("图片浏览器已退出，但原动态详情页面未能在限定时间内稳定；已安全暂停")
+            beginDynamicNavigationRecovery("图片浏览器已退出，但原动态详情身份未能连续确认")
         } else {
             scheduleAccountBrowseStep(PAGE_STATE_POLL_MS)
         }
@@ -2423,7 +2895,8 @@ class FreedomAccessibilityService : AccessibilityService() {
                 (accountBrowseProgrammaticActionLabel.contains("滑动") ||
                     accountBrowseProgrammaticActionLabel.contains("滚动")) -> true
             eventType == AccessibilityEvent.TYPE_VIEW_CLICKED &&
-                accountBrowseProgrammaticActionLabel.contains("ACTION_CLICK") -> true
+                (accountBrowseProgrammaticActionLabel.contains("ACTION_CLICK") ||
+                    accountBrowseProgrammaticActionLabel.contains("弹窗关闭")) -> true
             else -> false
         }
     }
@@ -2585,6 +3058,9 @@ class FreedomAccessibilityService : AccessibilityService() {
             }
 
             if (accountBrowseReturnedStableSamples >= REQUIRED_STABLE_PAGE_SAMPLES) {
+                accountBrowseDetailActivityClass = ""
+                accountBrowseDetailFingerprint = ""
+                accountBrowseProgrammaticActionLabel = ""
                 accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_LIST_SCROLL
                 accountBrowseReturnedStableSamples = 0
                 accountBrowseLastReturnedSnapshot = ""
@@ -3404,6 +3880,23 @@ class FreedomAccessibilityService : AccessibilityService() {
         private const val MAX_RECOVERY_TAB_CLICK_ATTEMPTS = 2
         private const val MAX_RECOVERY_HOME_CLICK_ATTEMPTS = 2
         private const val MAX_RECOVERY_BACK_STEPS = 4
+        private const val POPUP_VERIFY_POLL_MS = 350L
+        private const val POPUP_DISMISS_VERIFY_TIMEOUT_MS = 2_500L
+        private const val POPUP_RETRY_DELAY_MS = 900L
+        private const val POPUP_BLOCKED_RECHECK_MS = 1_000L
+        private const val MAX_POPUP_DISMISS_ATTEMPTS = 2
+        private val POPUP_SAFE_CLOSE_LABELS = setOf(
+            "关闭", "关闭弹窗", "关闭广告", "取消", "暂不", "暂不升级", "稍后", "稍后再说",
+            "以后再说", "知道了", "我知道了", "×", "✕", "x", "X", "Close", "close", "Dismiss", "dismiss"
+        )
+        private val POPUP_CRITICAL_CUES = setOf(
+            "权限", "授权", "允许", "同意", "隐私", "协议", "支付", "充值", "购买",
+            "删除", "注销", "退出登录", "身份验证", "安全验证", "实名认证", "确认提交",
+            "确定要", "是否删除", "是否退出", "登录", "绑定手机号", "开启定位", "开启相机"
+        )
+        private val POPUP_CONTENT_CUES = setOf(
+            "温馨提示", "系统提示", "公告", "新版本", "版本升级", "弹窗"
+        )
 
         private const val MIN_BROWSE_DELAY_MS = 3_000L
         private const val MAX_BROWSE_DELAY_MS = 15_000L
