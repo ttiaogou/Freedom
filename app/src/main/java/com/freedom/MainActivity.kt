@@ -42,6 +42,7 @@ class MainActivity : Activity() {
     private lateinit var runButton: ImageButton
     private lateinit var keepAccountCheckBox: CheckBox
     private var receiverRegistered = false
+    private var pendingLogExportContent: String? = null
 
     private val refreshReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -752,11 +753,98 @@ class MainActivity : Activity() {
             .setTitle("运行记录（最近 ${records.size} 条）")
             .setView(container)
             .setPositiveButton("关闭", null)
-            .setNeutralButton("清空记录") { _, _ ->
+            .setNeutralButton("导出 TXT") { _, _ ->
+                launchLogExport(records)
+            }
+            .setNegativeButton("清空记录") { _, _ ->
                 MonitorStore.clearLogs(this)
                 refreshScreen()
             }
             .show()
+    }
+
+    /** Open Android's system document picker; no storage permission is required. */
+    private fun launchLogExport(records: List<String>) {
+        val content = buildLogExportContent(records)
+        val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "text/plain"
+            putExtra(Intent.EXTRA_TITLE, createLogExportFileName())
+        }
+        pendingLogExportContent = content
+        try {
+            @Suppress("DEPRECATION")
+            startActivityForResult(intent, REQUEST_EXPORT_LOGS)
+        } catch (error: Exception) {
+            pendingLogExportContent = null
+            MonitorStore.addLog(
+                this,
+                timestamp() + "  启动日志导出失败：${error.javaClass.simpleName}: " +
+                    (error.message ?: "无详细信息")
+            )
+            Toast.makeText(this, "无法打开文件保存窗口，请稍后重试", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun buildLogExportContent(records: List<String>): String = buildString {
+        append("Freedom 运行日志\n")
+        append("导出时间：")
+        append(
+            java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", java.util.Locale.getDefault())
+                .format(java.util.Date())
+        )
+        append("\n记录数量：").append(records.size)
+        append("\n导出内容：包含完整技术详情\n")
+        append("=".repeat(72)).append("\n\n")
+        append(formatLogLines(records, includeTechnicalDetails = true))
+        if (records.isNotEmpty()) append('\n')
+    }
+
+    private fun createLogExportFileName(): String {
+        val time = java.text.SimpleDateFormat(
+            "yyyyMMdd-HHmmss",
+            java.util.Locale.getDefault()
+        ).format(java.util.Date())
+        return "Freedom-运行日志-$time.txt"
+    }
+
+    @Deprecated("Use the document picker result to write the selected URI")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != REQUEST_EXPORT_LOGS) return
+
+        val content = pendingLogExportContent
+        pendingLogExportContent = null
+        if (resultCode != RESULT_OK || data?.data == null) {
+            Toast.makeText(this, "已取消日志导出", Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (content == null) {
+            Toast.makeText(this, "导出内容已失效，请重新导出", Toast.LENGTH_LONG).show()
+            return
+        }
+
+        try {
+            val uri = data.data!!
+            val output = contentResolver.openOutputStream(uri, "w")
+                ?: throw java.io.IOException("无法打开所选文件")
+            output.use { stream ->
+                stream.write(content.toByteArray(Charsets.UTF_8))
+                stream.flush()
+            }
+            Toast.makeText(this, "运行记录已导出", Toast.LENGTH_LONG).show()
+        } catch (error: Exception) {
+            MonitorStore.addLog(
+                this,
+                timestamp() + "  写入日志文件失败：${error.javaClass.simpleName}: " +
+                    (error.message ?: "无详细信息")
+            )
+            Toast.makeText(
+                this,
+                "日志导出失败：${error.message ?: error.javaClass.simpleName}",
+                Toast.LENGTH_LONG
+            ).show()
+        }
     }
 
     private fun formatLogLines(
@@ -878,6 +966,7 @@ class MainActivity : Activity() {
         private const val KEY_KEEP_ACCOUNT_MODE = "keep_account_mode_enabled"
         private const val LOG_DETAIL_SEPARATOR = "\u001F"
         private const val REQUEST_MEDIA_PERMISSION = 2001
+        private const val REQUEST_EXPORT_LOGS = 2002
         private val PACKAGE_PATTERN = Regex("^[A-Za-z][A-Za-z0-9_]*(\\.[A-Za-z][A-Za-z0-9_]*)+$")
     }
 }
