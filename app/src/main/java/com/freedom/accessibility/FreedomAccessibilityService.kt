@@ -34,6 +34,7 @@ import com.freedom.accessibility.browse.DynamicTabInspection
 import com.freedom.accessibility.browse.DynamicTabRowEvidence
 import com.freedom.accessibility.browse.FeedGestureTarget
 import com.freedom.accessibility.browse.FeedPositionMatcher
+import com.freedom.accessibility.browse.FeedReturnStability
 import com.freedom.accessibility.browse.FeedReadinessInspection
 import com.freedom.accessibility.browse.HomeBottomNavEvidence
 import com.freedom.accessibility.browse.ManualResumeContext
