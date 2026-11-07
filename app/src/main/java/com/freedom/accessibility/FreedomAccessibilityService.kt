@@ -34,6 +34,7 @@ import com.freedom.accessibility.browse.AccountBrowseSessionState
 import com.freedom.accessibility.browse.DetailPageIdentityInspection
 import com.freedom.accessibility.browse.DetailDwellScrollPolicy
 import com.freedom.accessibility.browse.DynamicTabStartupScrollPolicy
+import com.freedom.accessibility.browse.DynamicFeedRecoveryStartupScrollPolicy
 import com.freedom.accessibility.browse.DynamicTabInspection
 import com.freedom.accessibility.browse.DynamicTabRowEvidence
 import com.freedom.accessibility.browse.FeedGestureTarget
@@ -429,7 +430,8 @@ class FreedomAccessibilityService : AccessibilityService() {
                 maxScanNodes = PAGE_FINGERPRINT_MAX_NODES,
                 tabTargetMatchToleranceDp = TAB_TARGET_MATCH_TOLERANCE_DP,
                 maxClickTargetHeightRatio = MAX_TAB_CLICK_TARGET_HEIGHT_RATIO,
-                maxAncestorDepth = MAX_TAB_CLICK_ANCESTOR_DEPTH
+                maxAncestorDepth = MAX_TAB_CLICK_ANCESTOR_DEPTH,
+                homeTabContainerViewIdSuffixes = MOMO_HOME_TAB_CONTAINER_VIEW_ID_SUFFIXES
             )
         )
     }
@@ -1133,37 +1135,24 @@ class FreedomAccessibilityService : AccessibilityService() {
                 } else if (handleMomoPopup(root)) {
                     return
                 } else {
-                    accountBrowseNotTargetForegroundLogged = false
-                    accountBrowseRootUnavailableLogged = false
+                    val startupWaitReason = if (
+                        accountBrowseFeedRefreshRecoveryActive &&
+                        !accountBrowseSession.feedRefreshStartupReady
+                    ) {
+                        dynamicFeedRecoveryStartupWaitReason(root)
+                    } else {
+                        null
+                    }
+                    if (startupWaitReason != null) {
+                        reason = startupWaitReason
+                    } else {
+                        accountBrowseNotTargetForegroundLogged = false
+                        accountBrowseRootUnavailableLogged = false
 
-                    val tabInspection = inspectDynamicTabRow(root)
-                    val tabEvidence = tabInspection.evidence
-                    if (tabEvidence != null) {
-                        if (tabEvidence.selectionKnown && !tabEvidence.dynamicSelected) {
-                            val dynamicTarget = findClickableNodeForLabel(
-                                root = root,
-                                label = MOMO_DYNAMIC_TAB_LABEL,
-                                expectedBounds = tabEvidence.dynamicBounds,
-                                minCenterY = 0,
-                                maxCenterY = (resources.displayMetrics.heightPixels * DYNAMIC_TAB_UPPER_BAND_RATIO).toInt()
-                            )
-                            if (dynamicTarget != null) {
-                                submitNavigationClick(
-                                    root = root,
-                                    target = dynamicTarget,
-                                    actionKey = NAV_ACTION_DYNAMIC_TAB,
-                                    actionDescription = "首页顶部‘动态’标签"
-                                )
-                                return
-                            }
-                            reason = "已确认首页顶部动态导航行，但没有找到可安全点击的‘动态’控件"
-                        } else {
-                            val readiness = inspectMomoFeedReadiness(root)
-                            val shouldVerifyUnknownSelectionByClick =
-                                !tabEvidence.selectionKnown &&
-                                    !accountBrowseDynamicTabClickConfirmed &&
-                                    accountBrowseRecoveryDynamicClickAttempts < MAX_RECOVERY_TAB_CLICK_ATTEMPTS
-                            if (shouldVerifyUnknownSelectionByClick) {
+                        val tabInspection = inspectDynamicTabRow(root)
+                        val tabEvidence = tabInspection.evidence
+                        if (tabEvidence != null) {
+                            if (tabEvidence.selectionKnown && !tabEvidence.dynamicSelected) {
                                 val dynamicTarget = findClickableNodeForLabel(
                                     root = root,
                                     label = MOMO_DYNAMIC_TAB_LABEL,
@@ -1172,7 +1161,6 @@ class FreedomAccessibilityService : AccessibilityService() {
                                     maxCenterY = (resources.displayMetrics.heightPixels * DYNAMIC_TAB_UPPER_BAND_RATIO).toInt()
                                 )
                                 if (dynamicTarget != null) {
-                                    addLog("动态标签选中状态未被系统明确暴露；为确保进入目标页，主动点击已由同排导航结构确认的‘动态’并验证结果")
                                     submitNavigationClick(
                                         root = root,
                                         target = dynamicTarget,
@@ -1181,55 +1169,74 @@ class FreedomAccessibilityService : AccessibilityService() {
                                     )
                                     return
                                 }
-                                reason = "已找到首页顶部动态导航行，但动态标签没有安全可点击的节点；不把当前列表直接认定为目标页"
-                            }
-                            if (readiness.fingerprint != null &&
-                                (tabEvidence.selectionKnown || accountBrowseDynamicTabClickConfirmed)
-                            ) {
-                                if (accountBrowseFeedRefreshRecoveryActive) {
-                                    accountBrowsePhase = AccountBrowsePhase.REFRESH_DYNAMIC_FEED
-                                    accountBrowseFeedRefreshWaitReason = ""
+                                reason = "已确认首页顶部动态导航行，但没有找到可安全点击的‘动态’控件"
+                            } else {
+                                val readiness = inspectMomoFeedReadiness(root)
+                                val shouldVerifyUnknownSelectionByClick =
+                                    !tabEvidence.selectionKnown &&
+                                        !accountBrowseDynamicTabClickConfirmed &&
+                                        accountBrowseRecoveryDynamicClickAttempts < MAX_RECOVERY_TAB_CLICK_ATTEMPTS
+                                if (shouldVerifyUnknownSelectionByClick) {
+                                    val dynamicTarget = findClickableNodeForLabel(
+                                        root = root,
+                                        label = MOMO_DYNAMIC_TAB_LABEL,
+                                        expectedBounds = tabEvidence.dynamicBounds,
+                                        minCenterY = 0,
+                                        maxCenterY = (resources.displayMetrics.heightPixels * DYNAMIC_TAB_UPPER_BAND_RATIO).toInt()
+                                    )
+                                    if (dynamicTarget != null) {
+                                        addLog("动态标签选中状态未被系统明确暴露；为确保进入目标页，主动点击已由同排导航结构确认的‘动态’并验证结果")
+                                        submitNavigationClick(
+                                            root = root,
+                                            target = dynamicTarget,
+                                            actionKey = NAV_ACTION_DYNAMIC_TAB,
+                                            actionDescription = "首页顶部‘动态’标签"
+                                        )
+                                        return
+                                    }
+                                    reason = "已找到首页顶部动态导航行，但动态标签没有安全可点击的节点；不把当前列表直接认定为目标页"
+                                }
+                                if (readiness.fingerprint != null &&
+                                    (tabEvidence.selectionKnown || accountBrowseDynamicTabClickConfirmed)
+                                ) {
+                                    if (accountBrowseFeedRefreshRecoveryActive) {
+                                        accountBrowsePhase = AccountBrowsePhase.REFRESH_DYNAMIC_FEED
+                                        accountBrowseFeedRefreshWaitReason = ""
+                                        addLog(
+                                            "已重新确认首页顶部‘动态’标签及其下方列表；" +
+                                                "动态列表已达到可读取状态；进入首页连续双击刷新验证，不使用旧列表位置继续滑动"
+                                        )
+                                        scheduleAccountBrowseStep(PAGE_STATE_POLL_MS)
+                                        return
+                                    }
+                                    accountBrowseImageBrowserActive = false
+                                    accountBrowseImageBrowserReturnActivityClass = ""
+                                    accountBrowseDetailActivityClass = ""
+                                    accountBrowseDetailFingerprint = ""
+                                    accountBrowseProgrammaticActionLabel = ""
+                                    accountBrowseDetailDwellDueAt = 0L
+                                    accountBrowseDetailDwellStartedAt = 0L
+                                    accountBrowseDetailDwellRemainingMs = 0L
+                                    accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_FEED_STABLE
+                                    accountBrowseDeadlineAt = System.currentTimeMillis() + INITIAL_FEED_STABILITY_TIMEOUT_MS
+                                    accountBrowseLastDynamicTabWaitReason = ""
+                                    accountBrowseLastStableFingerprint = ""
+                                    accountBrowseStableSamples = 0
                                     addLog(
-                                        "已重新确认首页顶部‘动态’标签及其下方列表；" +
-                                            "进入首页连续双击刷新验证，不使用旧列表位置继续滑动"
+                                        "已确认当前位于陌陌动态列表；现在独立等待列表稳定（最多 ${INITIAL_FEED_STABILITY_TIMEOUT_MS / 1_000} 秒）。" +
+                                            readiness.reason
                                     )
                                     scheduleAccountBrowseStep(PAGE_STATE_POLL_MS)
                                     return
                                 }
-                                accountBrowseImageBrowserActive = false
-                                accountBrowseImageBrowserReturnActivityClass = ""
-                                accountBrowseDetailActivityClass = ""
-                                accountBrowseDetailFingerprint = ""
-                                accountBrowseProgrammaticActionLabel = ""
-                                accountBrowseDetailDwellDueAt = 0L
-                                accountBrowseDetailDwellStartedAt = 0L
-                                accountBrowseDetailDwellRemainingMs = 0L
-                                accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_FEED_STABLE
-                                accountBrowseDeadlineAt = System.currentTimeMillis() + INITIAL_FEED_STABILITY_TIMEOUT_MS
-                                accountBrowseLastDynamicTabWaitReason = ""
-                                accountBrowseLastStableFingerprint = ""
-                                accountBrowseStableSamples = 0
-                                addLog(
-                                    "已确认当前位于陌陌动态列表；现在独立等待列表稳定（最多 ${INITIAL_FEED_STABILITY_TIMEOUT_MS / 1_000} 秒）。" +
-                                        readiness.reason
-                                )
-                                scheduleAccountBrowseStep(PAGE_STATE_POLL_MS)
-                                return
-                            }
-                            if (!shouldVerifyUnknownSelectionByClick || accountBrowseDynamicTabClickConfirmed) {
-                                reason = readiness.reason
+                                if (!shouldVerifyUnknownSelectionByClick || accountBrowseDynamicTabClickConfirmed) {
+                                    reason = readiness.reason
                             }
                         }
                     } else {
                         val homeEvidence = inspectHomeBottomNav(root)
                         if (homeEvidence != null) {
-                            val homeTarget = findClickableNodeForLabel(
-                                root = root,
-                                label = MOMO_HOME_TAB_LABEL,
-                                expectedBounds = homeEvidence.homeBounds,
-                                minCenterY = (resources.displayMetrics.heightPixels * HOME_NAV_LOWER_BAND_RATIO).toInt(),
-                                maxCenterY = resources.displayMetrics.heightPixels
-                            )
+                            val homeTarget = findHomeBottomNavClickTarget(root, homeEvidence)
                             if (homeTarget != null) {
                                 if (homeEvidence.selectionKnown && homeEvidence.homeSelected) {
                                     reason = "已确认底部‘首页’处于选中状态，但首页顶部动态导航行尚未出现；等待页面内容加载"
@@ -1262,6 +1269,7 @@ class FreedomAccessibilityService : AccessibilityService() {
                                     "当前页面层级无法确认；不执行猜测性返回或点击"
                             }
                         }
+                    }
                     }
                 }
             } finally {
@@ -1507,6 +1515,68 @@ class FreedomAccessibilityService : AccessibilityService() {
     private fun inspectHomeBottomNav(root: AccessibilityNodeInfo): HomeBottomNavEvidence? =
         momoPageInspector.inspectHomeBottomNav(root)
 
+    /**
+     * The refresh-recovery path first waits for a real Momo MainTabActivity root
+     * and at least one visible navigation row. Feed readiness is checked separately
+     * before the refresh gesture is ever submitted.
+     */
+    private fun dynamicFeedRecoveryStartupWaitReason(root: AccessibilityNodeInfo): String? {
+        val activePackage = runCatching { root.packageName?.toString().orEmpty() }
+            .getOrDefault("")
+        if (activePackage != MOMO_PACKAGE) {
+            return "Debug 恢复启动等待：当前无障碍根节点不属于陌陌（${activePackage.ifBlank { "未提供" }}）"
+        }
+        if (accountBrowseCurrentActivityClass != MOMO_MAIN_ACTIVITY) {
+            return "Debug 恢复启动等待：陌陌主页面尚未确认；当前 Activity=${accountBrowseCurrentActivityClass.ifBlank { "尚未报告" }}"
+        }
+
+        val dynamicTabEvidence = inspectDynamicTabRow(root).evidence
+        val homeNavEvidence = inspectHomeBottomNav(root)
+        if (dynamicTabEvidence == null && homeNavEvidence == null) {
+            return "Debug 恢复启动等待：陌陌主 Activity 已出现，但首页/动态导航节点尚未就绪；继续重新扫描"
+        }
+
+        accountBrowseSession.feedRefreshStartupReady = true
+        addLog(
+            "恢复启动检查通过：已确认陌陌主 Activity、当前无障碍根节点和导航结构；" +
+                "继续定位顶部‘动态’并验证可见列表，列表未就绪前不会执行首页双击"
+        )
+        return null
+    }
+
+    private fun findHomeBottomNavClickTarget(
+        root: AccessibilityNodeInfo,
+        evidence: HomeBottomNavEvidence
+    ): AccessibilityNodeInfo? {
+        val minCenterY = (resources.displayMetrics.heightPixels * HOME_NAV_LOWER_BAND_RATIO).toInt()
+        val maxCenterY = resources.displayMetrics.heightPixels
+        val labelTarget = findClickableNodeForLabel(
+            root = root,
+            label = MOMO_HOME_TAB_LABEL,
+            expectedBounds = evidence.homeBounds,
+            minCenterY = minCenterY,
+            maxCenterY = maxCenterY
+        )
+        if (labelTarget != null) return labelTarget
+
+        val containerTarget = momoNavigationController.findClickableHomeTabContainer(
+            root = root,
+            expectedLabelBounds = evidence.homeBounds,
+            minCenterY = minCenterY,
+            maxCenterY = maxCenterY
+        ) ?: return null
+
+        val targetBounds = Rect()
+        val targetViewId = runCatching { containerTarget.viewIdResourceName.orEmpty() }
+            .getOrDefault("")
+        runCatching { containerTarget.getBoundsInScreen(targetBounds) }
+        addLog(
+            "底部‘首页’点击目标定位成功：使用无障碍事件中实际出现过的控件 ViewId=$targetViewId；" +
+                "控件范围=${targetBounds.toShortString()}；已验证其可点击并完整包含‘首页’标签范围"
+        )
+        return containerTarget
+    }
+
     private fun findClickableNodeForLabel(
         root: AccessibilityNodeInfo,
         label: String,
@@ -1607,6 +1677,7 @@ class FreedomAccessibilityService : AccessibilityService() {
         GestureTrailOverlay.clear()
         restoreMonitorOverlayTouchPassthrough("动态页面刷新恢复准备")
         accountBrowseFeedRefreshRecoveryActive = true
+        accountBrowseSession.feedRefreshStartupReady = false
         accountBrowseFeedRefreshAttempts = 0
         accountBrowseFeedRefreshBeforeSnapshot = ""
         accountBrowseFeedRefreshLastSnapshot = ""
@@ -1628,8 +1699,8 @@ class FreedomAccessibilityService : AccessibilityService() {
         accountBrowseDeadlineAt = System.currentTimeMillis() + INITIAL_DYNAMIC_TAB_WAIT_TIMEOUT_MS
         accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_DYNAMIC_TAB
         addLog(
-            "$reason；不再尝试猜测旧列表位置，开始主动恢复：" +
-                "识别陌陌底部‘首页’，确认顶部‘动态’标签，再执行首页连续双击刷新"
+            "$reason；启动主动恢复等待：先确认陌陌主 Activity、无障碍根节点和导航结构，" +
+                "再验证顶部‘动态’列表可用，最后才执行首页连续双击刷新"
         )
         scheduleAccountBrowseStep(PAGE_STATE_POLL_MS)
     }
@@ -1677,13 +1748,7 @@ class FreedomAccessibilityService : AccessibilityService() {
             }
 
             if (homeEvidence.selectionKnown && !homeEvidence.homeSelected) {
-                val homeTarget = findClickableNodeForLabel(
-                    root = root,
-                    label = MOMO_HOME_TAB_LABEL,
-                    expectedBounds = homeEvidence.homeBounds,
-                    minCenterY = (resources.displayMetrics.heightPixels * HOME_NAV_LOWER_BAND_RATIO).toInt(),
-                    maxCenterY = resources.displayMetrics.heightPixels
-                )
+                val homeTarget = findHomeBottomNavClickTarget(root, homeEvidence)
                 if (homeTarget == null) {
                     scheduleDynamicFeedRefreshNavigationWait("底部‘首页’未选中，但没有找到可安全点击的首页控件")
                     return
@@ -1698,13 +1763,7 @@ class FreedomAccessibilityService : AccessibilityService() {
                 return
             }
 
-            val homeTarget = findClickableNodeForLabel(
-                root = root,
-                label = MOMO_HOME_TAB_LABEL,
-                expectedBounds = homeEvidence.homeBounds,
-                minCenterY = (resources.displayMetrics.heightPixels * HOME_NAV_LOWER_BAND_RATIO).toInt(),
-                maxCenterY = resources.displayMetrics.heightPixels
-            )
+            val homeTarget = findHomeBottomNavClickTarget(root, homeEvidence)
             if (homeTarget == null) {
                 scheduleDynamicFeedRefreshNavigationWait("已识别底部‘首页’，但没有找到可点击的首页控件")
                 return
@@ -2849,6 +2908,23 @@ class FreedomAccessibilityService : AccessibilityService() {
         )
     }
 
+    private fun isDynamicFeedRecoveryStartupScroll(
+        eventType: Int,
+        className: String,
+        now: Long
+    ): Boolean {
+        val hasTouchEvidence = accountBrowseTouchActive ||
+            now - accountBrowseLastGlobalTouchEventAt in 0..GLOBAL_TOUCH_EVENT_ASSOCIATION_MS
+        return DynamicFeedRecoveryStartupScrollPolicy.shouldIgnore(
+            isScrollEvent = eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED,
+            isRecoveryActive = accountBrowseFeedRefreshRecoveryActive,
+            isWaitingForDynamicTab = accountBrowsePhase == AccountBrowsePhase.WAIT_FOR_DYNAMIC_TAB,
+            isMainActivity = accountBrowseCurrentActivityClass == MOMO_MAIN_ACTIVITY,
+            isRecyclerView = className.substringAfterLast('.') == "RecyclerView",
+            hasTouchEvidence = hasTouchEvidence
+        )
+    }
+
     private fun isDetailLoadContainerScroll(eventType: Int, className: String): Boolean =
         eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED &&
             accountBrowsePhase == AccountBrowsePhase.WAIT_FOR_DETAIL_LOAD &&
@@ -2880,6 +2956,8 @@ class FreedomAccessibilityService : AccessibilityService() {
             now - accountBrowseFeedRefreshActionAt in 0..HOME_REFRESH_PROGRAMMATIC_EVENT_WINDOW_MS
 
     private fun classifyInteractionEventOrigin(eventType: Int, now: Long, className: String): String = when {
+        isDynamicFeedRecoveryStartupScroll(eventType, className, now) ->
+            "主动刷新恢复启动阶段；陌陌主页面 RecyclerView 初始化滚动事件且没有独立触摸证据，不按用户操作处理"
         isDynamicTabStartupScroll(eventType, className, now) ->
             "陌陌首页刚进入动态标签识别阶段；2 秒内 RecyclerView 初始化滚动事件且没有触摸证据，不按用户操作处理"
         isDetailLoadContainerScroll(eventType, className) ->
@@ -2940,6 +3018,13 @@ class FreedomAccessibilityService : AccessibilityService() {
         if (!isTrackedInteractionEvent(eventType)) return
         val now = System.currentTimeMillis()
         if (isProgrammaticInteractionEvent(eventType, now)) return
+        if (isDynamicFeedRecoveryStartupScroll(eventType, className, now)) {
+            addLog(
+                "主动刷新恢复仍在等待陌陌动态页就绪；收到 RecyclerView 初始化滚动事件，" +
+                    "未发现独立触摸证据，不触发人工操作暂停，继续等待页面重新扫描"
+            )
+            return
+        }
         if (isDynamicTabStartupScroll(eventType, className, now)) {
             addLog("陌陌首页刚进入动态标签识别阶段；2 秒缓冲期内检测到 RecyclerView 初始化滚动事件，没有独立触摸证据，不触发暂停")
             return
@@ -3238,6 +3323,7 @@ class FreedomAccessibilityService : AccessibilityService() {
         private const val MOMO_MAIN_ACTIVITY = "com.immomo.momo.maintab.MaintabActivity"
         private const val MOMO_HOME_TAB_LABEL = "首页"
         private val MOMO_HOME_NAV_LABELS = setOf("首页", "附近", "消息", "我的", "直播", "动态")
+        private val MOMO_HOME_TAB_CONTAINER_VIEW_ID_SUFFIXES = setOf("maintab_layout_nearby")
         private const val HOME_NAV_LOWER_BAND_RATIO = 0.72f
         private val DYNAMIC_TAB_LABELS = setOf(
             MOMO_DYNAMIC_TAB_LABEL,

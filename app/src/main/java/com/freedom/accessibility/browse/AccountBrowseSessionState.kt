@@ -58,6 +58,7 @@ internal class AccountBrowseSessionState {
     var recoveryDynamicClickAttempts = 0
     var dynamicTabClickConfirmed = false
     var feedRefreshRecoveryActive = false
+    var feedRefreshStartupReady = false
     var feedRefreshAttempts = 0
     var feedRefreshBeforeSnapshot = ""
     var feedRefreshLastSnapshot = ""
@@ -132,6 +133,7 @@ internal class AccountBrowseSessionState {
         recoveryDynamicClickAttempts = 0
         dynamicTabClickConfirmed = false
         feedRefreshRecoveryActive = false
+        feedRefreshStartupReady = false
         feedRefreshAttempts = 0
         feedRefreshBeforeSnapshot = ""
         feedRefreshLastSnapshot = ""

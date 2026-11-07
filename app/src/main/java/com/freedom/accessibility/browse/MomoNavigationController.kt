@@ -22,7 +22,8 @@ internal class MomoNavigationController(
         val maxScanNodes: Int,
         val tabTargetMatchToleranceDp: Int,
         val maxClickTargetHeightRatio: Float,
-        val maxAncestorDepth: Int
+        val maxAncestorDepth: Int,
+        val homeTabContainerViewIdSuffixes: Set<String>
     )
 
     fun findClickableNodeForLabel(
@@ -55,6 +56,64 @@ internal class MomoNavigationController(
                         val clickable = findClickableAncestor(node, bounds)
                         if (clickable != null) return clickable
                     }
+                    val childCount = runCatching { node.childCount }.getOrDefault(0)
+                    for (index in 0 until childCount) {
+                        if (visited + queue.size >= config.maxScanNodes) break
+                        val child = runCatching { node.getChild(index) }.getOrNull() ?: continue
+                        queue.add(child)
+                    }
+                } finally {
+                    runCatching { node.recycle() }
+                }
+            }
+        } finally {
+            while (queue.isNotEmpty()) runCatching { queue.removeFirst().recycle() }
+        }
+        return null
+    }
+
+    /**
+     * The installed Momo build can expose the bottom Home label but omit a useful
+     * clickable text ancestor. Its actual click event identifies the tab container
+     * by resource ID, so use that observed ID only when it geometrically contains
+     * the already-verified Home label bounds and is itself visibly clickable.
+     */
+    fun findClickableHomeTabContainer(
+        root: AccessibilityNodeInfo,
+        expectedLabelBounds: Rect,
+        minCenterY: Int,
+        maxCenterY: Int
+    ): AccessibilityNodeInfo? {
+        if (config.homeTabContainerViewIdSuffixes.isEmpty()) return null
+
+        val metrics = context.resources.displayMetrics
+        val maxWidth = (metrics.widthPixels * 0.40f).toInt()
+        val maxHeight = (metrics.heightPixels * 0.18f).toInt()
+        val queue = ArrayDeque<AccessibilityNodeInfo>()
+        queue.add(AccessibilityNodeInfo.obtain(root))
+        var visited = 0
+        try {
+            while (queue.isNotEmpty() && visited < config.maxScanNodes) {
+                val node = queue.removeFirst()
+                visited++
+                try {
+                    val viewId = runCatching { node.viewIdResourceName.orEmpty() }
+                        .getOrDefault("")
+                    val bounds = Rect()
+                    runCatching { node.getBoundsInScreen(bounds) }
+                    val knownContainer = config.homeTabContainerViewIdSuffixes.any { suffix ->
+                        viewId.endsWith(suffix, ignoreCase = true)
+                    }
+                    val safeTarget = knownContainer &&
+                        node.isVisibleToUser &&
+                        node.isClickable &&
+                        !bounds.isEmpty &&
+                        bounds.contains(expectedLabelBounds) &&
+                        bounds.centerY() in minCenterY..maxCenterY &&
+                        bounds.width() <= maxWidth &&
+                        bounds.height() <= maxHeight
+                    if (safeTarget) return AccessibilityNodeInfo.obtain(node)
+
                     val childCount = runCatching { node.childCount }.getOrDefault(0)
                     for (index in 0 until childCount) {
                         if (visited + queue.size >= config.maxScanNodes) break
