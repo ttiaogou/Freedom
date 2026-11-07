@@ -31,6 +31,7 @@ import com.freedom.accessibility.browse.AccountBrowsePhase
 import com.freedom.accessibility.browse.AccountBrowseSessionState
 import com.freedom.accessibility.browse.DetailPageIdentityInspection
 import com.freedom.accessibility.browse.DetailDwellScrollPolicy
+import com.freedom.accessibility.browse.DynamicTabStartupScrollPolicy
 import com.freedom.accessibility.browse.DynamicTabInspection
 import com.freedom.accessibility.browse.DynamicTabRowEvidence
 import com.freedom.accessibility.browse.FeedGestureTarget
@@ -66,7 +67,14 @@ class FreedomAccessibilityService : AccessibilityService() {
 
     private var accountBrowsePhase: AccountBrowsePhase
         get() = accountBrowseController.phase
-        set(value) = accountBrowseController.transitionTo(value)
+        set(value) {
+            if (value == AccountBrowsePhase.WAIT_FOR_DYNAMIC_TAB &&
+                accountBrowseController.phase != AccountBrowsePhase.WAIT_FOR_DYNAMIC_TAB
+            ) {
+                accountBrowseSession.dynamicTabWaitStartedAt = System.currentTimeMillis()
+            }
+            accountBrowseController.transitionTo(value)
+        }
 
     // Compatibility accessors keep the existing Service methods unchanged; backing
     // session values are owned by AccountBrowseController.session.
@@ -2283,6 +2291,19 @@ class FreedomAccessibilityService : AccessibilityService() {
         }
     }
 
+    private fun isDynamicTabStartupScroll(eventType: Int, className: String, now: Long): Boolean {
+        val hasTouchEvidence = accountBrowseTouchActive ||
+            now - accountBrowseLastGlobalTouchEventAt in 0..GLOBAL_TOUCH_EVENT_ASSOCIATION_MS
+        return DynamicTabStartupScrollPolicy.shouldIgnore(
+            isScrollEvent = eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED,
+            isDynamicTabWait = accountBrowsePhase == AccountBrowsePhase.WAIT_FOR_DYNAMIC_TAB,
+            isMainActivity = accountBrowseCurrentActivityClass == MOMO_MAIN_ACTIVITY,
+            isRecyclerView = className.substringAfterLast('.') == "RecyclerView",
+            elapsedSinceWaitStartedMs = now - accountBrowseSession.dynamicTabWaitStartedAt,
+            hasTouchEvidence = hasTouchEvidence
+        )
+    }
+
     private fun isDetailLoadContainerScroll(eventType: Int, className: String): Boolean =
         eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED &&
             accountBrowsePhase == AccountBrowsePhase.WAIT_FOR_DETAIL_LOAD &&
@@ -2304,6 +2325,8 @@ class FreedomAccessibilityService : AccessibilityService() {
             className.substringAfterLast('.') == "RecyclerView"
 
     private fun classifyInteractionEventOrigin(eventType: Int, now: Long, className: String): String = when {
+        isDynamicTabStartupScroll(eventType, className, now) ->
+            "陌陌首页刚进入动态标签识别阶段；2 秒内 RecyclerView 初始化滚动事件且没有触摸证据，不按用户操作处理"
         isDetailLoadContainerScroll(eventType, className) ->
             "动态详情加载期间 RecyclerView 的容器滚动/布局事件；缺少独立触摸证据，不按用户操作处理"
         isDetailDwellStartupScroll(eventType, className, now) ->
@@ -2360,6 +2383,10 @@ class FreedomAccessibilityService : AccessibilityService() {
         if (!isTrackedInteractionEvent(eventType)) return
         val now = System.currentTimeMillis()
         if (isProgrammaticInteractionEvent(eventType, now)) return
+        if (isDynamicTabStartupScroll(eventType, className, now)) {
+            addLog("陌陌首页刚进入动态标签识别阶段；2 秒缓冲期内检测到 RecyclerView 初始化滚动事件，没有独立触摸证据，不触发暂停")
+            return
+        }
         if (isDetailLoadContainerScroll(eventType, className)) {
             addLog("详情页面正在初始化；检测到 RecyclerView 滚动/布局事件，但没有独立用户触摸证据，来源标记为待确认，不触发暂停")
             return

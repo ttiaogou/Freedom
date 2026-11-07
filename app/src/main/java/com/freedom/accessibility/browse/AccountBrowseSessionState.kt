@@ -12,6 +12,7 @@ internal class AccountBrowseSessionState {
 
     // Navigation and page-readiness evidence
     var lastDynamicTabWaitReason = ""
+    var dynamicTabWaitStartedAt = 0L
     var deadlineAt = 0L
     var sourceFingerprint = ""
     var detailFingerprint = ""
@@ -71,6 +72,7 @@ internal class AccountBrowseSessionState {
     fun reset() {
         pauseReason = ""
         lastDynamicTabWaitReason = ""
+        dynamicTabWaitStartedAt = 0L
         deadlineAt = 0L
         sourceFingerprint = ""
         sourceSnapshot = ""
