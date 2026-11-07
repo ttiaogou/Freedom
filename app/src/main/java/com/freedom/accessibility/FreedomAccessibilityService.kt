@@ -23,6 +23,7 @@ import android.widget.TextView
 import com.freedom.data.MonitorActions
 import com.freedom.data.MonitorStore
 import com.freedom.accessibility.browse.MomoDynamicCardSelector
+import com.freedom.overlay.GestureTrailOverlay
 import com.freedom.overlay.MonitorOverlay
 import com.freedom.stability.MonitorKeepAliveService
 import java.text.SimpleDateFormat
@@ -703,6 +704,7 @@ class FreedomAccessibilityService : AccessibilityService() {
     }
 
     private fun resetAccountBrowseSession() {
+        GestureTrailOverlay.clear()
         restoreMonitorOverlayTouchPassthrough()
         mainHandler.removeCallbacks(accountBrowseRunnable)
         mainHandler.removeCallbacks(manualTouchResumeRunnable)
@@ -743,6 +745,7 @@ class FreedomAccessibilityService : AccessibilityService() {
         reason: String,
         allowManualResume: Boolean = false
     ) {
+        GestureTrailOverlay.clear()
         restoreMonitorOverlayTouchPassthrough()
         mainHandler.removeCallbacks(accountBrowseRunnable)
         accountBrowseStepPending = false
@@ -1133,6 +1136,7 @@ class FreedomAccessibilityService : AccessibilityService() {
             val accepted = runCatching {
                 dispatchGesture(gesture, object : AccessibilityService.GestureResultCallback() {
                     override fun onCompleted(gestureDescription: GestureDescription?) {
+                        GestureTrailOverlay.finishSwipe()
                         accountBrowseGestureInFlight = false
                         accountBrowseTouchStartedDuringGesture = false
                         accountBrowseTouchEndedDuringGesture = false
@@ -1144,6 +1148,7 @@ class FreedomAccessibilityService : AccessibilityService() {
                     }
 
                     override fun onCancelled(gestureDescription: GestureDescription?) {
+                        GestureTrailOverlay.cancelSwipe()
                         val touchStarted = accountBrowseTouchStartedDuringGesture
                         val touchEnded = accountBrowseTouchEndedDuringGesture
                         accountBrowseGestureInFlight = false
@@ -1173,11 +1178,14 @@ class FreedomAccessibilityService : AccessibilityService() {
 
             addLog("dispatchGesture 返回：accepted=$accepted")
             if (!accepted) {
+                GestureTrailOverlay.clear()
                 accountBrowseGestureInFlight = false
                 pauseAccountBrowse("Android 未接受第 ${accountBrowseSwipeCount + 1} 轮屏幕滑动手势；已停止本轮浏览")
                 return@postDelayed
             }
-            addLog("第 ${accountBrowseSwipeCount + 1} 轮列表区域滑动手势已提交；等待系统完成回调")
+            // Display the exact Path object submitted to GestureDescription; do not synthesize a separate curve.
+            GestureTrailOverlay.showSwipe(this, gesturePlan.path, profile.durationMs)
+            addLog("第 ${accountBrowseSwipeCount + 1} 轮列表区域滑动手势已提交；轨迹可视化与实际手势共用同一条 Path，等待系统完成回调")
         }, SWIPE_WINDOW_SYNC_DELAY_MS)
     }
 
@@ -1466,6 +1474,10 @@ class FreedomAccessibilityService : AccessibilityService() {
             return
         }
 
+        // ACTION_CLICK activates an accessibility node rather than injecting a physical tap.
+        // Capture its real screen bounds so the overlay can mark the target control accurately.
+        val clickTargetBounds = Rect()
+        runCatching { cardNode?.getBoundsInScreen(clickTargetBounds) }
         accountBrowseIgnoreManualEventsUntil = System.currentTimeMillis() + 1_800L
         val clicked = try {
             cardNode?.performAction(AccessibilityNodeInfo.ACTION_CLICK) == true
@@ -1480,6 +1492,12 @@ class FreedomAccessibilityService : AccessibilityService() {
             return
         }
 
+        if (!clickTargetBounds.isEmpty) {
+            GestureTrailOverlay.showClick(this, clickTargetBounds)
+            addLog("点击可视化：已标出被 ACTION_CLICK 激活的动态卡片控件范围及其中心位置；该操作是无障碍节点点击，不是模拟手指落点")
+        } else {
+            addLog("点击可视化未显示：系统没有返回动态卡片的有效屏幕边界")
+        }
         accountBrowseReturnedStableSamples = 0
         accountBrowseLastReturnedSnapshot = ""
         accountBrowseReturnMismatchLogged = false
@@ -2534,6 +2552,7 @@ class FreedomAccessibilityService : AccessibilityService() {
     }
 
     override fun onDestroy() {
+        GestureTrailOverlay.clear()
         restoreMonitorOverlayTouchPassthrough()
         mainHandler.removeCallbacksAndMessages(null)
         scanQueued = false
