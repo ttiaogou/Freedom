@@ -29,7 +29,8 @@ import java.util.ArrayDeque
 import java.util.Date
 import java.util.Locale
 import kotlin.math.PI
-import kotlin.math.pow
+import kotlin.math.cos
+import kotlin.math.hypot
 import kotlin.math.sin
 import kotlin.random.Random
 
@@ -86,8 +87,15 @@ class FreedomAccessibilityService : AccessibilityService() {
 
     private data class ScrollGestureProfile(
         val durationMs: Long,
-        val curveOffsetRatio: Float,
-        val accelerationExponent: Float
+        val curveOffsetRatio: Float
+    )
+
+    private data class ScrollGesturePlan(
+        val path: Path,
+        val startX: Int,
+        val startY: Int,
+        val endX: Int,
+        val endY: Int
     )
 
     private var accountBrowsePhase = AccountBrowsePhase.IDLE
@@ -712,9 +720,12 @@ class FreedomAccessibilityService : AccessibilityService() {
 
         val bounds = target.bounds
         val profile = loadScrollGestureProfile()
-        val path = createSmoothScrollPath(bounds, profile)
+        val gesturePlan = createSmoothScrollPath(bounds, profile) ?: run {
+            pauseAccountBrowse("动态列表有效区域不足以生成安全滑动路径；本轮未发送滑动")
+            return
+        }
         val gesture = GestureDescription.Builder()
-            .addStroke(GestureDescription.StrokeDescription(path, 0L, profile.durationMs))
+            .addStroke(GestureDescription.StrokeDescription(gesturePlan.path, 0L, profile.durationMs))
             .build()
 
         if (!enableMonitorOverlayTouchPassthrough()) {
@@ -728,13 +739,9 @@ class FreedomAccessibilityService : AccessibilityService() {
         accountBrowseLastScrollEventAt = 0L
         accountBrowseFallbackScrollAttempted = false
         accountBrowseGestureInFlight = false
-        val startX = bounds.centerX()
-        val startY = (bounds.top + bounds.height() * SCROLL_START_FRACTION).toInt()
-        val endX = bounds.centerX()
-        val endY = (bounds.top + bounds.height() * SCROLL_END_FRACTION).toInt()
         addLog(
             "第 ${accountBrowseSwipeCount + 1}/${accountBrowseSwipeTargetCount} 轮列表区域坐标滑动准备：容器=${target.className}，边界=$bounds，" +
-                "起点 ($startX,$startY)，终点 ($endX,$endY)，" +
+                "起点 (${gesturePlan.startX},${gesturePlan.startY})，终点 (${gesturePlan.endX},${gesturePlan.endY})，" +
                 "持续 ${profile.durationMs} 毫秒"
         )
 
@@ -907,38 +914,103 @@ class FreedomAccessibilityService : AccessibilityService() {
             durationMs = prefs.getLong(KEY_BROWSE_GESTURE_DURATION_MS, DEFAULT_GESTURE_DURATION_MS)
                 .coerceIn(MIN_GESTURE_DURATION_MS, MAX_GESTURE_DURATION_MS),
             curveOffsetRatio = (prefs.getFloat(KEY_BROWSE_GESTURE_CURVE_OFFSET, DEFAULT_CURVE_OFFSET_RATIO))
-                .coerceIn(0f, MAX_CURVE_OFFSET_RATIO),
-            accelerationExponent = prefs.getFloat(
-                KEY_BROWSE_GESTURE_ACCELERATION,
-                DEFAULT_GESTURE_ACCELERATION
-            ).coerceIn(MIN_GESTURE_ACCELERATION, MAX_GESTURE_ACCELERATION)
+                .coerceIn(0f, MAX_CURVE_OFFSET_RATIO)
         )
     }
 
-    /** Build a smooth, curved swipe with gradual acceleration and deceleration. */
+    /** Create fresh in-bounds endpoints and a cosine-timed cubic Bezier scroll path. */
     private fun createSmoothScrollPath(
         bounds: Rect,
         profile: ScrollGestureProfile
-    ): Path {
+    ): ScrollGesturePlan? {
+        val density = resources.displayMetrics.density.coerceAtLeast(1f)
+        val horizontalInset = maxOf(
+            (8f * density).toInt(),
+            (bounds.width() * 0.04f).toInt()
+        ).coerceAtMost(bounds.width() / 4)
+        val verticalInset = (8f * density).toInt().coerceAtMost(bounds.height() / 8)
+
+        val safeLeft = bounds.left + horizontalInset
+        val safeRight = bounds.right - horizontalInset
+        val safeTop = bounds.top + verticalInset
+        val safeBottom = bounds.bottom - verticalInset
+        val safeWidth = (safeRight - safeLeft).toFloat()
+        val safeHeight = (safeBottom - safeTop).toFloat()
+        if (safeWidth < 80f || safeHeight < 120f) return null
+
+        fun randomBetween(min: Float, max: Float): Float =
+            min + Random.nextFloat() * (max - min)
+
+        // Select a new start/end point from the currently visible list area on every swipe.
+        val startX = (safeLeft + safeWidth * randomBetween(0.18f, 0.82f)).toInt()
+        val endX = (
+            startX + safeWidth * randomBetween(-0.025f, 0.025f)
+        ).toInt().coerceIn(safeLeft, safeRight)
+        val startY = (safeTop + safeHeight * randomBetween(0.68f, 0.82f)).toInt()
+        val endY = (safeTop + safeHeight * randomBetween(0.22f, 0.38f)).toInt()
+
+        val startXf = startX.toFloat()
+        val startYf = startY.toFloat()
+        val endXf = endX.toFloat()
+        val endYf = endY.toFloat()
+        val curveLimit = (bounds.width() * profile.curveOffsetRatio)
+            .coerceAtMost(bounds.width() * MAX_CURVE_OFFSET_RATIO)
+        val control1X = (startXf + randomBetween(-curveLimit, curveLimit))
+            .coerceIn(safeLeft.toFloat(), safeRight.toFloat())
+        val control2X = (endXf + randomBetween(-curveLimit, curveLimit))
+            .coerceIn(safeLeft.toFloat(), safeRight.toFloat())
+        val verticalDistance = endYf - startYf
+        val control1Y = startYf + verticalDistance / 3f
+        val control2Y = startYf + verticalDistance * 2f / 3f
+
         val path = Path()
-        val centerX = bounds.centerX().toFloat()
-        val startY = bounds.top + bounds.height() * SCROLL_START_FRACTION
-        val endY = bounds.top + bounds.height() * SCROLL_END_FRACTION
-        val curveOffset = bounds.width() * profile.curveOffsetRatio
-        val steps = GESTURE_PATH_STEPS
+        val useMicroPerturbation = ENABLE_SCROLL_MICRO_PERTURBATION
+        val steps = if (useMicroPerturbation) {
+            MICRO_PERTURBATION_PATH_STEPS
+        } else {
+            GESTURE_PATH_STEPS
+        }
 
         for (step in 0..steps) {
             val t = step.toFloat() / steps.toFloat()
-            val eased = if (t < 0.5f) {
-                0.5f * (2f * t).pow(profile.accelerationExponent)
-            } else {
-                1f - 0.5f * (2f * (1f - t)).pow(profile.accelerationExponent)
+            // 2.1: cosine ease-in-out controls progress along the Bezier curve.
+            val progress = (0.5 - 0.5 * cos(PI * t.toDouble())).toFloat()
+            val inverse = 1f - progress
+            val inverseSquared = inverse * inverse
+            val progressSquared = progress * progress
+
+            val x = inverseSquared * inverse * startXf +
+                3f * inverseSquared * progress * control1X +
+                3f * inverse * progressSquared * control2X +
+                progressSquared * progress * endXf
+            val y = inverseSquared * inverse * startYf +
+                3f * inverseSquared * progress * control1Y +
+                3f * inverse * progressSquared * control2Y +
+                progressSquared * progress * endYf
+
+            var pathX = x
+            var pathY = y
+            if (useMicroPerturbation && step > 0 && step < steps) {
+                // 5.1: optional 10 Hz, 1.2 px perturbation along the local curve normal.
+                val tangentX = 3f * inverseSquared * (control1X - startXf) +
+                    6f * inverse * progress * (control2X - control1X) +
+                    3f * progressSquared * (endXf - control2X)
+                val tangentY = 3f * inverseSquared * (control1Y - startYf) +
+                    6f * inverse * progress * (control2Y - control1Y) +
+                    3f * progressSquared * (endYf - control2Y)
+                val tangentLength = hypot(tangentX.toDouble(), tangentY.toDouble())
+                    .toFloat().coerceAtLeast(1f)
+                val elapsedSeconds = t * profile.durationMs / 1_000f
+                val wave = sin(
+                    2.0 * PI * MICRO_PERTURBATION_FREQUENCY_HZ * elapsedSeconds.toDouble()
+                ).toFloat() * MICRO_PERTURBATION_AMPLITUDE_PX
+                pathX += (-tangentY / tangentLength) * wave
+                pathY += (tangentX / tangentLength) * wave
             }
-            val x = centerX + sin(PI * t.toDouble()).toFloat() * curveOffset
-            val y = startY + (endY - startY) * eased
-            if (step == 0) path.moveTo(x, y) else path.lineTo(x, y)
+
+            if (step == 0) path.moveTo(pathX, pathY) else path.lineTo(pathX, pathY)
         }
-        return path
+        return ScrollGesturePlan(path, startX, startY, endX, endY)
     }
 
     private fun openVisibleFeedCard() {
@@ -1863,7 +1935,6 @@ class FreedomAccessibilityService : AccessibilityService() {
         private const val ACCOUNT_BROWSE_KEY = "keep_account_mode_enabled"
         private const val KEY_BROWSE_GESTURE_DURATION_MS = "account_browse_gesture_duration_ms"
         private const val KEY_BROWSE_GESTURE_CURVE_OFFSET = "account_browse_gesture_curve_offset"
-        private const val KEY_BROWSE_GESTURE_ACCELERATION = "account_browse_gesture_acceleration"
         private const val MOMO_PACKAGE = "com.immomo.momo"
         private const val MOMO_DYNAMIC_TAB_LABEL = "动态"
         private const val MOMO_NEARBY_TAB_LABEL = "附近"
@@ -1908,14 +1979,13 @@ class FreedomAccessibilityService : AccessibilityService() {
         private const val MAX_GESTURE_DURATION_MS = 1_200L
         private const val DEFAULT_CURVE_OFFSET_RATIO = 0.012f
         private const val MAX_CURVE_OFFSET_RATIO = 0.04f
-        private const val DEFAULT_GESTURE_ACCELERATION = 1.8f
-        private const val MIN_GESTURE_ACCELERATION = 1.0f
-        private const val MAX_GESTURE_ACCELERATION = 3.0f
         private const val MIN_GESTURE_WIDTH_PX = 220
         private const val MIN_GESTURE_HEIGHT_PX = 300
-        private const val SCROLL_START_FRACTION = 0.78f
-        private const val SCROLL_END_FRACTION = 0.32f
         private const val GESTURE_PATH_STEPS = 32
+        private const val ENABLE_SCROLL_MICRO_PERTURBATION = false
+        private const val MICRO_PERTURBATION_FREQUENCY_HZ = 10f
+        private const val MICRO_PERTURBATION_AMPLITUDE_PX = 1.2f
+        private const val MICRO_PERTURBATION_PATH_STEPS = 100
         private const val MIN_FEED_CARD_WIDTH_RATIO = 0.75f
         private const val MIN_FEED_CARD_HEIGHT_RATIO = 0.18f
 
