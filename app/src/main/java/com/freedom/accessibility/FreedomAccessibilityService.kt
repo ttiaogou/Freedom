@@ -58,7 +58,9 @@ class FreedomAccessibilityService : AccessibilityService() {
     private var scanQueued = false
     private var targetReceiverRegistered = false
 
-    private var accountBrowsePhase = AccountBrowsePhase.IDLE
+    private var accountBrowsePhase: AccountBrowsePhase
+        get() = accountBrowseController.phase
+        set(value) = accountBrowseController.transitionTo(value)
     private var accountBrowsePauseReason = ""
     private var accountBrowseLastDynamicTabWaitReason = ""
     private var accountBrowseDeadlineAt = 0L
@@ -113,9 +115,35 @@ class FreedomAccessibilityService : AccessibilityService() {
     private var accountBrowsePopupActionAttempts = 0
     private var accountBrowsePopupExhaustedLogged = false
 
+    // Owns the automatic-browse phase and dispatches each phase to the existing
+    // service implementation. Android-specific operations and session evidence remain here.
+    private val accountBrowseController by lazy(LazyThreadSafetyMode.NONE) {
+        AccountBrowseController(
+            isSessionEnabled = {
+                MonitorStore.isRunning(this) && isAccountBrowseModeEnabled()
+            },
+            isTouchActive = { accountBrowseTouchActive },
+            onResetSession = ::resetAccountBrowseSession,
+            actions = AccountBrowseController.Actions(
+                waitForDynamicTab = ::waitForMomoDynamicTab,
+                verifyNavigationAction = ::verifyNavigationAction,
+                waitForFeedStable = ::waitForMomoFeedStable,
+                runFirstSwipeCountdown = ::runFirstSwipeCountdown,
+                performFeedScroll = ::performFeedScroll,
+                verifyInitialSwipe = ::verifyInitialSwipe,
+                openVisibleFeedCard = ::openVisibleFeedCard,
+                checkDetailPageLoaded = ::checkDetailPageLoaded,
+                returnFromDetailPage = ::returnFromDetailPage,
+                waitForImageBrowserReturn = ::waitForImageBrowserReturn,
+                waitForDetailRestabilize = ::waitForDetailRestabilize,
+                checkFeedListReturned = ::checkFeedListReturned
+            )
+        )
+    }
+
     // The extracted scheduler preserves the former Handler Runnable contract:
     // one pending step at a time, no replacement, and no second eligibility check
-    // between enqueue and callback dispatch. performAccountBrowseStep remains authoritative.
+    // between enqueue and callback dispatch. AccountBrowseController dispatches each phase.
     private val accountBrowseScheduler by lazy(LazyThreadSafetyMode.NONE) {
         AccountBrowseScheduler(
             handler = mainHandler,
@@ -733,29 +761,7 @@ class FreedomAccessibilityService : AccessibilityService() {
     }
 
     private fun performAccountBrowseStep() {
-        if (!MonitorStore.isRunning(this) || !isAccountBrowseModeEnabled()) {
-            resetAccountBrowseSession()
-            return
-        }
-        if (accountBrowseTouchActive || accountBrowsePhase == AccountBrowsePhase.PAUSED) return
-
-        when (accountBrowsePhase) {
-            AccountBrowsePhase.IDLE,
-            AccountBrowsePhase.PAUSED -> return
-            AccountBrowsePhase.WAIT_FOR_DYNAMIC_TAB -> waitForMomoDynamicTab()
-            AccountBrowsePhase.VERIFY_NAVIGATION_ACTION -> verifyNavigationAction()
-            AccountBrowsePhase.WAIT_FOR_FEED_STABLE -> waitForMomoFeedStable()
-            AccountBrowsePhase.FIRST_SWIPE_COUNTDOWN -> runFirstSwipeCountdown()
-            AccountBrowsePhase.WAIT_FOR_LIST_SCROLL -> performFeedScroll()
-            AccountBrowsePhase.WAIT_FOR_SCROLL_SETTLE -> verifyInitialSwipe()
-            AccountBrowsePhase.WAIT_FOR_CARD_OPEN,
-            AccountBrowsePhase.WAIT_FOR_SAFE_CARD -> openVisibleFeedCard()
-            AccountBrowsePhase.WAIT_FOR_DETAIL_LOAD -> checkDetailPageLoaded()
-            AccountBrowsePhase.DETAIL_DWELL -> returnFromDetailPage()
-            AccountBrowsePhase.WAIT_FOR_IMAGE_BROWSER_RETURN -> waitForImageBrowserReturn()
-            AccountBrowsePhase.WAIT_FOR_DETAIL_RESTABILIZE -> waitForDetailRestabilize()
-            AccountBrowsePhase.WAIT_FOR_LIST_RETURN -> checkFeedListReturned()
-        }
+        accountBrowseController.performStep()
     }
 
     /**

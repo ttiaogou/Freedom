@@ -89,3 +89,13 @@
 - 保留节点扫描上限、标签中心偏差、可点击祖先宽高约束/深度、异常处理与节点回收语义。
 - 未修改导航重试次数、超时/轮询/延迟参数、Activity/包名标识、页面验证条件或自动浏览状态机。
 - 已完成静态引用与差异核对；完整 Android Gradle 编译及真机验证仍需 GitHub Actions / 设备确认。
+
+
+## Stage 7 — AccountBrowseController 初步拆分（2026-11-07）
+
+- 新增 `app/src/main/java/com/freedom/accessibility/browse/AccountBrowseController.kt`。
+- 将当前 `AccountBrowsePhase` 所有权迁入 controller；Service 中原 `accountBrowsePhase` 变量改为同名 getter/setter 代理，因此原有阶段读取和赋值点不需要改写。
+- 将 `performAccountBrowseStep()` 的运行/模式门控与阶段分派搬入 controller；Service 保留薄代理，原 Handler 调度入口、回调顺序和每个阶段处理方法不变。
+- Controller 的 `Actions` 仅回调到 Service 既有的阶段处理函数。页面检查、弹窗、安全关闭、导航验证与重试、手势派发、暂停/恢复副作用、各类截止时间和会话证据继续由 Service 或既有专职组件管理。
+- 保留原门控次序及全部 13 个阶段分支，不更改阶段枚举、阶段转换赋值、延迟、重试次数、扫描阈值或手势参数。
+- 本次不新增功能、依赖、权限、广播或持久化键。完整 Android 构建与真机验证仍需通过 GitHub Actions。

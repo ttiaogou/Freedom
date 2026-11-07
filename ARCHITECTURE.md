@@ -91,3 +91,14 @@
 - Preserved scan limit, target-center tolerance, maximum clickable-ancestor width/height, ancestor depth, action exception handling, and node ownership/recycling.
 - No navigation retries, timing values, labels, package/activity identifiers, page verification rules, or automation state-machine behavior were intentionally changed.
 - Full Android `assembleDebug` and device validation remain required through GitHub Actions.
+
+
+## Stage 7 — 自动浏览阶段协调器初步拆分
+
+- 新增 `accessibility/browse/AccountBrowseController.kt`。
+- 将自动浏览当前阶段的存储迁入 controller；`FreedomAccessibilityService.accountBrowsePhase` 保留同名读写代理，现有业务判断与阶段赋值位置不变。
+- 将原 `performAccountBrowseStep()` 的运行条件门控和 `when (phase)` 分派迁入 controller。Service 仍保留原方法作为兼容入口，调度器的回调关系不变。
+- 阶段动作通过显式 `Actions` 回调回到 Service；节点访问、无障碍事件处理、页面识别、弹窗关闭、导航重试、手势派发、计时器及日志仍由 Service/既有组件负责。
+- 保留执行门控顺序：监控或自动浏览模式关闭时先重置；触摸期间或已暂停时不执行；随后按当前阶段分派。
+- 本阶段只建立控制器对当前阶段和阶段分派的所有权，不迁移会话其余字段，也不重写阶段转换、暂停恢复和任何阶段动作。
+- 不新增权限、广播、持久化键、第三方依赖或用户功能。完整 Android `assembleDebug` 和真机行为仍需 GitHub Actions / 设备验证。
