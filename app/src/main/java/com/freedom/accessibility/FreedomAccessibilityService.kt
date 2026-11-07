@@ -58,6 +58,27 @@ class FreedomAccessibilityService : AccessibilityService() {
         val nodeCount: Int
     )
 
+    private data class FeedReadinessInspection(
+        val fingerprint: PageFingerprint?,
+        val reason: String
+    )
+
+    private data class TabLabelEvidence(
+        val label: String,
+        val bounds: Rect,
+        val selected: Boolean
+    )
+
+    private data class DynamicTabRowEvidence(
+        val contentTop: Int,
+        val diagnostic: String
+    )
+
+    private data class DynamicTabInspection(
+        val evidence: DynamicTabRowEvidence?,
+        val reason: String
+    )
+
     private data class ScrollGestureProfile(
         val durationMs: Long,
         val curveOffsetRatio: Float,
@@ -388,7 +409,7 @@ class FreedomAccessibilityService : AccessibilityService() {
         }
     }
 
-    /** Wait until the actual Dynamic tab and its scrollable feed are visible and stable. */
+    /** Wait until Home > top-level Dynamic tab and its visible feed list are ready and stable. */
     private fun waitForMomoFeedStable() {
         val root = runCatching { rootInActiveWindow }.getOrNull()
         if (root == null) {
@@ -405,23 +426,24 @@ class FreedomAccessibilityService : AccessibilityService() {
             return
         }
 
-        val fingerprint = try {
+        val inspection = try {
             inspectMomoFeedReadiness(root)
         } finally {
             runCatching { root.recycle() }
         }
+        val fingerprint = inspection.fingerprint
 
         if (fingerprint == null) {
             accountBrowseLastStableFingerprint = ""
             accountBrowseStableSamples = 0
-            addLog("动态列表尚不具备操作条件：动态页标识、可见列表容器、有效尺寸或可见项目未通过")
+            addLog("动态列表尚不具备操作条件：${inspection.reason}")
         } else if (fingerprint.signature == accountBrowseLastStableFingerprint) {
             accountBrowseStableSamples++
-            addLog("动态列表采样：可见项目=${fingerprint.nodeCount}，稳定计数=${accountBrowseStableSamples}/$REQUIRED_STABLE_FEED_SAMPLES")
+            addLog("动态列表采样：可见项目=${fingerprint.nodeCount}，稳定计数=${accountBrowseStableSamples}/$REQUIRED_STABLE_FEED_SAMPLES；${inspection.reason}")
         } else {
             accountBrowseLastStableFingerprint = fingerprint.signature
             accountBrowseStableSamples = 1
-            addLog("动态列表布局基准已建立：可见项目=${fingerprint.nodeCount}，稳定计数=1/$REQUIRED_STABLE_FEED_SAMPLES")
+            addLog("动态列表布局基准已建立：可见项目=${fingerprint.nodeCount}，稳定计数=1/$REQUIRED_STABLE_FEED_SAMPLES；${inspection.reason}")
         }
 
         if (accountBrowseStableSamples >= REQUIRED_STABLE_FEED_SAMPLES) {
@@ -965,30 +987,48 @@ class FreedomAccessibilityService : AccessibilityService() {
     }
 
     private fun isMomoDynamicFeedPage(root: AccessibilityNodeInfo): Boolean =
-        inspectMomoFeedReadiness(root) != null
+        inspectMomoFeedReadiness(root).fingerprint != null
 
     /**
-     * Initial readiness is intentionally less strict than normal scroll-container lookup:
-     * the list may be laid out and touchable before Android exposes it as scrollable, and
-     * network-driven text/image updates must not keep resetting the stability timer.
-     * The fingerprint therefore describes only the list container's geometry and a coarse
-     * visible-child count, not the entire page or card text/content.
+     * Momo's target feed is the top-level Home page's inner "动态" tab.
+     * The bottom navigation's "首页" is a different navigation level and must not
+     * be used as the feed-tab marker. We identify the top tab row by its visible
+     * labels (动态 / 附近 / AI小陌), then validate a visible list below that row.
      */
-    private fun inspectMomoFeedReadiness(root: AccessibilityNodeInfo): PageFingerprint? {
+    private fun inspectMomoFeedReadiness(root: AccessibilityNodeInfo): FeedReadinessInspection {
         val packageName = runCatching { root.packageName?.toString().orEmpty() }.getOrDefault("")
-        if (packageName != MOMO_PACKAGE || !hasVisibleMomoDynamicTab(root)) return null
+        if (packageName != MOMO_PACKAGE) {
+            return FeedReadinessInspection(null, "当前窗口不是陌陌：$packageName")
+        }
 
-        val listNode = findVisibleFeedContainer(root) ?: return null
+        val tabInspection = inspectDynamicTabRow(root)
+        val tabEvidence = tabInspection.evidence
+            ?: return FeedReadinessInspection(null, tabInspection.reason)
+
+        val listNode = findVisibleFeedContainer(root, tabEvidence.contentTop)
+            ?: return FeedReadinessInspection(null, "已确认首页顶部动态标签行，但下方没有找到足够大的可见列表容器")
+
         return try {
             val bounds = Rect()
             listNode.getBoundsInScreen(bounds)
             val metrics = resources.displayMetrics
             val minWidth = (metrics.widthPixels * MIN_LIST_WIDTH_RATIO).toInt()
+            val visibleContentTop = maxOf(bounds.top, tabEvidence.contentTop)
+            val visibleContentHeight = bounds.bottom - visibleContentTop
             val minHeight = (metrics.heightPixels * MIN_LIST_HEIGHT_RATIO).toInt()
-            if (!listNode.isVisibleToUser || bounds.width() < minWidth || bounds.height() < minHeight) {
-                return null
+
+            if (!listNode.isVisibleToUser) {
+                return FeedReadinessInspection(null, "列表容器存在，但当前不可见")
+            }
+            if (bounds.width() < minWidth || visibleContentHeight < minHeight) {
+                return FeedReadinessInspection(
+                    null,
+                    "列表有效区域尺寸不足：宽=${bounds.width()}，有效高=$visibleContentHeight"
+                )
             }
 
+            val contentBounds = Rect(bounds)
+            contentBounds.top = visibleContentTop
             var visibleChildren = 0
             val childCount = runCatching { listNode.childCount }.getOrDefault(0)
             for (index in 0 until childCount) {
@@ -997,7 +1037,7 @@ class FreedomAccessibilityService : AccessibilityService() {
                     val childBounds = Rect()
                     child.getBoundsInScreen(childBounds)
                     if (child.isVisibleToUser && childBounds.width() > 0 && childBounds.height() > 0 &&
-                        Rect.intersects(bounds, childBounds)
+                        Rect.intersects(contentBounds, childBounds)
                     ) {
                         visibleChildren++
                     }
@@ -1005,15 +1045,17 @@ class FreedomAccessibilityService : AccessibilityService() {
                     runCatching { child.recycle() }
                 }
             }
-            if (visibleChildren == 0) return null
+            if (visibleChildren == 0) {
+                return FeedReadinessInspection(null, "列表容器和尺寸有效，但当前没有可见列表项目")
+            }
 
             val className = listNode.className?.toString().orEmpty().substringAfterLast('.')
             val signature = listOf(
                 className,
                 bounds.left / FINGERPRINT_SIZE_BUCKET_PX,
-                bounds.top / FINGERPRINT_SIZE_BUCKET_PX,
+                visibleContentTop / FINGERPRINT_SIZE_BUCKET_PX,
                 bounds.width() / FINGERPRINT_SIZE_BUCKET_PX,
-                bounds.height() / FINGERPRINT_SIZE_BUCKET_PX,
+                visibleContentHeight / FINGERPRINT_SIZE_BUCKET_PX,
                 when {
                     visibleChildren <= 1 -> 1
                     visibleChildren <= 3 -> 2
@@ -1021,22 +1063,138 @@ class FreedomAccessibilityService : AccessibilityService() {
                     else -> 4
                 }
             ).joinToString(":")
-            PageFingerprint(signature = signature, nodeCount = visibleChildren)
+            FeedReadinessInspection(
+                PageFingerprint(signature = signature, nodeCount = visibleChildren),
+                "${tabEvidence.diagnostic}；列表=$className，当前可见项目=$visibleChildren"
+            )
         } finally {
             runCatching { listNode.recycle() }
         }
     }
 
-    /** Finds a visible list-like container even before its scrollable flag is exposed. */
-    private fun findVisibleFeedContainer(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+    /**
+     * Locate the upper horizontal tab row. Resource IDs are deliberately not required:
+     * Momo versions may expose different IDs or omit IDs from accessibility nodes.
+     * If selected state is exposed and another tab is selected, the Dynamic tab is rejected.
+     * If no selection semantics are exposed, the exact three-label row is used as a
+     * structural fallback and the fallback is written to the diagnostic log.
+     */
+    private fun inspectDynamicTabRow(root: AccessibilityNodeInfo): DynamicTabInspection {
+        val metrics = resources.displayMetrics
+        val upperBandBottom = (metrics.heightPixels * DYNAMIC_TAB_UPPER_BAND_RATIO).toInt()
+        val rowTolerance = maxOf(dp(DYNAMIC_TAB_ROW_TOLERANCE_DP), (metrics.heightPixels * 0.04f).toInt())
+        val labels = ArrayList<TabLabelEvidence>()
+        val queue = ArrayDeque<Pair<AccessibilityNodeInfo, Boolean>>()
+        queue.add(AccessibilityNodeInfo.obtain(root) to false)
+        var visited = 0
+
+        try {
+            while (queue.isNotEmpty() && visited < PAGE_FINGERPRINT_MAX_NODES) {
+                val (node, selectedInPath) = queue.removeFirst()
+                visited++
+                try {
+                    val selected = selectedInPath || node.isSelected || node.isChecked
+                    val bounds = Rect()
+                    runCatching { node.getBoundsInScreen(bounds) }
+                    val text = runCatching { node.text?.toString()?.trim().orEmpty() }.getOrDefault("")
+                    val description = runCatching { node.contentDescription?.toString()?.trim().orEmpty() }
+                        .getOrDefault("")
+                    val label = when {
+                        text in DYNAMIC_TAB_LABELS -> text
+                        description in DYNAMIC_TAB_LABELS -> description
+                        else -> ""
+                    }
+                    if (label.isNotEmpty() && node.isVisibleToUser && bounds.width() > 0 &&
+                        bounds.height() > 0 && bounds.top >= 0 && bounds.centerY() <= upperBandBottom
+                    ) {
+                        labels.add(TabLabelEvidence(label, Rect(bounds), selected))
+                    }
+
+                    val childCount = runCatching { node.childCount }.getOrDefault(0)
+                    for (index in 0 until childCount) {
+                        if (visited + queue.size >= PAGE_FINGERPRINT_MAX_NODES) break
+                        val child = runCatching { node.getChild(index) }.getOrNull() ?: continue
+                        queue.add(child to selected)
+                    }
+                } finally {
+                    runCatching { node.recycle() }
+                }
+            }
+        } finally {
+            while (queue.isNotEmpty()) runCatching { queue.removeFirst().first.recycle() }
+        }
+
+        val dynamicLabels = labels.filter { it.label == MOMO_DYNAMIC_TAB_LABEL }
+        val nearbyLabels = labels.filter { it.label == MOMO_NEARBY_TAB_LABEL }
+        val aiLabels = labels.filter { it.label == MOMO_AI_TAB_LABEL }
+        if (dynamicLabels.isEmpty()) {
+            return DynamicTabInspection(null, "屏幕顶部区域没有识别到‘动态’标签")
+        }
+
+        var bestRow: List<TabLabelEvidence>? = null
+        var bestScore = -1
+        for (dynamic in dynamicLabels) {
+            val sameRowNearby = nearbyLabels.filter {
+                kotlin.math.abs(it.bounds.centerY() - dynamic.bounds.centerY()) <= rowTolerance &&
+                    it.bounds.centerX() > dynamic.bounds.centerX()
+            }.minByOrNull { kotlin.math.abs(it.bounds.centerY() - dynamic.bounds.centerY()) }
+            val sameRowAi = aiLabels.filter {
+                kotlin.math.abs(it.bounds.centerY() - dynamic.bounds.centerY()) <= rowTolerance &&
+                    it.bounds.centerX() > dynamic.bounds.centerX()
+            }.minByOrNull { kotlin.math.abs(it.bounds.centerY() - dynamic.bounds.centerY()) }
+
+            // The photo shows these three labels in one horizontal row. Requiring at least
+            // one neighbor avoids matching unrelated "动态" text elsewhere in the page.
+            if (sameRowNearby != null || sameRowAi != null) {
+                val row = listOfNotNull(dynamic, sameRowNearby, sameRowAi)
+                val score = (if (sameRowNearby != null) 1 else 0) + (if (sameRowAi != null) 1 else 0)
+                if (score > bestScore) {
+                    bestRow = row
+                    bestScore = score
+                }
+            }
+        }
+
+        val row = bestRow ?: return DynamicTabInspection(
+            null,
+            "识别到顶部‘动态’，但未找到同一行的‘附近’或‘AI小陌’标签，无法确认是首页顶部导航"
+        )
+        val dynamic = row.first { it.label == MOMO_DYNAMIC_TAB_LABEL }
+        val selectedLabels = row.filter { it.selected }.map { it.label }.distinct()
+        if (selectedLabels.size == 1 && selectedLabels.single() != MOMO_DYNAMIC_TAB_LABEL) {
+            return DynamicTabInspection(
+                null,
+                "顶部导航选中项不是‘动态’：${selectedLabels.single()}"
+            )
+        }
+
+        val rowBottom = row.maxOf { it.bounds.bottom }
+        val contentTop = rowBottom + dp(DYNAMIC_TAB_CONTENT_GAP_DP)
+        val selectionDescription = when {
+            selectedLabels.size == 1 && selectedLabels.single() == MOMO_DYNAMIC_TAB_LABEL ->
+                "顶部‘动态’标签已选中"
+            selectedLabels.size > 1 ->
+                "Tab选中状态存在祖先节点歧义，按顶部标签行结构确认"
+            else ->
+                "无障碍节点未暴露Tab选中状态，按‘动态/附近/AI小陌’同排结构确认"
+        }
+        val neighborDescription = if (bestScore == 2) "附近与AI小陌同排" else "附近或AI小陌同排"
+        return DynamicTabInspection(
+            DynamicTabRowEvidence(contentTop, "$selectionDescription，$neighborDescription"),
+            ""
+        )
+    }
+
+    /** Finds a visible list-like container below the confirmed top Dynamic-tab row. */
+    private fun findVisibleFeedContainer(
+        root: AccessibilityNodeInfo,
+        contentTop: Int
+    ): AccessibilityNodeInfo? {
         val queue = ArrayDeque<AccessibilityNodeInfo>()
         queue.add(AccessibilityNodeInfo.obtain(root))
         val metrics = resources.displayMetrics
         val minWidth = (metrics.widthPixels * MIN_LIST_WIDTH_RATIO).toInt()
         val minHeight = (metrics.heightPixels * MIN_LIST_HEIGHT_RATIO).toInt()
-        val minComposerWidth = (metrics.widthPixels * MIN_COMPOSER_WIDTH_RATIO).toInt()
-        val screenHeight = metrics.heightPixels
-        var hasBottomTextEntry = false
         var bestNode: AccessibilityNodeInfo? = null
         var bestArea = 0L
         var visited = 0
@@ -1047,22 +1205,17 @@ class FreedomAccessibilityService : AccessibilityService() {
                 try {
                     val bounds = Rect()
                     runCatching { node.getBoundsInScreen(bounds) }
-                    if (node.isVisibleToUser && node.isEditable &&
-                        bounds.bottom >= (screenHeight * COMPOSER_BOTTOM_RATIO).toInt() &&
-                        bounds.width() >= minComposerWidth
-                    ) {
-                        hasBottomTextEntry = true
-                    }
-
+                    val visibleTop = maxOf(bounds.top, contentTop)
+                    val visibleHeight = bounds.bottom - visibleTop
                     val className = node.className?.toString().orEmpty()
                     val isListLike = className.endsWith("RecyclerView") ||
                         className.endsWith("ListView") || className.endsWith("AbsListView") ||
                         className.endsWith("ScrollView") || className.endsWith("NestedScrollView") ||
                         className.endsWith("WebView")
                     if (node.isVisibleToUser && isListLike && bounds.width() >= minWidth &&
-                        bounds.height() >= minHeight
+                        visibleHeight >= minHeight
                     ) {
-                        val area = bounds.width().toLong() * bounds.height().toLong()
+                        val area = bounds.width().toLong() * visibleHeight.toLong()
                         if (area > bestArea) {
                             runCatching { bestNode?.recycle() }
                             bestNode = AccessibilityNodeInfo.obtain(node)
@@ -1083,47 +1236,7 @@ class FreedomAccessibilityService : AccessibilityService() {
         } finally {
             while (queue.isNotEmpty()) runCatching { queue.removeFirst().recycle() }
         }
-        if (hasBottomTextEntry) {
-            runCatching { bestNode?.recycle() }
-            return null
-        }
         return bestNode
-    }
-
-    private fun hasVisibleMomoDynamicTab(root: AccessibilityNodeInfo): Boolean {
-        // Some tab widgets mark the container selected rather than the TextView itself.
-        // Carry selected state down the tree so the same visible tab is still recognized.
-        val queue = ArrayDeque<Pair<AccessibilityNodeInfo, Boolean>>()
-        queue.add(AccessibilityNodeInfo.obtain(root) to false)
-        var visited = 0
-        try {
-            while (queue.isNotEmpty() && visited < PAGE_FINGERPRINT_MAX_NODES) {
-                val (node, selectedInPath) = queue.removeFirst()
-                visited++
-                try {
-                    val selected = selectedInPath || node.isSelected || node.isChecked
-                    val id = runCatching { node.viewIdResourceName.orEmpty() }.getOrDefault("")
-                    val text = runCatching { node.text?.toString()?.trim().orEmpty() }.getOrDefault("")
-                    if (node.isVisibleToUser && selected &&
-                        text == MOMO_DYNAMIC_TAB_LABEL && id.endsWith(MOMO_TAB_TITLE_ID_SUFFIX)
-                    ) return true
-
-                    val childCount = runCatching { node.childCount }.getOrDefault(0)
-                    for (index in 0 until childCount) {
-                        if (visited + queue.size >= PAGE_FINGERPRINT_MAX_NODES) break
-                        val child = runCatching { node.getChild(index) }.getOrNull() ?: continue
-                        queue.add(child to selected)
-                    }
-                } finally {
-                    runCatching { node.recycle() }
-                }
-            }
-        } finally {
-            while (queue.isNotEmpty()) {
-                runCatching { queue.removeFirst().first.recycle() }
-            }
-        }
-        return false
     }
 
     private fun pageFingerprint(root: AccessibilityNodeInfo): PageFingerprint {
@@ -1595,7 +1708,16 @@ class FreedomAccessibilityService : AccessibilityService() {
         private const val KEY_BROWSE_GESTURE_ACCELERATION = "account_browse_gesture_acceleration"
         private const val MOMO_PACKAGE = "com.immomo.momo"
         private const val MOMO_DYNAMIC_TAB_LABEL = "动态"
-        private const val MOMO_TAB_TITLE_ID_SUFFIX = "/id/tab_title"
+        private const val MOMO_NEARBY_TAB_LABEL = "附近"
+        private const val MOMO_AI_TAB_LABEL = "AI小陌"
+        private val DYNAMIC_TAB_LABELS = setOf(
+            MOMO_DYNAMIC_TAB_LABEL,
+            MOMO_NEARBY_TAB_LABEL,
+            MOMO_AI_TAB_LABEL
+        )
+        private const val DYNAMIC_TAB_UPPER_BAND_RATIO = 0.28f
+        private const val DYNAMIC_TAB_ROW_TOLERANCE_DP = 48
+        private const val DYNAMIC_TAB_CONTENT_GAP_DP = 8
 
         private const val MIN_BROWSE_DELAY_MS = 3_000L
         private const val MAX_BROWSE_DELAY_MS = 15_000L
