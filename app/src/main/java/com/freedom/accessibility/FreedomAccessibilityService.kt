@@ -36,6 +36,7 @@ import com.freedom.accessibility.browse.DynamicTabRowEvidence
 import com.freedom.accessibility.browse.FeedGestureTarget
 import com.freedom.accessibility.browse.FeedPositionMatcher
 import com.freedom.accessibility.browse.FeedReturnStability
+import com.freedom.accessibility.browse.FeedReturnVerificationPolicy
 import com.freedom.accessibility.browse.FeedReadinessInspection
 import com.freedom.accessibility.browse.HomeBottomNavEvidence
 import com.freedom.accessibility.browse.ManualResumeContext
@@ -2425,7 +2426,14 @@ class FreedomAccessibilityService : AccessibilityService() {
         if (root == null) {
             accountBrowseReturnedStableSamples = 0
             accountBrowseLastReturnedSnapshot = ""
-            if (System.currentTimeMillis() >= accountBrowseDeadlineAt) {
+            val decision = FeedReturnVerificationPolicy.decide(
+                rootAvailable = false,
+                isFeedPage = false,
+                positionMatches = false,
+                positionStable = false,
+                deadlineReached = System.currentTimeMillis() >= accountBrowseDeadlineAt
+            )
+            if (decision == FeedReturnVerificationPolicy.Decision.PAUSE_ROOT_UNAVAILABLE) {
                 pauseAccountBrowse("返回后持续无法读取当前页面；为避免误操作，已暂停")
             } else {
                 scheduleAccountBrowseStep(PAGE_STATE_POLL_MS)
@@ -2466,8 +2474,15 @@ class FreedomAccessibilityService : AccessibilityService() {
         accountBrowseLastReturnedSnapshot = stability.lastSnapshot
         accountBrowseReturnedStableSamples = stability.stableSamples
 
-        if (stability.isStable) {
-            if (accountBrowseReturnedStableSamples >= REQUIRED_STABLE_PAGE_SAMPLES) {
+        val decision = FeedReturnVerificationPolicy.decide(
+            rootAvailable = true,
+            isFeedPage = isFeedList,
+            positionMatches = positionMatches,
+            positionStable = stability.isStable,
+            deadlineReached = System.currentTimeMillis() >= accountBrowseDeadlineAt
+        )
+        when (decision) {
+            FeedReturnVerificationPolicy.Decision.RESTORED -> {
                 accountBrowseDetailActivityClass = ""
                 accountBrowseDetailFingerprint = ""
                 accountBrowseProgrammaticActionLabel = ""
@@ -2483,26 +2498,37 @@ class FreedomAccessibilityService : AccessibilityService() {
                 scheduleAccountBrowseStep(delay)
                 return
             }
-        } else if (isFeedList && !positionMatches) {
-            if (!accountBrowseReturnMismatchLogged) {
-                addLog(
-                    "已识别动态列表，但当前可见内容与打开动态前的位置快照不匹配；" +
-                        "暂不继续滑动，等待列表位置恢复并稳定"
-                )
-                accountBrowseReturnMismatchLogged = true
-            }
-        }
 
-        if (System.currentTimeMillis() >= accountBrowseDeadlineAt) {
-            pauseAccountBrowse(
-                if (isFeedList) {
+            FeedReturnVerificationPolicy.Decision.PAUSE_ROOT_UNAVAILABLE -> {
+                // The root-available path above cannot produce this outcome.
+                pauseAccountBrowse("返回后持续无法读取当前页面；为避免误操作，已暂停")
+                return
+            }
+
+            FeedReturnVerificationPolicy.Decision.PAUSE_POSITION_UNCONFIRMED -> {
+                pauseAccountBrowse(
                     "已返回动态列表，但无法确认恢复到打开动态前的位置；为避免跳过内容，已暂停"
-                } else {
-                    "返回后没有重新识别到动态列表；请检查页面并重新启动"
+                )
+                return
+            }
+
+            FeedReturnVerificationPolicy.Decision.PAUSE_NOT_FEED_PAGE -> {
+                pauseAccountBrowse("返回后没有重新识别到动态列表；请检查页面并重新启动")
+                return
+            }
+
+            FeedReturnVerificationPolicy.Decision.WAIT -> {
+                if (isFeedList && !positionMatches) {
+                    if (!accountBrowseReturnMismatchLogged) {
+                        addLog(
+                            "已识别动态列表，但当前可见内容与打开动态前的位置快照不匹配；" +
+                                "暂不继续滑动，等待列表位置恢复并稳定"
+                        )
+                        accountBrowseReturnMismatchLogged = true
+                    }
                 }
-            )
-        } else {
-            scheduleAccountBrowseStep(PAGE_STATE_POLL_MS)
+                scheduleAccountBrowseStep(PAGE_STATE_POLL_MS)
+            }
         }
     }
 
