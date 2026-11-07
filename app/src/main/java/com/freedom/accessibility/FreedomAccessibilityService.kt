@@ -101,6 +101,10 @@ class FreedomAccessibilityService : AccessibilityService() {
     private var accountBrowseTouchActive = false
     private var accountBrowseGestureInFlight = false
     private var accountBrowseScrollEventSeen = false
+    private var accountBrowseScrollEventCount = 0
+    private var accountBrowseLastScrollEventAt = 0L
+    private var accountBrowseSwipeCount = 0
+    private var accountBrowseSwipeTargetCount = 0
     private var accountBrowseInitialSwipeCompleted = false
     private var accountBrowseFallbackScrollAttempted = false
     private var accountBrowseSourceSnapshot = ""
@@ -111,7 +115,7 @@ class FreedomAccessibilityService : AccessibilityService() {
         if (accountBrowseOverlayPassthroughActive) {
             restoreMonitorOverlayTouchPassthrough()
             if (accountBrowsePhase == AccountBrowsePhase.WAIT_FOR_SCROLL_SETTLE) {
-                pauseAccountBrowse("首次滑动回调超时；已恢复实时监控悬浮窗触摸状态")
+                pauseAccountBrowse("滑动回调超时；已恢复实时监控悬浮窗触摸状态")
             }
         }
     }
@@ -251,11 +255,14 @@ class FreedomAccessibilityService : AccessibilityService() {
         if (eventPackage != targetPackage || eventPackage == packageName) return
 
         if (event.eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED &&
-            accountBrowsePhase == AccountBrowsePhase.WAIT_FOR_SCROLL_SETTLE &&
-            !accountBrowseScrollEventSeen
+            accountBrowsePhase == AccountBrowsePhase.WAIT_FOR_SCROLL_SETTLE
         ) {
-            accountBrowseScrollEventSeen = true
-            addLog("首次屏幕滑动期间检测到目标应用列表滚动事件")
+            accountBrowseLastScrollEventAt = System.currentTimeMillis()
+            accountBrowseScrollEventCount++
+            if (!accountBrowseScrollEventSeen) {
+                accountBrowseScrollEventSeen = true
+                addLog("第 ${accountBrowseSwipeCount + 1} 轮滑动期间检测到目标应用列表滚动事件")
+            }
         }
 
         if (!isAccountBrowseModeEnabled()) {
@@ -388,6 +395,10 @@ class FreedomAccessibilityService : AccessibilityService() {
         accountBrowseTouchActive = false
         accountBrowseGestureInFlight = false
         accountBrowseScrollEventSeen = false
+        accountBrowseScrollEventCount = 0
+        accountBrowseLastScrollEventAt = 0L
+        accountBrowseSwipeCount = 0
+        accountBrowseSwipeTargetCount = 0
         accountBrowseInitialSwipeCompleted = false
         accountBrowseFallbackScrollAttempted = false
         accountBrowseCountdownRemaining = 0
@@ -467,9 +478,17 @@ class FreedomAccessibilityService : AccessibilityService() {
         }
 
         if (accountBrowseStableSamples >= REQUIRED_STABLE_FEED_SAMPLES) {
+            accountBrowseSwipeCount = 0
+            accountBrowseSwipeTargetCount = Random.nextInt(
+                MIN_SWIPES_PER_SESSION,
+                MAX_SWIPES_PER_SESSION + 1
+            )
             accountBrowsePhase = AccountBrowsePhase.FIRST_SWIPE_COUNTDOWN
             accountBrowseCountdownRemaining = FIRST_SWIPE_COUNTDOWN_SECONDS
-            addLog("已连续确认陌陌动态列表稳定 ${REQUIRED_STABLE_FEED_SAMPLES} 次；现在开始首次滑动倒计时")
+            addLog(
+                "已连续确认陌陌动态列表稳定 ${REQUIRED_STABLE_FEED_SAMPLES} 次；" +
+                    "本轮随机安排 $accountBrowseSwipeTargetCount 轮真实滑动，现在开始首次滑动倒计时"
+            )
             if (!showFirstSwipeCountdown(accountBrowseCountdownRemaining)) {
                 pauseAccountBrowse("无法显示首次滑动倒计时提示；为避免无提示操作，已暂停")
                 return
@@ -686,10 +705,10 @@ class FreedomAccessibilityService : AccessibilityService() {
         } finally {
             runCatching { root.recycle() }
         } ?: run {
-            pauseAccountBrowse("无法定位首页动态列表的有效滑动区域；未发送首次滑动")
+            pauseAccountBrowse("无法定位首页动态列表的有效滑动区域；本轮未发送滑动")
             return
         }
-        addLog("首次滑动前可见节点快照：${accountBrowseSourceSnapshot.ifBlank { "未提取到可见文字节点" }}")
+        addLog("第 ${accountBrowseSwipeCount + 1}/${accountBrowseSwipeTargetCount} 轮滑动前可见节点快照：${accountBrowseSourceSnapshot.ifBlank { "未提取到可见文字节点" }}")
 
         val bounds = target.bounds
         val profile = loadScrollGestureProfile()
@@ -699,12 +718,14 @@ class FreedomAccessibilityService : AccessibilityService() {
             .build()
 
         if (!enableMonitorOverlayTouchPassthrough()) {
-            pauseAccountBrowse("实时监控悬浮窗无法切换为触摸穿透；首次滑动未执行")
+            pauseAccountBrowse("实时监控悬浮窗无法切换为触摸穿透；本轮滑动未执行")
             return
         }
 
         accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_SCROLL_SETTLE
         accountBrowseScrollEventSeen = false
+        accountBrowseScrollEventCount = 0
+        accountBrowseLastScrollEventAt = 0L
         accountBrowseFallbackScrollAttempted = false
         accountBrowseGestureInFlight = false
         val startX = bounds.centerX()
@@ -712,7 +733,7 @@ class FreedomAccessibilityService : AccessibilityService() {
         val endX = bounds.centerX()
         val endY = (bounds.top + bounds.height() * SCROLL_END_FRACTION).toInt()
         addLog(
-            "首次列表区域坐标滑动准备：容器=${target.className}，边界=$bounds，" +
+            "第 ${accountBrowseSwipeCount + 1}/${accountBrowseSwipeTargetCount} 轮列表区域坐标滑动准备：容器=${target.className}，边界=$bounds，" +
                 "起点 ($startX,$startY)，终点 ($endX,$endY)，" +
                 "持续 ${profile.durationMs} 毫秒"
         )
@@ -734,14 +755,14 @@ class FreedomAccessibilityService : AccessibilityService() {
                         if (accountBrowsePhase != AccountBrowsePhase.WAIT_FOR_SCROLL_SETTLE ||
                             !MonitorStore.isRunning(this@FreedomAccessibilityService)
                         ) return
-                        addLog("Android 已完成首次屏幕滑动手势；正在检查滚动事件")
+                        addLog("Android 已完成第 ${accountBrowseSwipeCount + 1} 轮屏幕滑动手势；正在检查真实列表滚动")
                         scheduleAccountBrowseStep(SCROLL_SETTLE_MS)
                     }
 
                     override fun onCancelled(gestureDescription: GestureDescription?) {
                         accountBrowseGestureInFlight = false
                         if (accountBrowsePhase == AccountBrowsePhase.WAIT_FOR_SCROLL_SETTLE) {
-                            pauseAccountBrowse("首次屏幕滑动被系统或用户操作中断")
+                            pauseAccountBrowse("第 ${accountBrowseSwipeCount + 1} 轮屏幕滑动被系统或用户操作中断")
                         }
                     }
                 }, mainHandler)
@@ -750,56 +771,79 @@ class FreedomAccessibilityService : AccessibilityService() {
             addLog("dispatchGesture 返回：accepted=$accepted")
             if (!accepted) {
                 accountBrowseGestureInFlight = false
-                pauseAccountBrowse("Android 未接受首次屏幕滑动手势；未执行节点滚动备用操作")
+                pauseAccountBrowse("Android 未接受第 ${accountBrowseSwipeCount + 1} 轮屏幕滑动手势；已停止本轮浏览")
                 return@postDelayed
             }
-            addLog("首次列表区域滑动手势已提交；等待系统完成回调")
+            addLog("第 ${accountBrowseSwipeCount + 1} 轮列表区域滑动手势已提交；等待系统完成回调")
         }, SWIPE_WINDOW_SYNC_DELAY_MS)
     }
 
-    /** End this diagnostic cycle after the first swipe; card opening is deliberately deferred. */
+    /** Verify a real list-scroll event, wait for the list to become idle, then schedule the next round. */
     private fun verifyInitialSwipe() {
         if (accountBrowsePhase != AccountBrowsePhase.WAIT_FOR_SCROLL_SETTLE) return
-        if (!restoreMonitorOverlayTouchPassthrough()) {
-            pauseAccountBrowse("首次滑动后无法恢复实时监控悬浮窗；已停止后续操作")
+        if (accountBrowseGestureInFlight) {
+            scheduleAccountBrowseStep(PAGE_STATE_POLL_MS)
             return
         }
-        accountBrowseInitialSwipeCompleted = true
 
-        val root = runCatching { rootInActiveWindow }.getOrNull()
-        val afterSnapshot = if (root == null) {
-            ""
-        } else {
-            try {
-                if (runCatching { root.packageName?.toString().orEmpty() }.getOrDefault("") == MOMO_PACKAGE) {
-                    captureVisibleFeedNodeSnapshot(root)
-                } else {
-                    ""
-                }
-            } finally {
-                runCatching { root.recycle() }
+        if (accountBrowseScrollEventSeen) {
+            val quietForMs = System.currentTimeMillis() - accountBrowseLastScrollEventAt
+            if (quietForMs < SCROLL_SETTLE_MS) {
+                scheduleAccountBrowseStep((SCROLL_SETTLE_MS - quietForMs).coerceAtLeast(100L))
+                return
             }
         }
-        addLog("首次滑动后可见节点快照：${afterSnapshot.ifBlank { "当前无法提取目标页面节点" }}")
+
+        if (!restoreMonitorOverlayTouchPassthrough()) {
+            pauseAccountBrowse("第 ${accountBrowseSwipeCount + 1} 轮滑动后无法恢复实时监控悬浮窗；已停止后续操作")
+            return
+        }
+
+        val root = obtainTargetRootOrPause() ?: return
+        val afterSnapshot = try {
+            if (isMomoDynamicFeedPage(root)) {
+                captureVisibleFeedNodeSnapshot(root)
+            } else {
+                ""
+            }
+        } finally {
+            runCatching { root.recycle() }
+        }
+        addLog("第 ${accountBrowseSwipeCount + 1} 轮滑动后可见节点快照：${afterSnapshot.ifBlank { "动态列表快照不可用" }}")
+
+        if (!accountBrowseScrollEventSeen) {
+            pauseAccountBrowse("第 ${accountBrowseSwipeCount + 1} 轮手势已提交，但没有收到目标列表 TYPE_VIEW_SCROLLED；未计入成功轮数")
+            return
+        }
+        if (afterSnapshot.isBlank()) {
+            pauseAccountBrowse("第 ${accountBrowseSwipeCount + 1} 轮收到滚动事件，但滑动后无法重新确认动态列表；已暂停")
+            return
+        }
+
         val snapshotsDiffer = accountBrowseSourceSnapshot.isNotBlank() &&
-            afterSnapshot.isNotBlank() && accountBrowseSourceSnapshot != afterSnapshot
+            accountBrowseSourceSnapshot != afterSnapshot
+        accountBrowseSwipeCount++
+        addLog(
+            "第 $accountBrowseSwipeCount/${accountBrowseSwipeTargetCount} 轮真实滑动已确认；" +
+                "TYPE_VIEW_SCROLLED 事件数=$accountBrowseScrollEventCount；" +
+                "前后节点快照${if (snapshotsDiffer) "发生变化" else "未显示明显差异"}"
+        )
 
-        if (accountBrowseScrollEventSeen) {
-            addLog("首次滑动结果：已收到目标应用 TYPE_VIEW_SCROLLED 事件")
-        } else {
-            addLog("首次滑动结果：手势回调已完成，但未收到 TYPE_VIEW_SCROLLED 事件")
-        }
-        when {
-            afterSnapshot.isBlank() -> addLog("前后节点快照对比：滑动后快照不可用，无法比较")
-            snapshotsDiffer -> addLog("前后节点快照对比：可见节点文字或位置发生变化；这是辅助迹象，仍以实际画面确认是否滚动")
-            else -> addLog("前后节点快照对比：未发现明显变化；这不能单独证明列表没有移动")
+        if (accountBrowseSwipeCount >= accountBrowseSwipeTargetCount) {
+            accountBrowseInitialSwipeCompleted = true
+            pauseAccountBrowse(
+                "已完成随机安排的 $accountBrowseSwipeCount 轮真实滑动；滑动阶段结束，等待进入下一阶段"
+            )
+            return
         }
 
-        if (accountBrowseScrollEventSeen) {
-            pauseAccountBrowse("首次滑动已完成并记录；本阶段到此结束，尚未启动动态卡片点击")
-        } else {
-            pauseAccountBrowse("首次滑动结果待人工确认；请结合画面和前后节点快照确认后再重新启动")
-        }
+        accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_LIST_SCROLL
+        val delay = randomBrowseDelayMs()
+        addLog(
+            "动态列表已停止滚动；下一轮真实滑动将在 ${delay / 1000.0} 秒后进行。" +
+                "当前进度=$accountBrowseSwipeCount/$accountBrowseSwipeTargetCount"
+        )
+        scheduleAccountBrowseStep(delay)
     }
 
     /** Capture a small, readable sample of visible text nodes and their screen positions. */
@@ -1835,6 +1879,8 @@ class FreedomAccessibilityService : AccessibilityService() {
 
         private const val MIN_BROWSE_DELAY_MS = 3_000L
         private const val MAX_BROWSE_DELAY_MS = 15_000L
+        private const val MIN_SWIPES_PER_SESSION = 4
+        private const val MAX_SWIPES_PER_SESSION = 5
         private const val DETAIL_LOAD_TIMEOUT_MS = 12_000L
         private const val LIST_RETURN_TIMEOUT_MS = 10_000L
         private const val PAGE_STATE_POLL_MS = 300L

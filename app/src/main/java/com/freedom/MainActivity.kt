@@ -329,7 +329,6 @@ class MainActivity : Activity() {
             if (isAccessibilityEnabled()) "已授权" else "未授权 · 点击前往设置",
             if (isAccessibilityEnabled()) "已授权" else "去授权"
         ) {
-            dialog.dismiss()
             startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
         }
         addConfigActionRow(
@@ -337,7 +336,6 @@ class MainActivity : Activity() {
             if (Settings.canDrawOverlays(this)) "已允许在其他应用上层显示" else "未授权 · 点击前往设置",
             if (Settings.canDrawOverlays(this)) "已允许" else "去授权"
         ) {
-            dialog.dismiss()
             requestOverlayPermission()
         }
         addConfigSwitchRow(
