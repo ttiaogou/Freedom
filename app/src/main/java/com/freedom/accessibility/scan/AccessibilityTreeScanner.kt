@@ -99,7 +99,7 @@ internal class AccessibilityTreeScanner(
         }
 
         if (pageTitle.isBlank()) pageTitle = MonitorStore.snapshot(service).page
-        MonitorStore.saveSnapshot(
+        val snapshotChanged = MonitorStore.saveSnapshot(
             context = service,
             app = appLabel,
             page = pageTitle.ifBlank { "未识别页面标题" },
@@ -107,8 +107,13 @@ internal class AccessibilityTreeScanner(
             visitedCount = visited,
             truncated = truncated
         )
-        onLog("节点扫描完成：访问 $visited 个节点，预览显示 ${displayLines.size} 个" + if (truncated) "；已达到扫描上限，结果可能不完整" else "")
-        onRefresh()
+        if (snapshotChanged) {
+            onLog(
+                "节点扫描完成：访问 $visited 个节点，预览显示 ${displayLines.size} 个" +
+                    if (truncated) "；已达到扫描上限，结果可能不完整" else ""
+            )
+            onRefresh()
+        }
     }
 
 

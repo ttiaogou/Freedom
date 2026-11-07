@@ -13,6 +13,7 @@ import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.provider.Settings
 import android.view.Gravity
 import android.view.WindowManager
@@ -31,6 +32,7 @@ import com.freedom.accessibility.browse.AccountBrowsePhase
 import com.freedom.accessibility.browse.AccountBrowseSessionState
 import com.freedom.accessibility.browse.DetailPageIdentityInspection
 import com.freedom.accessibility.browse.DynamicTabInspection
+import com.freedom.accessibility.browse.DynamicTabRowEvidence
 import com.freedom.accessibility.browse.FeedGestureTarget
 import com.freedom.accessibility.browse.FeedReadinessInspection
 import com.freedom.accessibility.browse.HomeBottomNavEvidence
@@ -40,6 +42,7 @@ import com.freedom.accessibility.browse.PopupInspection
 import com.freedom.accessibility.browse.ScrollGesturePlan
 import com.freedom.accessibility.browse.ScrollGestureProfile
 import com.freedom.accessibility.event.AccessibilityEventFormatter
+import com.freedom.accessibility.event.AccessibilityEventPolicy
 import com.freedom.accessibility.scan.AccessibilityTreeScanner
 import com.freedom.accessibility.scheduling.AccountBrowseScheduler
 import com.freedom.accessibility.gesture.GestureTuning
@@ -63,8 +66,222 @@ class FreedomAccessibilityService : AccessibilityService() {
         get() = accountBrowseController.phase
         set(value) = accountBrowseController.transitionTo(value)
 
+    // Compatibility accessors keep the existing Service methods unchanged; backing
+    // session values are owned by AccountBrowseController.session.
     private val accountBrowseSession: AccountBrowseSessionState
         get() = accountBrowseController.session
+
+    private var accountBrowsePauseReason: String
+        get() = accountBrowseSession.pauseReason
+        set(value) { accountBrowseSession.pauseReason = value }
+
+    private var accountBrowseLastDynamicTabWaitReason: String
+        get() = accountBrowseSession.lastDynamicTabWaitReason
+        set(value) { accountBrowseSession.lastDynamicTabWaitReason = value }
+
+    private var accountBrowseDeadlineAt: Long
+        get() = accountBrowseSession.deadlineAt
+        set(value) { accountBrowseSession.deadlineAt = value }
+
+    private var accountBrowseSourceFingerprint: String
+        get() = accountBrowseSession.sourceFingerprint
+        set(value) { accountBrowseSession.sourceFingerprint = value }
+
+    private var accountBrowseDetailFingerprint: String
+        get() = accountBrowseSession.detailFingerprint
+        set(value) { accountBrowseSession.detailFingerprint = value }
+
+    private var accountBrowseDetailActivityClass: String
+        get() = accountBrowseSession.detailActivityClass
+        set(value) { accountBrowseSession.detailActivityClass = value }
+
+    private var accountBrowseLastStableFingerprint: String
+        get() = accountBrowseSession.lastStableFingerprint
+        set(value) { accountBrowseSession.lastStableFingerprint = value }
+
+    private var accountBrowseStableSamples: Int
+        get() = accountBrowseSession.stableSamples
+        set(value) { accountBrowseSession.stableSamples = value }
+
+    private var accountBrowseTouchActive: Boolean
+        get() = accountBrowseSession.touchActive
+        set(value) { accountBrowseSession.touchActive = value }
+
+    private var accountBrowseManualResumeAllowed: Boolean
+        get() = accountBrowseSession.manualResumeAllowed
+        set(value) { accountBrowseSession.manualResumeAllowed = value }
+
+    private var accountBrowseTouchStartedDuringGesture: Boolean
+        get() = accountBrowseSession.touchStartedDuringGesture
+        set(value) { accountBrowseSession.touchStartedDuringGesture = value }
+
+    private var accountBrowseTouchEndedDuringGesture: Boolean
+        get() = accountBrowseSession.touchEndedDuringGesture
+        set(value) { accountBrowseSession.touchEndedDuringGesture = value }
+
+    private var accountBrowseGestureInFlight: Boolean
+        get() = accountBrowseSession.gestureInFlight
+        set(value) { accountBrowseSession.gestureInFlight = value }
+
+    private var accountBrowseScrollEventSeen: Boolean
+        get() = accountBrowseSession.scrollEventSeen
+        set(value) { accountBrowseSession.scrollEventSeen = value }
+
+    private var accountBrowseScrollEventCount: Int
+        get() = accountBrowseSession.scrollEventCount
+        set(value) { accountBrowseSession.scrollEventCount = value }
+
+    private var accountBrowseLastScrollEventAt: Long
+        get() = accountBrowseSession.lastScrollEventAt
+        set(value) { accountBrowseSession.lastScrollEventAt = value }
+
+    private var accountBrowseSwipeCount: Int
+        get() = accountBrowseSession.swipeCount
+        set(value) { accountBrowseSession.swipeCount = value }
+
+    private var accountBrowseFallbackScrollAttempted: Boolean
+        get() = accountBrowseSession.fallbackScrollAttempted
+        set(value) { accountBrowseSession.fallbackScrollAttempted = value }
+
+    private var accountBrowseSourceSnapshot: String
+        get() = accountBrowseSession.sourceSnapshot
+        set(value) { accountBrowseSession.sourceSnapshot = value }
+
+    private var accountBrowseReturnedStableSamples: Int
+        get() = accountBrowseSession.returnedStableSamples
+        set(value) { accountBrowseSession.returnedStableSamples = value }
+
+    private var accountBrowseLastReturnedSnapshot: String
+        get() = accountBrowseSession.lastReturnedSnapshot
+        set(value) { accountBrowseSession.lastReturnedSnapshot = value }
+
+    private var accountBrowseReturnMismatchLogged: Boolean
+        get() = accountBrowseSession.returnMismatchLogged
+        set(value) { accountBrowseSession.returnMismatchLogged = value }
+
+    private var accountBrowseCountdownRemaining: Int
+        get() = accountBrowseSession.countdownRemaining
+        set(value) { accountBrowseSession.countdownRemaining = value }
+
+    private var accountBrowseOverlayPassthroughActive: Boolean
+        get() = accountBrowseSession.overlayPassthroughActive
+        set(value) { accountBrowseSession.overlayPassthroughActive = value }
+
+    private var accountBrowseCurrentActivityClass: String
+        get() = accountBrowseSession.currentActivityClass
+        set(value) { accountBrowseSession.currentActivityClass = value }
+
+    private var accountBrowseImageBrowserReturnActivityClass: String
+        get() = accountBrowseSession.imageBrowserReturnActivityClass
+        set(value) { accountBrowseSession.imageBrowserReturnActivityClass = value }
+
+    private var accountBrowseImageBrowserActive: Boolean
+        get() = accountBrowseSession.imageBrowserActive
+        set(value) { accountBrowseSession.imageBrowserActive = value }
+
+    private var accountBrowseDetailDwellDueAt: Long
+        get() = accountBrowseSession.detailDwellDueAt
+        set(value) { accountBrowseSession.detailDwellDueAt = value }
+
+    private var accountBrowseDetailDwellRemainingMs: Long
+        get() = accountBrowseSession.detailDwellRemainingMs
+        set(value) { accountBrowseSession.detailDwellRemainingMs = value }
+
+    private var accountBrowseIgnoreManualEventsUntil: Long
+        get() = accountBrowseSession.ignoreManualEventsUntil
+        set(value) { accountBrowseSession.ignoreManualEventsUntil = value }
+
+    private var accountBrowseProgrammaticActionLabel: String
+        get() = accountBrowseSession.programmaticActionLabel
+        set(value) { accountBrowseSession.programmaticActionLabel = value }
+
+    private var accountBrowseSafeCardRecheckCount: Int
+        get() = accountBrowseSession.safeCardRecheckCount
+        set(value) { accountBrowseSession.safeCardRecheckCount = value }
+
+    private var accountBrowseLastGlobalTouchEventAt: Long
+        get() = accountBrowseSession.lastGlobalTouchEventAt
+        set(value) { accountBrowseSession.lastGlobalTouchEventAt = value }
+
+    private var accountBrowseLastGlobalTouchEventName: String
+        get() = accountBrowseSession.lastGlobalTouchEventName
+        set(value) { accountBrowseSession.lastGlobalTouchEventName = value }
+
+    private var accountBrowseLastGlobalTouchEventOrigin: String
+        get() = accountBrowseSession.lastGlobalTouchEventOrigin
+        set(value) { accountBrowseSession.lastGlobalTouchEventOrigin = value }
+
+    private var accountBrowsePausedContext: ManualResumeContext?
+        get() = accountBrowseSession.pausedContext
+        set(value) { accountBrowseSession.pausedContext = value }
+
+    private var accountBrowseNavigationActionKey: String
+        get() = accountBrowseSession.navigationActionKey
+        set(value) { accountBrowseSession.navigationActionKey = value }
+
+    private var accountBrowseNavigationBeforeActivity: String
+        get() = accountBrowseSession.navigationBeforeActivity
+        set(value) { accountBrowseSession.navigationBeforeActivity = value }
+
+    private var accountBrowseNavigationBeforeFingerprint: String
+        get() = accountBrowseSession.navigationBeforeFingerprint
+        set(value) { accountBrowseSession.navigationBeforeFingerprint = value }
+
+    private var accountBrowseNavigationActionDeadlineAt: Long
+        get() = accountBrowseSession.navigationActionDeadlineAt
+        set(value) { accountBrowseSession.navigationActionDeadlineAt = value }
+
+    private var accountBrowseNavigationActionAttempts: Int
+        get() = accountBrowseSession.navigationActionAttempts
+        set(value) { accountBrowseSession.navigationActionAttempts = value }
+
+    private var accountBrowseRecoveryBackAttempts: Int
+        get() = accountBrowseSession.recoveryBackAttempts
+        set(value) { accountBrowseSession.recoveryBackAttempts = value }
+
+    private var accountBrowseRecoveryHomeClickAttempts: Int
+        get() = accountBrowseSession.recoveryHomeClickAttempts
+        set(value) { accountBrowseSession.recoveryHomeClickAttempts = value }
+
+    private var accountBrowseRecoveryDynamicClickAttempts: Int
+        get() = accountBrowseSession.recoveryDynamicClickAttempts
+        set(value) { accountBrowseSession.recoveryDynamicClickAttempts = value }
+
+    private var accountBrowseDynamicTabClickConfirmed: Boolean
+        get() = accountBrowseSession.dynamicTabClickConfirmed
+        set(value) { accountBrowseSession.dynamicTabClickConfirmed = value }
+
+    private var accountBrowseNotTargetForegroundLogged: Boolean
+        get() = accountBrowseSession.notTargetForegroundLogged
+        set(value) { accountBrowseSession.notTargetForegroundLogged = value }
+
+    private var accountBrowseRootUnavailableLogged: Boolean
+        get() = accountBrowseSession.rootUnavailableLogged
+        set(value) { accountBrowseSession.rootUnavailableLogged = value }
+
+    private var accountBrowseLastPopupSignature: String
+        get() = accountBrowseSession.lastPopupSignature
+        set(value) { accountBrowseSession.lastPopupSignature = value }
+
+    private var accountBrowsePopupDismissPending: Boolean
+        get() = accountBrowseSession.popupDismissPending
+        set(value) { accountBrowseSession.popupDismissPending = value }
+
+    private var accountBrowsePopupDismissDeadlineAt: Long
+        get() = accountBrowseSession.popupDismissDeadlineAt
+        set(value) { accountBrowseSession.popupDismissDeadlineAt = value }
+
+    private var accountBrowsePopupNextAttemptAt: Long
+        get() = accountBrowseSession.popupNextAttemptAt
+        set(value) { accountBrowseSession.popupNextAttemptAt = value }
+
+    private var accountBrowsePopupActionAttempts: Int
+        get() = accountBrowseSession.popupActionAttempts
+        set(value) { accountBrowseSession.popupActionAttempts = value }
+
+    private var accountBrowsePopupExhaustedLogged: Boolean
+        get() = accountBrowseSession.popupExhaustedLogged
+        set(value) { accountBrowseSession.popupExhaustedLogged = value }
 
     // Owns the automatic-browse phase, phase dispatch, session evidence, and lifecycle coordination.
     // Android-specific operations and platform side effects remain in this service.
@@ -73,7 +290,7 @@ class FreedomAccessibilityService : AccessibilityService() {
             isSessionEnabled = {
                 MonitorStore.isRunning(this) && isAccountBrowseModeEnabled()
             },
-            isTouchActive = { accountBrowseSession.touchActive },
+            isTouchActive = { accountBrowseTouchActive },
             onResetSession = ::resetAccountBrowseSession,
             actions = AccountBrowseController.Actions(
                 waitForDynamicTab = ::waitForMomoDynamicTab,
@@ -101,7 +318,7 @@ class FreedomAccessibilityService : AccessibilityService() {
             canSchedule = {
                 MonitorStore.isRunning(this) &&
                     isAccountBrowseModeEnabled() &&
-                    !accountBrowseSession.touchActive &&
+                    !accountBrowseTouchActive &&
                     accountBrowsePhase != AccountBrowsePhase.PAUSED &&
                     accountBrowsePhase != AccountBrowsePhase.IDLE
             },
@@ -185,7 +402,7 @@ class FreedomAccessibilityService : AccessibilityService() {
             service = this,
             handler = mainHandler,
             isBrowseGestureBusy = {
-                accountBrowseSession.gestureInFlight || accountBrowseSession.overlayPassthroughActive
+                accountBrowseGestureInFlight || accountBrowseOverlayPassthroughActive
             },
             dp = ::dp,
             onLog = ::addLog
@@ -193,7 +410,7 @@ class FreedomAccessibilityService : AccessibilityService() {
     }
 
     private val monitorOverlayPassthroughWatchdog = Runnable {
-        if (accountBrowseSession.overlayPassthroughActive) {
+        if (accountBrowseOverlayPassthroughActive) {
             restoreMonitorOverlayTouchPassthrough()
             if (accountBrowsePhase == AccountBrowsePhase.WAIT_FOR_SCROLL_SETTLE) {
                 pauseAccountBrowse("滑动回调超时；已恢复实时监控悬浮窗触摸状态")
@@ -224,9 +441,19 @@ class FreedomAccessibilityService : AccessibilityService() {
         }
     }
 
+    private var lastNodeScanStartedAt = 0L
+
     private val scanRunnable = Runnable {
         scanQueued = false
+        lastNodeScanStartedAt = SystemClock.uptimeMillis()
         accessibilityTreeScanner.scanActiveWindow()
+    }
+
+    private var refreshViewsQueued = false
+    private val refreshViewsRunnable = Runnable {
+        refreshViewsQueued = false
+        sendBroadcast(Intent(MonitorActions.ACTION_REFRESH).setPackage(packageName))
+        MonitorOverlay.update(this)
     }
 
     // Resume after the user finishes navigating or interacting with the target app.
@@ -372,18 +599,18 @@ class FreedomAccessibilityService : AccessibilityService() {
 
             when (eventType) {
                 AccessibilityEvent.TYPE_TOUCH_INTERACTION_START -> {
-                    accountBrowseSession.lastGlobalTouchEventAt = System.currentTimeMillis()
-                    accountBrowseSession.lastGlobalTouchEventName = "TYPE_TOUCH_INTERACTION_START"
-                    accountBrowseSession.lastGlobalTouchEventOrigin = if (accountBrowseSession.gestureInFlight) {
+                    accountBrowseLastGlobalTouchEventAt = System.currentTimeMillis()
+                    accountBrowseLastGlobalTouchEventName = "TYPE_TOUCH_INTERACTION_START"
+                    accountBrowseLastGlobalTouchEventOrigin = if (accountBrowseGestureInFlight) {
                         "Freedom 自动滑动期间收到；具体来源待确认"
                     } else {
                         "全局触摸事件；系统未提供来源应用"
                     }
-                    if (accountBrowseSession.gestureInFlight) {
-                        accountBrowseSession.touchStartedDuringGesture = true
+                    if (accountBrowseGestureInFlight) {
+                        accountBrowseTouchStartedDuringGesture = true
                         addLog(
                             "收到系统触摸开始事件；发生在 Freedom 自动滑动执行期间，归类为自动手势期间的触摸/中断候选；" +
-                                "Activity=${accountBrowseSession.currentActivityClass.ifBlank { "未知" }}；阶段=${accountBrowsePhase.name}；" +
+                                "Activity=${accountBrowseCurrentActivityClass.ifBlank { "未知" }}；阶段=${accountBrowsePhase.name}；" +
                                 "${currentMonitorPageContext()}；系统未提供该事件的手指坐标"
                         )
                         return
@@ -391,11 +618,11 @@ class FreedomAccessibilityService : AccessibilityService() {
                     addLog(
                         "用户在操作屏幕：收到 TYPE_TOUCH_INTERACTION_START；" +
                             "来源应用=${eventPackage.ifBlank { "系统未提供来源应用" }}；" +
-                            "Activity=${accountBrowseSession.currentActivityClass.ifBlank { "未知" }}；" +
+                            "Activity=${accountBrowseCurrentActivityClass.ifBlank { "未知" }}；" +
                             "自动浏览阶段=${accountBrowsePhase.name}；${currentMonitorPageContext()}；系统未提供手指坐标"
                     )
-                    if (!accountBrowseSession.touchActive) {
-                        accountBrowseSession.touchActive = true
+                    if (!accountBrowseTouchActive) {
+                        accountBrowseTouchActive = true
                         mainHandler.removeCallbacks(manualTouchResumeRunnable)
                         if (accountBrowsePhase != AccountBrowsePhase.PAUSED) {
                             pauseAccountBrowse(
@@ -404,31 +631,31 @@ class FreedomAccessibilityService : AccessibilityService() {
                             )
                         } else {
                             accountBrowseController.recordManualTakeoverWhilePaused(
-                                activityClass = accountBrowseSession.currentActivityClass,
-                                sourceFingerprint = accountBrowseSession.sourceFingerprint,
-                                detailFingerprint = accountBrowseSession.detailFingerprint,
-                                imageBrowserActive = accountBrowseSession.imageBrowserActive,
-                                lastProgrammaticAction = accountBrowseSession.programmaticActionLabel,
+                                activityClass = accountBrowseCurrentActivityClass,
+                                sourceFingerprint = accountBrowseSourceFingerprint,
+                                detailFingerprint = accountBrowseDetailFingerprint,
+                                imageBrowserActive = accountBrowseImageBrowserActive,
+                                lastProgrammaticAction = accountBrowseProgrammaticActionLabel,
                                 currentTimeMillis = System::currentTimeMillis
                             )
-                            addLog("检测到用户正在操作屏幕；原暂停原因=${accountBrowseSession.pauseReason.ifBlank { "未记录" }}；操作结束后重新分析页面层级并导航到动态标签")
+                            addLog("检测到用户正在操作屏幕；原暂停原因=${accountBrowsePauseReason.ifBlank { "未记录" }}；操作结束后重新分析页面层级并导航到动态标签")
                         }
                     }
                 }
 
                 AccessibilityEvent.TYPE_TOUCH_INTERACTION_END -> {
-                    accountBrowseSession.lastGlobalTouchEventAt = System.currentTimeMillis()
-                    accountBrowseSession.lastGlobalTouchEventName = "TYPE_TOUCH_INTERACTION_END"
-                    accountBrowseSession.lastGlobalTouchEventOrigin = if (accountBrowseSession.gestureInFlight) {
+                    accountBrowseLastGlobalTouchEventAt = System.currentTimeMillis()
+                    accountBrowseLastGlobalTouchEventName = "TYPE_TOUCH_INTERACTION_END"
+                    accountBrowseLastGlobalTouchEventOrigin = if (accountBrowseGestureInFlight) {
                         "Freedom 自动滑动期间收到；具体来源待确认"
                     } else {
                         "全局触摸事件；系统未提供来源应用"
                     }
-                    if (accountBrowseSession.gestureInFlight) {
-                        accountBrowseSession.touchEndedDuringGesture = true
+                    if (accountBrowseGestureInFlight) {
+                        accountBrowseTouchEndedDuringGesture = true
                         addLog(
                             "收到系统触摸结束事件；发生在 Freedom 自动滑动执行期间，归类为自动手势期间的触摸/中断候选；" +
-                                "Activity=${accountBrowseSession.currentActivityClass.ifBlank { "未知" }}；阶段=${accountBrowsePhase.name}；" +
+                                "Activity=${accountBrowseCurrentActivityClass.ifBlank { "未知" }}；阶段=${accountBrowsePhase.name}；" +
                                 "${currentMonitorPageContext()}；系统未提供该事件的手指坐标"
                         )
                         return
@@ -436,12 +663,12 @@ class FreedomAccessibilityService : AccessibilityService() {
                     addLog(
                         "用户停止操作屏幕：收到 TYPE_TOUCH_INTERACTION_END；" +
                             "来源应用=${eventPackage.ifBlank { "系统未提供来源应用" }}；" +
-                            "Activity=${accountBrowseSession.currentActivityClass.ifBlank { "未知" }}；" +
+                            "Activity=${accountBrowseCurrentActivityClass.ifBlank { "未知" }}；" +
                             "自动浏览阶段=${accountBrowsePhase.name}；${currentMonitorPageContext()}；系统未提供手指坐标"
                     )
-                    if (accountBrowseSession.touchActive) {
-                        accountBrowseSession.touchActive = false
-                        if (accountBrowseSession.manualResumeAllowed) {
+                    if (accountBrowseTouchActive) {
+                        accountBrowseTouchActive = false
+                        if (accountBrowseManualResumeAllowed) {
                             addLog("用户已停止操作屏幕；开始 ${MANUAL_TOUCH_RESUME_MS / 1000.0} 秒静默倒计时，期间新操作会重新计时")
                             mainHandler.removeCallbacks(manualTouchResumeRunnable)
                             mainHandler.postDelayed(manualTouchResumeRunnable, MANUAL_TOUCH_RESUME_MS)
@@ -462,11 +689,11 @@ class FreedomAccessibilityService : AccessibilityService() {
         if (eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED &&
             accountBrowsePhase == AccountBrowsePhase.WAIT_FOR_SCROLL_SETTLE
         ) {
-            accountBrowseSession.lastScrollEventAt = System.currentTimeMillis()
-            accountBrowseSession.scrollEventCount++
-            if (!accountBrowseSession.scrollEventSeen) {
-                accountBrowseSession.scrollEventSeen = true
-                addLog("第 ${accountBrowseSession.swipeCount + 1} 轮滑动期间检测到目标应用列表滚动事件")
+            accountBrowseLastScrollEventAt = System.currentTimeMillis()
+            accountBrowseScrollEventCount++
+            if (!accountBrowseScrollEventSeen) {
+                accountBrowseScrollEventSeen = true
+                addLog("第 ${accountBrowseSwipeCount + 1} 轮滑动期间检测到目标应用列表滚动事件")
             }
         }
 
@@ -484,7 +711,9 @@ class FreedomAccessibilityService : AccessibilityService() {
             .orEmpty()
             .take(300)
         val description = event.contentDescription?.toString()?.take(180).orEmpty()
-        val signature = "$eventPackage|$rawEventName|$className|$content|$description"
+        val contentChangeTypes = event.contentChangeTypes
+        val eventKind = AccessibilityEventPolicy.classify(eventType, contentChangeTypes)
+        val signature = "$eventPackage|$rawEventName|$className|$content|$description|$contentChangeTypes"
         val now = System.currentTimeMillis()
         // Reduce identical event bursts while preserving meaningful changes.
         if (signature == lastEventSignature && now - lastEventAt < 250L) return
@@ -495,11 +724,13 @@ class FreedomAccessibilityService : AccessibilityService() {
             handleMomoActivityTransition(className)
         }
 
-        val appLabel = resolveAppLabel(eventPackage)
-        val pageHint = sequenceOf(content, description, className.substringAfterLast('.'))
-            .firstOrNull { it.isNotBlank() }
-            .orEmpty()
-        MonitorStore.updateAppPage(this, app = appLabel, page = pageHint)
+        if (eventKind.updatesPageMetadata) {
+            val appLabel = resolveAppLabel(eventPackage)
+            val pageHint = sequenceOf(content, description, className.substringAfterLast('.'))
+                .firstOrNull { it.isNotBlank() }
+                .orEmpty()
+            MonitorStore.updateAppPage(this, app = appLabel, page = pageHint)
+        }
 
         val friendlyEvent = AccessibilityEventFormatter.friendlyEventDescription(
             eventType = event.eventType,
@@ -516,7 +747,7 @@ class FreedomAccessibilityService : AccessibilityService() {
             if (description.isNotBlank()) add("内容描述=$description")
             if (isTrackedInteractionEvent(eventType)) {
                 add("操作来源判断=${classifyInteractionEventOrigin(eventType, now, className)}")
-                add("当前 Activity=${accountBrowseSession.currentActivityClass.ifBlank { "未知" }}")
+                add("当前 Activity=${accountBrowseCurrentActivityClass.ifBlank { "未知" }}")
                 add("自动浏览阶段=${accountBrowsePhase.name}")
                 add(accessibilitySourceDetails(event))
             }
@@ -531,16 +762,27 @@ class FreedomAccessibilityService : AccessibilityService() {
             event = event
         )
 
-        // Scan once shortly after the latest event, not once for every event in a burst.
-        mainHandler.removeCallbacks(scanRunnable)
-        scanQueued = true
-        mainHandler.postDelayed(scanRunnable, SCAN_DEBOUNCE_MS)
+        // Full BFS scans are requested only for window/structure changes.
+        // Ordinary events and text-only metadata updates never trigger tree traversal.
+        if (eventKind.requestsNodeScan) {
+            requestNodeScan()
+        }
     }
 
     /**
      * The existing checkbox is the user's explicit opt-in. Keep its original key.
      * The first cycle starts only when the selected target app is actually foregrounded.
      */
+    private fun requestNodeScan() {
+        if (!MonitorStore.isRunning(this)) return
+        mainHandler.removeCallbacks(scanRunnable)
+        scanQueued = true
+        val elapsed = SystemClock.uptimeMillis() - lastNodeScanStartedAt
+        val intervalDelay = (MIN_NODE_SCAN_INTERVAL_MS - elapsed).coerceAtLeast(0L)
+        val delay = maxOf(SCAN_DEBOUNCE_MS, intervalDelay)
+        mainHandler.postDelayed(scanRunnable, delay)
+    }
+
     private fun isAccountBrowseModeEnabled(): Boolean =
         getSharedPreferences(ACCOUNT_BROWSE_PREFS, Context.MODE_PRIVATE)
             .getBoolean(ACCOUNT_BROWSE_KEY, false)
@@ -553,9 +795,9 @@ class FreedomAccessibilityService : AccessibilityService() {
             return
         }
         val root = runCatching { rootInActiveWindow }.getOrNull() ?: run {
-            if (!accountBrowseSession.rootUnavailableLogged) {
+            if (!accountBrowseRootUnavailableLogged) {
                 addLog("恢复检查暂时无法读取当前前台页面；等待后续页面事件再次触发检查")
-                accountBrowseSession.rootUnavailableLogged = true
+                accountBrowseRootUnavailableLogged = true
             }
             return
         }
@@ -564,20 +806,20 @@ class FreedomAccessibilityService : AccessibilityService() {
         }.getOrDefault(false)
         runCatching { root.recycle() }
         if (!isTargetForeground) {
-            if (!accountBrowseSession.notTargetForegroundLogged) {
+            if (!accountBrowseNotTargetForegroundLogged) {
                 addLog("恢复检查发现当前前台不是陌陌；不会执行自动操作，等待进入陌陌后重新识别")
-                accountBrowseSession.notTargetForegroundLogged = true
+                accountBrowseNotTargetForegroundLogged = true
             }
             return
         }
-        accountBrowseSession.notTargetForegroundLogged = false
-        accountBrowseSession.rootUnavailableLogged = false
+        accountBrowseNotTargetForegroundLogged = false
+        accountBrowseRootUnavailableLogged = false
 
         accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_DYNAMIC_TAB
-        accountBrowseSession.deadlineAt = System.currentTimeMillis() + INITIAL_DYNAMIC_TAB_WAIT_TIMEOUT_MS
-        accountBrowseSession.lastDynamicTabWaitReason = ""
-        accountBrowseSession.lastStableFingerprint = ""
-        accountBrowseSession.stableSamples = 0
+        accountBrowseDeadlineAt = System.currentTimeMillis() + INITIAL_DYNAMIC_TAB_WAIT_TIMEOUT_MS
+        accountBrowseLastDynamicTabWaitReason = ""
+        accountBrowseLastStableFingerprint = ""
+        accountBrowseStableSamples = 0
         addLog("已检测到陌陌进入前台；开始识别页面层级并定位首页顶部‘动态’标签（最多 ${INITIAL_DYNAMIC_TAB_WAIT_TIMEOUT_MS / 1_000} 秒），进入后再验证列表稳定性")
         scheduleAccountBrowseStep(PAGE_STATE_POLL_MS)
     }
@@ -606,20 +848,20 @@ class FreedomAccessibilityService : AccessibilityService() {
             reason = reason,
             allowManualResume = allowManualResume,
             capturePausedContext = { phaseAtPause ->
-                accountBrowseSession.pausedContext = ManualResumeContext(
+                accountBrowsePausedContext = ManualResumeContext(
                     phaseName = phaseAtPause.name,
-                    activityClass = accountBrowseSession.currentActivityClass,
-                    sourceFingerprint = accountBrowseSession.sourceFingerprint,
-                    detailFingerprint = accountBrowseSession.detailFingerprint,
-                    imageBrowserActive = accountBrowseSession.imageBrowserActive,
-                    lastProgrammaticAction = accountBrowseSession.programmaticActionLabel,
+                    activityClass = accountBrowseCurrentActivityClass,
+                    sourceFingerprint = accountBrowseSourceFingerprint,
+                    detailFingerprint = accountBrowseDetailFingerprint,
+                    imageBrowserActive = accountBrowseImageBrowserActive,
+                    lastProgrammaticAction = accountBrowseProgrammaticActionLabel,
                     capturedAt = System.currentTimeMillis()
                 )
                 addLog(
                     "已保存暂停上下文：阶段=${phaseAtPause.name}；" +
-                        "Activity=${accountBrowseSession.currentActivityClass.ifBlank { "未知" }}；" +
-                        "详情上下文=${if (accountBrowseSession.detailFingerprint.isNotBlank()) "已保存" else "无"}；" +
-                        "图片浏览状态=${accountBrowseSession.imageBrowserActive}"
+                        "Activity=${accountBrowseCurrentActivityClass.ifBlank { "未知" }}；" +
+                        "详情上下文=${if (accountBrowseDetailFingerprint.isNotBlank()) "已保存" else "无"}；" +
+                        "图片浏览状态=$accountBrowseImageBrowserActive"
                 )
             },
             beforePause = {
@@ -647,46 +889,46 @@ class FreedomAccessibilityService : AccessibilityService() {
         val popup = inspectMomoPopup(root)
         val now = System.currentTimeMillis()
 
-        if (accountBrowseSession.popupDismissPending) {
+        if (accountBrowsePopupDismissPending) {
             if (popup == null) {
-                accountBrowseSession.popupDismissPending = false
-                accountBrowseSession.popupDismissDeadlineAt = 0L
-                accountBrowseSession.popupNextAttemptAt = 0L
-                accountBrowseSession.popupActionAttempts = 0
-                accountBrowseSession.popupExhaustedLogged = false
-                accountBrowseSession.lastPopupSignature = ""
+                accountBrowsePopupDismissPending = false
+                accountBrowsePopupDismissDeadlineAt = 0L
+                accountBrowsePopupNextAttemptAt = 0L
+                accountBrowsePopupActionAttempts = 0
+                accountBrowsePopupExhaustedLogged = false
+                accountBrowseLastPopupSignature = ""
                 addLog("弹窗关闭已验证：重新扫描后未发现原弹窗；继续当前页面导航/浏览步骤")
                 return false
             }
             recyclePopupInspection(popup)
-            if (now < accountBrowseSession.popupDismissDeadlineAt) {
+            if (now < accountBrowsePopupDismissDeadlineAt) {
                 scheduleAccountBrowseStep(POPUP_VERIFY_POLL_MS)
                 return true
             }
-            accountBrowseSession.popupDismissPending = false
-            accountBrowseSession.popupDismissDeadlineAt = 0L
-            accountBrowseSession.popupNextAttemptAt = now + POPUP_RETRY_DELAY_MS
+            accountBrowsePopupDismissPending = false
+            accountBrowsePopupDismissDeadlineAt = 0L
+            accountBrowsePopupNextAttemptAt = now + POPUP_RETRY_DELAY_MS
             addLog("弹窗关闭动作已提交，但页面仍报告弹窗存在；等待重新分析关闭方式，不执行页面点击或滑动")
             scheduleAccountBrowseStep(POPUP_RETRY_DELAY_MS)
             return true
         }
 
         if (popup == null) {
-            if (accountBrowseSession.lastPopupSignature.isNotBlank()) {
-                accountBrowseSession.lastPopupSignature = ""
-                accountBrowseSession.popupActionAttempts = 0
-                accountBrowseSession.popupExhaustedLogged = false
-                accountBrowseSession.popupNextAttemptAt = 0L
+            if (accountBrowseLastPopupSignature.isNotBlank()) {
+                accountBrowseLastPopupSignature = ""
+                accountBrowsePopupActionAttempts = 0
+                accountBrowsePopupExhaustedLogged = false
+                accountBrowsePopupNextAttemptAt = 0L
             }
             return false
         }
 
-        val isNewPopup = popup.signature != accountBrowseSession.lastPopupSignature
+        val isNewPopup = popup.signature != accountBrowseLastPopupSignature
         if (isNewPopup) {
-            accountBrowseSession.lastPopupSignature = popup.signature
-            accountBrowseSession.popupActionAttempts = 0
-            accountBrowseSession.popupExhaustedLogged = false
-            accountBrowseSession.popupNextAttemptAt = 0L
+            accountBrowseLastPopupSignature = popup.signature
+            accountBrowsePopupActionAttempts = 0
+            accountBrowsePopupExhaustedLogged = false
+            accountBrowsePopupNextAttemptAt = 0L
         }
 
         if (popup.critical) {
@@ -698,28 +940,28 @@ class FreedomAccessibilityService : AccessibilityService() {
             return true
         }
 
-        if (now < accountBrowseSession.popupNextAttemptAt) {
+        if (now < accountBrowsePopupNextAttemptAt) {
             recyclePopupInspection(popup)
-            scheduleAccountBrowseStep((accountBrowseSession.popupNextAttemptAt - now).coerceAtLeast(POPUP_VERIFY_POLL_MS))
+            scheduleAccountBrowseStep((accountBrowsePopupNextAttemptAt - now).coerceAtLeast(POPUP_VERIFY_POLL_MS))
             return true
         }
 
         val hasSafeDismissMethod = popup.dismissable && popup.container != null
         val hasExplicitCloseTarget = popup.closeTarget != null
         if (!hasSafeDismissMethod && !hasExplicitCloseTarget) {
-            if (!accountBrowseSession.popupExhaustedLogged) {
+            if (!accountBrowsePopupExhaustedLogged) {
                 addLog("弹窗已识别，但没有暴露可确认的安全关闭方式；保持等待用户处理，不使用屏幕外部点击或盲目返回")
-                accountBrowseSession.popupExhaustedLogged = true
+                accountBrowsePopupExhaustedLogged = true
             }
             recyclePopupInspection(popup)
             scheduleAccountBrowseStep(POPUP_BLOCKED_RECHECK_MS)
             return true
         }
 
-        if (accountBrowseSession.popupActionAttempts >= MAX_POPUP_DISMISS_ATTEMPTS) {
-            if (!accountBrowseSession.popupExhaustedLogged) {
+        if (accountBrowsePopupActionAttempts >= MAX_POPUP_DISMISS_ATTEMPTS) {
+            if (!accountBrowsePopupExhaustedLogged) {
                 addLog("已识别弹窗，但两次安全关闭尝试后仍无法确认关闭；交由用户处理，不执行动态导航或滑动")
-                accountBrowseSession.popupExhaustedLogged = true
+                accountBrowsePopupExhaustedLogged = true
             }
             recyclePopupInspection(popup)
             scheduleAccountBrowseStep(POPUP_BLOCKED_RECHECK_MS)
@@ -740,26 +982,26 @@ class FreedomAccessibilityService : AccessibilityService() {
                 popup.closeTarget.performAction(AccessibilityNodeInfo.ACTION_CLICK)
             }.getOrDefault(false)
         }
-        accountBrowseSession.popupActionAttempts++
+        accountBrowsePopupActionAttempts++
         recyclePopupInspection(popup)
 
         if (!dismissed) {
-            if (isNewPopup || accountBrowseSession.popupActionAttempts == 1) {
+            if (isNewPopup || accountBrowsePopupActionAttempts == 1) {
                 addLog("弹窗识别：${popup.description}；未发现可执行的安全关闭方式（${actionDescription}）；不使用屏幕外部点击或盲目返回")
             }
-            accountBrowseSession.popupNextAttemptAt = now + POPUP_RETRY_DELAY_MS
+            accountBrowsePopupNextAttemptAt = now + POPUP_RETRY_DELAY_MS
             scheduleAccountBrowseStep(POPUP_BLOCKED_RECHECK_MS)
             return true
         }
 
-        accountBrowseSession.popupDismissPending = true
-        accountBrowseSession.popupDismissDeadlineAt = now + POPUP_DISMISS_VERIFY_TIMEOUT_MS
-        accountBrowseSession.programmaticActionLabel = if (actionDescription.contains("ACTION_DISMISS")) {
+        accountBrowsePopupDismissPending = true
+        accountBrowsePopupDismissDeadlineAt = now + POPUP_DISMISS_VERIFY_TIMEOUT_MS
+        accountBrowseProgrammaticActionLabel = if (actionDescription.contains("ACTION_DISMISS")) {
             "Freedom ACTION_DISMISS 弹窗关闭"
         } else {
             "Freedom ACTION_CLICK $actionDescription 弹窗关闭"
         }
-        accountBrowseSession.ignoreManualEventsUntil = now + POPUP_DISMISS_VERIFY_TIMEOUT_MS
+        accountBrowseIgnoreManualEventsUntil = now + POPUP_DISMISS_VERIFY_TIMEOUT_MS
         addLog("识别到可安全关闭的陌陌弹窗：${popup.description}；采用 $actionDescription；等待重新扫描验证关闭结果")
         scheduleAccountBrowseStep(POPUP_VERIFY_POLL_MS)
         return true
@@ -793,8 +1035,8 @@ class FreedomAccessibilityService : AccessibilityService() {
                 } else if (handleMomoPopup(root)) {
                     return
                 } else {
-                    accountBrowseSession.notTargetForegroundLogged = false
-                    accountBrowseSession.rootUnavailableLogged = false
+                    accountBrowseNotTargetForegroundLogged = false
+                    accountBrowseRootUnavailableLogged = false
 
                     val tabInspection = inspectDynamicTabRow(root)
                     val tabEvidence = tabInspection.evidence
@@ -821,8 +1063,8 @@ class FreedomAccessibilityService : AccessibilityService() {
                             val readiness = inspectMomoFeedReadiness(root)
                             val shouldVerifyUnknownSelectionByClick =
                                 !tabEvidence.selectionKnown &&
-                                    !accountBrowseSession.dynamicTabClickConfirmed &&
-                                    accountBrowseSession.recoveryDynamicClickAttempts < MAX_RECOVERY_TAB_CLICK_ATTEMPTS
+                                    !accountBrowseDynamicTabClickConfirmed &&
+                                    accountBrowseRecoveryDynamicClickAttempts < MAX_RECOVERY_TAB_CLICK_ATTEMPTS
                             if (shouldVerifyUnknownSelectionByClick) {
                                 val dynamicTarget = findClickableNodeForLabel(
                                     root = root,
@@ -844,20 +1086,20 @@ class FreedomAccessibilityService : AccessibilityService() {
                                 reason = "已找到首页顶部动态导航行，但动态标签没有安全可点击的节点；不把当前列表直接认定为目标页"
                             }
                             if (readiness.fingerprint != null &&
-                                (tabEvidence.selectionKnown || accountBrowseSession.dynamicTabClickConfirmed)
+                                (tabEvidence.selectionKnown || accountBrowseDynamicTabClickConfirmed)
                             ) {
-                                accountBrowseSession.imageBrowserActive = false
-                                accountBrowseSession.imageBrowserReturnActivityClass = ""
-                                accountBrowseSession.detailActivityClass = ""
-                                accountBrowseSession.detailFingerprint = ""
-                                accountBrowseSession.programmaticActionLabel = ""
-                                accountBrowseSession.detailDwellDueAt = 0L
-                                accountBrowseSession.detailDwellRemainingMs = 0L
+                                accountBrowseImageBrowserActive = false
+                                accountBrowseImageBrowserReturnActivityClass = ""
+                                accountBrowseDetailActivityClass = ""
+                                accountBrowseDetailFingerprint = ""
+                                accountBrowseProgrammaticActionLabel = ""
+                                accountBrowseDetailDwellDueAt = 0L
+                                accountBrowseDetailDwellRemainingMs = 0L
                                 accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_FEED_STABLE
-                                accountBrowseSession.deadlineAt = System.currentTimeMillis() + INITIAL_FEED_STABILITY_TIMEOUT_MS
-                                accountBrowseSession.lastDynamicTabWaitReason = ""
-                                accountBrowseSession.lastStableFingerprint = ""
-                                accountBrowseSession.stableSamples = 0
+                                accountBrowseDeadlineAt = System.currentTimeMillis() + INITIAL_FEED_STABILITY_TIMEOUT_MS
+                                accountBrowseLastDynamicTabWaitReason = ""
+                                accountBrowseLastStableFingerprint = ""
+                                accountBrowseStableSamples = 0
                                 addLog(
                                     "已确认当前位于陌陌动态列表；现在独立等待列表稳定（最多 ${INITIAL_FEED_STABILITY_TIMEOUT_MS / 1_000} 秒）。" +
                                         readiness.reason
@@ -865,7 +1107,7 @@ class FreedomAccessibilityService : AccessibilityService() {
                                 scheduleAccountBrowseStep(PAGE_STATE_POLL_MS)
                                 return
                             }
-                            if (!shouldVerifyUnknownSelectionByClick || accountBrowseSession.dynamicTabClickConfirmed) {
+                            if (!shouldVerifyUnknownSelectionByClick || accountBrowseDynamicTabClickConfirmed) {
                                 reason = readiness.reason
                             }
                         }
@@ -895,7 +1137,7 @@ class FreedomAccessibilityService : AccessibilityService() {
                                 reason = "识别到陌陌底部‘首页’导航，但没有找到可安全点击的控件"
                             }
                         } else if (isKnownMomoChildPage()) {
-                            if (accountBrowseSession.recoveryBackAttempts >= MAX_RECOVERY_BACK_STEPS) {
+                            if (accountBrowseRecoveryBackAttempts >= MAX_RECOVERY_BACK_STEPS) {
                                 pauseAccountBrowse("已连续返回 $MAX_RECOVERY_BACK_STEPS 次，仍无法识别动态标签页；停止导航以避免误退出陌陌")
                                 return
                             }
@@ -903,9 +1145,9 @@ class FreedomAccessibilityService : AccessibilityService() {
                             return
                         } else {
                             reason = when {
-                                accountBrowseSession.currentActivityClass == MOMO_MAIN_ACTIVITY ->
+                                accountBrowseCurrentActivityClass == MOMO_MAIN_ACTIVITY ->
                                     "当前位于陌陌主 Activity，但无障碍节点暂未暴露可验证的首页/动态导航控件"
-                                accountBrowseSession.currentActivityClass.isBlank() ->
+                                accountBrowseCurrentActivityClass.isBlank() ->
                                     "尚未取得可靠的陌陌 Activity 信息，也没有识别到动态导航行或底部首页导航"
                                 else ->
                                     "当前页面层级无法确认；不执行猜测性返回或点击"
@@ -918,18 +1160,18 @@ class FreedomAccessibilityService : AccessibilityService() {
             }
         }
 
-        if (reason != accountBrowseSession.lastDynamicTabWaitReason) {
-            accountBrowseSession.lastDynamicTabWaitReason = reason
+        if (reason != accountBrowseLastDynamicTabWaitReason) {
+            accountBrowseLastDynamicTabWaitReason = reason
             addLog("主动导航分析：$reason")
         }
-        if (accountBrowseSession.pausedContext != null) {
+        if (accountBrowsePausedContext != null) {
             // Manual recovery remains pending while the app/page is unavailable or unknown.
             // Keep analyzing at a low frequency; do not guess-click or give up after a timeout.
-            accountBrowseSession.deadlineAt = System.currentTimeMillis() + INITIAL_DYNAMIC_TAB_WAIT_TIMEOUT_MS
+            accountBrowseDeadlineAt = System.currentTimeMillis() + INITIAL_DYNAMIC_TAB_WAIT_TIMEOUT_MS
             scheduleAccountBrowseStep(1_000L)
             return
         }
-        if (System.currentTimeMillis() >= accountBrowseSession.deadlineAt) {
+        if (System.currentTimeMillis() >= accountBrowseDeadlineAt) {
             pauseAccountBrowse("主动导航动态标签超时；当前页面未能被可靠识别，没有执行滑动或动态卡片点击")
         } else {
             scheduleAccountBrowseStep(PAGE_STATE_POLL_MS)
@@ -942,22 +1184,22 @@ class FreedomAccessibilityService : AccessibilityService() {
      * treating every non-MainTab Activity as a child page can accidentally leave the intended task.
      */
     private fun isKnownMomoChildPage(): Boolean {
-        val activity = accountBrowseSession.currentActivityClass
+        val activity = accountBrowseCurrentActivityClass
         return when (activity) {
-            MOMO_FEED_IMAGE_BROWSER_ACTIVITY -> accountBrowseSession.imageBrowserActive ||
-                accountBrowseSession.pausedContext?.imageBrowserActive == true
+            MOMO_FEED_IMAGE_BROWSER_ACTIVITY -> accountBrowseImageBrowserActive ||
+                accountBrowsePausedContext?.imageBrowserActive == true
             MOMO_DYNAMIC_DETAIL_ACTIVITY ->
-                accountBrowseSession.detailActivityClass == MOMO_DYNAMIC_DETAIL_ACTIVITY ||
-                    accountBrowseSession.detailFingerprint.isNotBlank() ||
-                    accountBrowseSession.pausedContext?.detailFingerprint?.isNotBlank() == true ||
-                    (accountBrowseSession.pausedContext?.phaseName?.let { phaseName ->
+                accountBrowseDetailActivityClass == MOMO_DYNAMIC_DETAIL_ACTIVITY ||
+                    accountBrowseDetailFingerprint.isNotBlank() ||
+                    accountBrowsePausedContext?.detailFingerprint?.isNotBlank() == true ||
+                    (accountBrowsePausedContext?.phaseName?.let { phaseName ->
                         phaseName in setOf(
                             AccountBrowsePhase.WAIT_FOR_DETAIL_LOAD.name,
                             AccountBrowsePhase.DETAIL_DWELL.name,
                             AccountBrowsePhase.WAIT_FOR_IMAGE_BROWSER_RETURN.name,
                             AccountBrowsePhase.WAIT_FOR_DETAIL_RESTABILIZE.name
                         )
-                    } == true) || accountBrowseSession.programmaticActionLabel.contains("动态卡片")
+                    } == true) || accountBrowseProgrammaticActionLabel.contains("动态卡片")
             else -> false
         }
     }
@@ -971,10 +1213,10 @@ class FreedomAccessibilityService : AccessibilityService() {
         val targetBounds = Rect()
         runCatching { target.getBoundsInScreen(targetBounds) }
         val beforeFingerprint = pageFingerprint(root).signature
-        val beforeActivity = accountBrowseSession.currentActivityClass
+        val beforeActivity = accountBrowseCurrentActivityClass
         val attempt = when (actionKey) {
-            NAV_ACTION_DYNAMIC_TAB -> ++accountBrowseSession.recoveryDynamicClickAttempts
-            NAV_ACTION_HOME_TAB -> ++accountBrowseSession.recoveryHomeClickAttempts
+            NAV_ACTION_DYNAMIC_TAB -> ++accountBrowseRecoveryDynamicClickAttempts
+            NAV_ACTION_HOME_TAB -> ++accountBrowseRecoveryHomeClickAttempts
             else -> 1
         }
         val maxAttempts = if (actionKey == NAV_ACTION_DYNAMIC_TAB) {
@@ -988,19 +1230,19 @@ class FreedomAccessibilityService : AccessibilityService() {
             return
         }
 
-        accountBrowseSession.programmaticActionLabel = "Freedom ACTION_CLICK $actionDescription"
-        accountBrowseSession.ignoreManualEventsUntil = System.currentTimeMillis() + NAVIGATION_ACTION_EVENT_WINDOW_MS
+        accountBrowseProgrammaticActionLabel = "Freedom ACTION_CLICK $actionDescription"
+        accountBrowseIgnoreManualEventsUntil = System.currentTimeMillis() + NAVIGATION_ACTION_EVENT_WINDOW_MS
         val clicked = momoNavigationController.performClickAndRecycle(target)
         if (!clicked) {
             pauseAccountBrowse("系统未接受‘$actionDescription’的无障碍点击；没有继续尝试其他控件")
             return
         }
 
-        accountBrowseSession.navigationActionKey = actionKey
-        accountBrowseSession.navigationBeforeActivity = beforeActivity
-        accountBrowseSession.navigationBeforeFingerprint = beforeFingerprint
-        accountBrowseSession.navigationActionAttempts = attempt
-        accountBrowseSession.navigationActionDeadlineAt = System.currentTimeMillis() + NAVIGATION_ACTION_VERIFY_TIMEOUT_MS
+        accountBrowseNavigationActionKey = actionKey
+        accountBrowseNavigationBeforeActivity = beforeActivity
+        accountBrowseNavigationBeforeFingerprint = beforeFingerprint
+        accountBrowseNavigationActionAttempts = attempt
+        accountBrowseNavigationActionDeadlineAt = System.currentTimeMillis() + NAVIGATION_ACTION_VERIFY_TIMEOUT_MS
         accountBrowsePhase = AccountBrowsePhase.VERIFY_NAVIGATION_ACTION
         addLog(
             "已向‘$actionDescription’提交无障碍点击（第 $attempt/$maxAttempts 次）；" +
@@ -1012,25 +1254,25 @@ class FreedomAccessibilityService : AccessibilityService() {
 
     private fun submitNavigationBack(root: AccessibilityNodeInfo) {
         val beforeFingerprint = pageFingerprint(root).signature
-        val beforeActivity = accountBrowseSession.currentActivityClass
-        accountBrowseSession.recoveryBackAttempts++
-        accountBrowseSession.programmaticActionLabel = "Freedom GLOBAL_ACTION_BACK 页面层级返回"
-        accountBrowseSession.ignoreManualEventsUntil = System.currentTimeMillis() + NAVIGATION_ACTION_EVENT_WINDOW_MS
+        val beforeActivity = accountBrowseCurrentActivityClass
+        accountBrowseRecoveryBackAttempts++
+        accountBrowseProgrammaticActionLabel = "Freedom GLOBAL_ACTION_BACK 页面层级返回"
+        accountBrowseIgnoreManualEventsUntil = System.currentTimeMillis() + NAVIGATION_ACTION_EVENT_WINDOW_MS
         val accepted = runCatching { momoNavigationController.performBack() }.getOrDefault(false)
         if (!accepted) {
             pauseAccountBrowse("当前已识别为陌陌子页面，但系统未接受返回操作；停止自动导航")
             return
         }
 
-        accountBrowseSession.navigationActionKey = NAV_ACTION_BACK
-        accountBrowseSession.navigationBeforeActivity = beforeActivity
-        accountBrowseSession.navigationBeforeFingerprint = beforeFingerprint
-        accountBrowseSession.navigationActionAttempts = accountBrowseSession.recoveryBackAttempts
-        accountBrowseSession.navigationActionDeadlineAt = System.currentTimeMillis() + NAVIGATION_ACTION_VERIFY_TIMEOUT_MS
+        accountBrowseNavigationActionKey = NAV_ACTION_BACK
+        accountBrowseNavigationBeforeActivity = beforeActivity
+        accountBrowseNavigationBeforeFingerprint = beforeFingerprint
+        accountBrowseNavigationActionAttempts = accountBrowseRecoveryBackAttempts
+        accountBrowseNavigationActionDeadlineAt = System.currentTimeMillis() + NAVIGATION_ACTION_VERIFY_TIMEOUT_MS
         accountBrowsePhase = AccountBrowsePhase.VERIFY_NAVIGATION_ACTION
         addLog(
             "当前页面识别为陌陌子页面（Activity=${beforeActivity.ifBlank { "未知" }}）；" +
-                "已提交第 ${accountBrowseSession.recoveryBackAttempts}/$MAX_RECOVERY_BACK_STEPS 次返回；" +
+                "已提交第 $accountBrowseRecoveryBackAttempts/$MAX_RECOVERY_BACK_STEPS 次返回；" +
                 "等待验证返回后的页面层级"
         )
         scheduleAccountBrowseStep(NAVIGATION_ACTION_VERIFY_POLL_MS)
@@ -1039,8 +1281,8 @@ class FreedomAccessibilityService : AccessibilityService() {
     private fun verifyNavigationAction() {
         val root = runCatching { rootInActiveWindow }.getOrNull()
         if (root == null) {
-            if (System.currentTimeMillis() >= accountBrowseSession.navigationActionDeadlineAt) {
-                accountBrowseSession.navigationActionKey = ""
+            if (System.currentTimeMillis() >= accountBrowseNavigationActionDeadlineAt) {
+                accountBrowseNavigationActionKey = ""
                 accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_DYNAMIC_TAB
             }
             scheduleAccountBrowseStep(PAGE_STATE_POLL_MS)
@@ -1050,8 +1292,8 @@ class FreedomAccessibilityService : AccessibilityService() {
         val activePackage = runCatching { root.packageName?.toString().orEmpty() }.getOrDefault("")
         if (activePackage != MOMO_PACKAGE) {
             runCatching { root.recycle() }
-            if (System.currentTimeMillis() >= accountBrowseSession.navigationActionDeadlineAt) {
-                accountBrowseSession.navigationActionKey = ""
+            if (System.currentTimeMillis() >= accountBrowseNavigationActionDeadlineAt) {
+                accountBrowseNavigationActionKey = ""
                 accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_DYNAMIC_TAB
             }
             scheduleAccountBrowseStep(PAGE_STATE_POLL_MS)
@@ -1062,13 +1304,13 @@ class FreedomAccessibilityService : AccessibilityService() {
             return
         }
 
-        val currentActivity = accountBrowseSession.currentActivityClass
+        val currentActivity = accountBrowseCurrentActivityClass
         val currentFingerprint = try {
             pageFingerprint(root).signature
         } finally {
             runCatching { root.recycle() }
         }
-        val actionKey = accountBrowseSession.navigationActionKey
+        val actionKey = accountBrowseNavigationActionKey
         val tabEvidence = if (actionKey == NAV_ACTION_DYNAMIC_TAB) {
             val freshRoot = runCatching { rootInActiveWindow }.getOrNull()
             if (freshRoot == null) null else try {
@@ -1086,15 +1328,15 @@ class FreedomAccessibilityService : AccessibilityService() {
             }
         } else false
 
-        val structureChanged = currentActivity != accountBrowseSession.navigationBeforeActivity ||
-            currentFingerprint != accountBrowseSession.navigationBeforeFingerprint
+        val structureChanged = currentActivity != accountBrowseNavigationBeforeActivity ||
+            currentFingerprint != accountBrowseNavigationBeforeFingerprint
         val backPageEvidence = if (actionKey == NAV_ACTION_BACK) {
             val freshRoot = runCatching { rootInActiveWindow }.getOrNull()
             if (freshRoot == null) false else try {
                 inspectDynamicTabRow(freshRoot).evidence != null ||
                     inspectHomeBottomNav(freshRoot) != null ||
-                    (accountBrowseSession.imageBrowserActive &&
-                        currentActivity == accountBrowseSession.imageBrowserReturnActivityClass)
+                    (accountBrowseImageBrowserActive &&
+                        currentActivity == accountBrowseImageBrowserReturnActivityClass)
             } finally {
                 runCatching { freshRoot.recycle() }
             }
@@ -1104,28 +1346,28 @@ class FreedomAccessibilityService : AccessibilityService() {
                 (tabEvidence?.let { it.selectionKnown && it.dynamicSelected } == true) ||
                 (tabEvidence != null && structureChanged)
             NAV_ACTION_HOME_TAB -> feedConfirmed || tabEvidence != null || structureChanged
-            NAV_ACTION_BACK -> currentActivity != accountBrowseSession.navigationBeforeActivity ||
-                (currentFingerprint != accountBrowseSession.navigationBeforeFingerprint && backPageEvidence)
+            NAV_ACTION_BACK -> currentActivity != accountBrowseNavigationBeforeActivity ||
+                (currentFingerprint != accountBrowseNavigationBeforeFingerprint && backPageEvidence)
             else -> false
         }
 
         if (confirmed) {
             if (actionKey == NAV_ACTION_DYNAMIC_TAB) {
-                accountBrowseSession.dynamicTabClickConfirmed = true
+                accountBrowseDynamicTabClickConfirmed = true
             }
             addLog("导航结果已验证：动作=$actionKey；Activity=${currentActivity.ifBlank { "未知" }}；页面结构已重新识别")
-            accountBrowseSession.navigationActionKey = ""
-            accountBrowseSession.navigationBeforeActivity = ""
-            accountBrowseSession.navigationBeforeFingerprint = ""
-            accountBrowseSession.navigationActionDeadlineAt = 0L
+            accountBrowseNavigationActionKey = ""
+            accountBrowseNavigationBeforeActivity = ""
+            accountBrowseNavigationBeforeFingerprint = ""
+            accountBrowseNavigationActionDeadlineAt = 0L
             accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_DYNAMIC_TAB
-            accountBrowseSession.lastDynamicTabWaitReason = ""
+            accountBrowseLastDynamicTabWaitReason = ""
             scheduleAccountBrowseStep(PAGE_STATE_POLL_MS)
             return
         }
 
-        if (System.currentTimeMillis() >= accountBrowseSession.navigationActionDeadlineAt) {
-            val attempts = accountBrowseSession.navigationActionAttempts
+        if (System.currentTimeMillis() >= accountBrowseNavigationActionDeadlineAt) {
+            val attempts = accountBrowseNavigationActionAttempts
             val maxAttempts = when (actionKey) {
                 NAV_ACTION_BACK -> MAX_RECOVERY_BACK_STEPS
                 NAV_ACTION_HOME_TAB -> MAX_RECOVERY_HOME_CLICK_ATTEMPTS
@@ -1133,16 +1375,16 @@ class FreedomAccessibilityService : AccessibilityService() {
                 else -> 1
             }
             addLog("导航结果未得到确认：动作=$actionKey；页面仍未出现可验证变化（$attempts/$maxAttempts 次）；重新分析当前页面后再决定下一步")
-            accountBrowseSession.navigationActionKey = ""
-            accountBrowseSession.navigationBeforeActivity = ""
-            accountBrowseSession.navigationBeforeFingerprint = ""
-            accountBrowseSession.navigationActionDeadlineAt = 0L
+            accountBrowseNavigationActionKey = ""
+            accountBrowseNavigationBeforeActivity = ""
+            accountBrowseNavigationBeforeFingerprint = ""
+            accountBrowseNavigationActionDeadlineAt = 0L
             accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_DYNAMIC_TAB
             if (attempts >= maxAttempts && actionKey != NAV_ACTION_BACK) {
                 pauseAccountBrowse("导航动作 $actionKey 连续 $maxAttempts 次未验证成功；已停止重复点击")
                 return
             }
-            if (actionKey == NAV_ACTION_BACK && accountBrowseSession.recoveryBackAttempts >= MAX_RECOVERY_BACK_STEPS) {
+            if (actionKey == NAV_ACTION_BACK && accountBrowseRecoveryBackAttempts >= MAX_RECOVERY_BACK_STEPS) {
                 pauseAccountBrowse("连续返回 $MAX_RECOVERY_BACK_STEPS 次后仍未能确认页面层级；已停止自动导航")
                 return
             }
@@ -1185,8 +1427,8 @@ class FreedomAccessibilityService : AccessibilityService() {
         val activePackage = runCatching { root.packageName?.toString().orEmpty() }.getOrDefault("")
         if (activePackage != MOMO_PACKAGE) {
             runCatching { root.recycle() }
-            accountBrowseSession.lastStableFingerprint = ""
-            accountBrowseSession.stableSamples = 0
+            accountBrowseLastStableFingerprint = ""
+            accountBrowseStableSamples = 0
             scheduleOrTimeoutFeedStability()
             return
         }
@@ -1203,35 +1445,35 @@ class FreedomAccessibilityService : AccessibilityService() {
         val fingerprint = inspection.fingerprint
 
         if (fingerprint == null) {
-            accountBrowseSession.lastStableFingerprint = ""
-            accountBrowseSession.stableSamples = 0
+            accountBrowseLastStableFingerprint = ""
+            accountBrowseStableSamples = 0
             addLog("动态列表尚不具备操作条件：${inspection.reason}")
-        } else if (fingerprint.signature == accountBrowseSession.lastStableFingerprint) {
-            accountBrowseSession.stableSamples++
-            addLog("动态列表采样：可见项目=${fingerprint.nodeCount}，稳定计数=${accountBrowseSession.stableSamples}/$REQUIRED_STABLE_FEED_SAMPLES；${inspection.reason}")
+        } else if (fingerprint.signature == accountBrowseLastStableFingerprint) {
+            accountBrowseStableSamples++
+            addLog("动态列表采样：可见项目=${fingerprint.nodeCount}，稳定计数=${accountBrowseStableSamples}/$REQUIRED_STABLE_FEED_SAMPLES；${inspection.reason}")
         } else {
-            accountBrowseSession.lastStableFingerprint = fingerprint.signature
-            accountBrowseSession.stableSamples = 1
+            accountBrowseLastStableFingerprint = fingerprint.signature
+            accountBrowseStableSamples = 1
             addLog("动态列表布局基准已建立：可见项目=${fingerprint.nodeCount}，稳定计数=1/$REQUIRED_STABLE_FEED_SAMPLES；${inspection.reason}")
         }
 
-        if (accountBrowseSession.stableSamples >= REQUIRED_STABLE_FEED_SAMPLES) {
-            accountBrowseSession.swipeCount = 0
-            if (accountBrowseSession.pausedContext != null) {
+        if (accountBrowseStableSamples >= REQUIRED_STABLE_FEED_SAMPLES) {
+            accountBrowseSwipeCount = 0
+            if (accountBrowsePausedContext != null) {
                 addLog("暂停上下文已完成校验：当前动态列表连续稳定；恢复后先执行新的列表滑动，再选择动态，避免重新点击暂停前已打开的卡片")
-                accountBrowseSession.pausedContext = null
+                accountBrowsePausedContext = null
             }
             accountBrowsePhase = AccountBrowsePhase.FIRST_SWIPE_COUNTDOWN
-            accountBrowseSession.countdownRemaining = FIRST_SWIPE_COUNTDOWN_SECONDS
+            accountBrowseCountdownRemaining = FIRST_SWIPE_COUNTDOWN_SECONDS
             addLog(
                 "已连续确认陌陌动态列表稳定 ${REQUIRED_STABLE_FEED_SAMPLES} 次；" +
                     "即将开始持续滑动循环，现在开始首次滑动倒计时"
             )
-            if (!showFirstSwipeCountdown(accountBrowseSession.countdownRemaining)) {
+            if (!showFirstSwipeCountdown(accountBrowseCountdownRemaining)) {
                 pauseAccountBrowse("无法显示首次滑动倒计时提示；为避免无提示操作，已暂停")
                 return
             }
-            addLog("首次滑动倒计时：${accountBrowseSession.countdownRemaining} 秒")
+            addLog("首次滑动倒计时：${accountBrowseCountdownRemaining} 秒")
             scheduleAccountBrowseStep(FIRST_SWIPE_COUNTDOWN_STEP_MS)
             return
         }
@@ -1240,7 +1482,7 @@ class FreedomAccessibilityService : AccessibilityService() {
     }
 
     private fun scheduleOrTimeoutFeedStability() {
-        if (System.currentTimeMillis() >= accountBrowseSession.deadlineAt) {
+        if (System.currentTimeMillis() >= accountBrowseDeadlineAt) {
             pauseAccountBrowse("动态列表加载或稳定确认超时；没有执行首次滑动")
         } else {
             scheduleAccountBrowseStep(PAGE_STATE_POLL_MS)
@@ -1260,18 +1502,18 @@ class FreedomAccessibilityService : AccessibilityService() {
             return
         }
 
-        if (accountBrowseSession.countdownRemaining > 1) {
-            accountBrowseSession.countdownRemaining--
-            if (!showFirstSwipeCountdown(accountBrowseSession.countdownRemaining)) {
+        if (accountBrowseCountdownRemaining > 1) {
+            accountBrowseCountdownRemaining--
+            if (!showFirstSwipeCountdown(accountBrowseCountdownRemaining)) {
                 pauseAccountBrowse("首次滑动倒计时提示中断；已取消首次滑动")
                 return
             }
-            addLog("首次滑动倒计时：${accountBrowseSession.countdownRemaining} 秒")
+            addLog("首次滑动倒计时：${accountBrowseCountdownRemaining} 秒")
             scheduleAccountBrowseStep(FIRST_SWIPE_COUNTDOWN_STEP_MS)
             return
         }
 
-        accountBrowseSession.countdownRemaining = 0
+        accountBrowseCountdownRemaining = 0
         hideFirstSwipeCountdown()
         accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_LIST_SCROLL
         performFeedScroll()
@@ -1365,7 +1607,7 @@ class FreedomAccessibilityService : AccessibilityService() {
     /** Temporarily remove the live monitor window from the touch path for the swipe. */
     private fun enableMonitorOverlayTouchPassthrough(): Boolean {
         if (!MonitorOverlay.isAttached()) {
-            accountBrowseSession.overlayPassthroughActive = false
+            accountBrowseOverlayPassthroughActive = false
             addLog("实时监控悬浮窗当前未附加（配置中‘悬浮日志’已关闭）；本次滑动不经过悬浮窗")
             return true
         }
@@ -1375,7 +1617,7 @@ class FreedomAccessibilityService : AccessibilityService() {
             addLog("无法暂时关闭实时监控悬浮窗的触摸拦截；未发送首次滑动。$before")
             return false
         }
-        accountBrowseSession.overlayPassthroughActive = true
+        accountBrowseOverlayPassthroughActive = true
         mainHandler.removeCallbacks(monitorOverlayPassthroughWatchdog)
         mainHandler.postDelayed(
             monitorOverlayPassthroughWatchdog,
@@ -1389,10 +1631,10 @@ class FreedomAccessibilityService : AccessibilityService() {
     }
 
     private fun restoreMonitorOverlayTouchPassthrough(): Boolean {
-        if (!accountBrowseSession.overlayPassthroughActive) return true
+        if (!accountBrowseOverlayPassthroughActive) return true
         val restored = MonitorOverlay.setTouchPassthrough(false)
         if (restored) {
-            accountBrowseSession.overlayPassthroughActive = false
+            accountBrowseOverlayPassthroughActive = false
             mainHandler.removeCallbacks(monitorOverlayPassthroughWatchdog)
             addLog("首次滑动检查结束：实时监控悬浮窗已恢复显示和触摸操作")
             return true
@@ -1413,7 +1655,7 @@ class FreedomAccessibilityService : AccessibilityService() {
     private fun performFeedScroll() {
         val root = obtainTargetRootOrPause() ?: return
         val target = try {
-            accountBrowseSession.sourceSnapshot = captureVisibleFeedNodeSnapshot(root)
+            accountBrowseSourceSnapshot = captureVisibleFeedNodeSnapshot(root)
             resolveFeedGestureTarget(root)
         } finally {
             runCatching { root.recycle() }
@@ -1421,7 +1663,7 @@ class FreedomAccessibilityService : AccessibilityService() {
             pauseAccountBrowse("无法定位首页动态列表的有效滑动区域；本轮未发送滑动")
             return
         }
-        addLog("第 ${accountBrowseSession.swipeCount + 1} 轮滑动前可见节点快照：${accountBrowseSession.sourceSnapshot.ifBlank { "未提取到可见文字节点" }}")
+        addLog("第 ${accountBrowseSwipeCount + 1} 轮滑动前可见节点快照：${accountBrowseSourceSnapshot.ifBlank { "未提取到可见文字节点" }}")
 
         val bounds = target.bounds
         val profile = loadScrollGestureProfile()
@@ -1439,17 +1681,17 @@ class FreedomAccessibilityService : AccessibilityService() {
         }
 
         accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_SCROLL_SETTLE
-        accountBrowseSession.scrollEventSeen = false
-        accountBrowseSession.scrollEventCount = 0
-        accountBrowseSession.programmaticActionLabel = "Freedom dispatchGesture 自动坐标滑动"
-        accountBrowseSession.ignoreManualEventsUntil = System.currentTimeMillis() + profile.durationMs + 2_000L
-        accountBrowseSession.lastScrollEventAt = 0L
-        accountBrowseSession.fallbackScrollAttempted = false
-        accountBrowseSession.gestureInFlight = false
-        accountBrowseSession.touchStartedDuringGesture = false
-        accountBrowseSession.touchEndedDuringGesture = false
+        accountBrowseScrollEventSeen = false
+        accountBrowseScrollEventCount = 0
+        accountBrowseProgrammaticActionLabel = "Freedom dispatchGesture 自动坐标滑动"
+        accountBrowseIgnoreManualEventsUntil = System.currentTimeMillis() + profile.durationMs + 2_000L
+        accountBrowseLastScrollEventAt = 0L
+        accountBrowseFallbackScrollAttempted = false
+        accountBrowseGestureInFlight = false
+        accountBrowseTouchStartedDuringGesture = false
+        accountBrowseTouchEndedDuringGesture = false
         addLog(
-            "第 ${accountBrowseSession.swipeCount + 1} 轮列表区域坐标滑动准备：容器=${target.className}，边界=$bounds，" +
+            "第 ${accountBrowseSwipeCount + 1} 轮列表区域坐标滑动准备：容器=${target.className}，边界=$bounds，" +
                 "起点 (${gesturePlan.startX},${gesturePlan.startY})，终点 (${gesturePlan.endX},${gesturePlan.endY})，" +
                 "持续 ${profile.durationMs} 毫秒"
         )
@@ -1457,48 +1699,48 @@ class FreedomAccessibilityService : AccessibilityService() {
         // Give WindowManager a short frame interval to apply any overlay visibility/flag change.
         mainHandler.postDelayed({
             if (accountBrowsePhase != AccountBrowsePhase.WAIT_FOR_SCROLL_SETTLE ||
-                accountBrowseSession.touchActive || !MonitorStore.isRunning(this)
+                accountBrowseTouchActive || !MonitorStore.isRunning(this)
             ) {
-                accountBrowseSession.gestureInFlight = false
+                accountBrowseGestureInFlight = false
                 restoreMonitorOverlayTouchPassthrough()
                 return@postDelayed
             }
-            accountBrowseSession.gestureInFlight = true
+            accountBrowseGestureInFlight = true
             val accepted = runCatching {
                 dispatchGesture(gesture, object : AccessibilityService.GestureResultCallback() {
                     override fun onCompleted(gestureDescription: GestureDescription?) {
                         GestureTrailOverlay.finishSwipe()
-                        accountBrowseSession.gestureInFlight = false
-                        accountBrowseSession.touchStartedDuringGesture = false
-                        accountBrowseSession.touchEndedDuringGesture = false
+                        accountBrowseGestureInFlight = false
+                        accountBrowseTouchStartedDuringGesture = false
+                        accountBrowseTouchEndedDuringGesture = false
                         if (accountBrowsePhase != AccountBrowsePhase.WAIT_FOR_SCROLL_SETTLE ||
                             !MonitorStore.isRunning(this@FreedomAccessibilityService)
                         ) return
-                        addLog("Android 已完成第 ${accountBrowseSession.swipeCount + 1} 轮屏幕滑动手势；正在检查真实列表滚动")
+                        addLog("Android 已完成第 ${accountBrowseSwipeCount + 1} 轮屏幕滑动手势；正在检查真实列表滚动")
                         scheduleAccountBrowseStep(SCROLL_SETTLE_MS)
                     }
 
                     override fun onCancelled(gestureDescription: GestureDescription?) {
                         GestureTrailOverlay.cancelSwipe()
-                        val touchStarted = accountBrowseSession.touchStartedDuringGesture
-                        val touchEnded = accountBrowseSession.touchEndedDuringGesture
-                        accountBrowseSession.gestureInFlight = false
-                        accountBrowseSession.touchStartedDuringGesture = false
-                        accountBrowseSession.touchEndedDuringGesture = false
+                        val touchStarted = accountBrowseTouchStartedDuringGesture
+                        val touchEnded = accountBrowseTouchEndedDuringGesture
+                        accountBrowseGestureInFlight = false
+                        accountBrowseTouchStartedDuringGesture = false
+                        accountBrowseTouchEndedDuringGesture = false
                         if (accountBrowsePhase == AccountBrowsePhase.WAIT_FOR_SCROLL_SETTLE) {
                             val interruptedByTouch = touchStarted || touchEnded
                             pauseAccountBrowse(
-                                "第 ${accountBrowseSession.swipeCount + 1} 轮屏幕滑动被系统或用户操作中断",
+                                "第 ${accountBrowseSwipeCount + 1} 轮屏幕滑动被系统或用户操作中断",
                                 allowManualResume = interruptedByTouch
                             )
                             if (interruptedByTouch) {
                                 if (touchEnded) {
-                                    accountBrowseSession.touchActive = false
+                                    accountBrowseTouchActive = false
                                     addLog("检测到手动触摸中断了自动滑动，且触摸已经结束；开始 ${MANUAL_TOUCH_RESUME_MS / 1000.0} 秒静默等待")
                                     mainHandler.removeCallbacks(manualTouchResumeRunnable)
                                     mainHandler.postDelayed(manualTouchResumeRunnable, MANUAL_TOUCH_RESUME_MS)
                                 } else {
-                                    accountBrowseSession.touchActive = true
+                                    accountBrowseTouchActive = true
                                     addLog("检测到手动触摸中断了自动滑动；等待用户松开屏幕后再开始静默等待")
                                 }
                             }
@@ -1510,26 +1752,26 @@ class FreedomAccessibilityService : AccessibilityService() {
             addLog("dispatchGesture 返回：accepted=$accepted")
             if (!accepted) {
                 GestureTrailOverlay.clear()
-                accountBrowseSession.gestureInFlight = false
-                pauseAccountBrowse("Android 未接受第 ${accountBrowseSession.swipeCount + 1} 轮屏幕滑动手势；已停止本轮浏览")
+                accountBrowseGestureInFlight = false
+                pauseAccountBrowse("Android 未接受第 ${accountBrowseSwipeCount + 1} 轮屏幕滑动手势；已停止本轮浏览")
                 return@postDelayed
             }
             // Display the exact Path object submitted to GestureDescription; do not synthesize a separate curve.
             GestureTrailOverlay.showSwipe(this, gesturePlan.path, profile.durationMs)
-            addLog("第 ${accountBrowseSession.swipeCount + 1} 轮列表区域滑动手势已提交；轨迹可视化与实际手势共用同一条 Path，等待系统完成回调")
+            addLog("第 ${accountBrowseSwipeCount + 1} 轮列表区域滑动手势已提交；轨迹可视化与实际手势共用同一条 Path，等待系统完成回调")
         }, SWIPE_WINDOW_SYNC_DELAY_MS)
     }
 
     /** Verify a real list-scroll event, wait for the list to become idle, then schedule the next round. */
     private fun verifyInitialSwipe() {
         if (accountBrowsePhase != AccountBrowsePhase.WAIT_FOR_SCROLL_SETTLE) return
-        if (accountBrowseSession.gestureInFlight) {
+        if (accountBrowseGestureInFlight) {
             scheduleAccountBrowseStep(PAGE_STATE_POLL_MS)
             return
         }
 
-        if (accountBrowseSession.scrollEventSeen) {
-            val quietForMs = System.currentTimeMillis() - accountBrowseSession.lastScrollEventAt
+        if (accountBrowseScrollEventSeen) {
+            val quietForMs = System.currentTimeMillis() - accountBrowseLastScrollEventAt
             if (quietForMs < SCROLL_SETTLE_MS) {
                 scheduleAccountBrowseStep((SCROLL_SETTLE_MS - quietForMs).coerceAtLeast(100L))
                 return
@@ -1537,7 +1779,7 @@ class FreedomAccessibilityService : AccessibilityService() {
         }
 
         if (!restoreMonitorOverlayTouchPassthrough()) {
-            pauseAccountBrowse("第 ${accountBrowseSession.swipeCount + 1} 轮滑动后无法恢复实时监控悬浮窗；已停止后续操作")
+            pauseAccountBrowse("第 ${accountBrowseSwipeCount + 1} 轮滑动后无法恢复实时监控悬浮窗；已停止后续操作")
             return
         }
 
@@ -1551,29 +1793,29 @@ class FreedomAccessibilityService : AccessibilityService() {
         } finally {
             runCatching { root.recycle() }
         }
-        addLog("第 ${accountBrowseSession.swipeCount + 1} 轮滑动后可见节点快照：${afterSnapshot.ifBlank { "动态列表快照不可用" }}")
+        addLog("第 ${accountBrowseSwipeCount + 1} 轮滑动后可见节点快照：${afterSnapshot.ifBlank { "动态列表快照不可用" }}")
 
-        if (!accountBrowseSession.scrollEventSeen) {
-            pauseAccountBrowse("第 ${accountBrowseSession.swipeCount + 1} 轮手势已提交，但没有收到目标列表 TYPE_VIEW_SCROLLED；未计入成功轮数")
+        if (!accountBrowseScrollEventSeen) {
+            pauseAccountBrowse("第 ${accountBrowseSwipeCount + 1} 轮手势已提交，但没有收到目标列表 TYPE_VIEW_SCROLLED；未计入成功轮数")
             return
         }
         if (afterSnapshot.isBlank()) {
-            pauseAccountBrowse("第 ${accountBrowseSession.swipeCount + 1} 轮收到滚动事件，但滑动后无法重新确认动态列表；已暂停")
+            pauseAccountBrowse("第 ${accountBrowseSwipeCount + 1} 轮收到滚动事件，但滑动后无法重新确认动态列表；已暂停")
             return
         }
 
-        val snapshotsDiffer = accountBrowseSession.sourceSnapshot.isNotBlank() &&
-            accountBrowseSession.sourceSnapshot != afterSnapshot
-        accountBrowseSession.swipeCount++
+        val snapshotsDiffer = accountBrowseSourceSnapshot.isNotBlank() &&
+            accountBrowseSourceSnapshot != afterSnapshot
+        accountBrowseSwipeCount++
         addLog(
-            "第 ${accountBrowseSession.swipeCount} 轮真实滑动已确认；" +
-                "TYPE_VIEW_SCROLLED 事件数=${accountBrowseSession.scrollEventCount}；" +
+            "第 $accountBrowseSwipeCount 轮真实滑动已确认；" +
+                "TYPE_VIEW_SCROLLED 事件数=$accountBrowseScrollEventCount；" +
                 "前后节点快照${if (snapshotsDiffer) "发生变化" else "未显示明显差异"}"
         )
 
         accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_CARD_OPEN
         addLog(
-            "动态列表已停止滚动；累计已确认滑动=${accountBrowseSession.swipeCount} 轮，" +
+            "动态列表已停止滚动；累计已确认滑动=$accountBrowseSwipeCount 轮，" +
                 "等待列表稳定后识别并打开一条普通动态"
         )
         scheduleAccountBrowseStep(CARD_OPEN_SETTLE_MS)
@@ -1596,7 +1838,7 @@ class FreedomAccessibilityService : AccessibilityService() {
         // dispatchGesture() can be accepted by Android without producing a real list scroll
         // (for example, when the host view ignores injected touch). Verify the scroll event;
         // if absent, retry once through the list's native accessibility scroll action.
-        if (!accountBrowseSession.scrollEventSeen && !accountBrowseSession.fallbackScrollAttempted) {
+        if (!accountBrowseScrollEventSeen && !accountBrowseFallbackScrollAttempted) {
             val fallbackRoot = obtainTargetRootOrPause() ?: return
             val fallbackNode = try {
                 findScrollableFeedContainer(fallbackRoot)
@@ -1607,8 +1849,8 @@ class FreedomAccessibilityService : AccessibilityService() {
                 pauseAccountBrowse("手势没有触发列表滚动，且未找到可用的备用滚动区域")
                 return
             }
-            accountBrowseSession.programmaticActionLabel = "Freedom ACTION_SCROLL_FORWARD 备用滚动"
-            accountBrowseSession.ignoreManualEventsUntil = System.currentTimeMillis() + 1_800L
+            accountBrowseProgrammaticActionLabel = "Freedom ACTION_SCROLL_FORWARD 备用滚动"
+            accountBrowseIgnoreManualEventsUntil = System.currentTimeMillis() + 1_800L
             val fallbackScrolled = try {
                 fallbackNode.performAction(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD)
             } catch (_: Exception) {
@@ -1616,7 +1858,7 @@ class FreedomAccessibilityService : AccessibilityService() {
             } finally {
                 runCatching { fallbackNode.recycle() }
             }
-            accountBrowseSession.fallbackScrollAttempted = true
+            accountBrowseFallbackScrollAttempted = true
             if (!fallbackScrolled) {
                 pauseAccountBrowse("触摸滑动和备用无障碍滚动均未能移动列表")
                 return
@@ -1645,8 +1887,8 @@ class FreedomAccessibilityService : AccessibilityService() {
             // Save the exact list state immediately before opening the card. The same
             // list-only snapshot is compared after Back to avoid scrolling from an
             // unverified or shifted position.
-            accountBrowseSession.sourceFingerprint = pageFingerprint(root).signature
-            accountBrowseSession.sourceSnapshot = captureVisibleFeedNodeSnapshot(listNode)
+            accountBrowseSourceFingerprint = pageFingerprint(root).signature
+            accountBrowseSourceSnapshot = captureVisibleFeedNodeSnapshot(listNode)
             cardNode = findClickableFeedCard(listNode)
         } finally {
             runCatching { scrollNode?.recycle() }
@@ -1655,13 +1897,13 @@ class FreedomAccessibilityService : AccessibilityService() {
 
         if (cardNode == null) {
             if (accountBrowsePhase == AccountBrowsePhase.WAIT_FOR_SAFE_CARD) {
-                accountBrowseSession.safeCardRecheckCount++
-                if (accountBrowseSession.safeCardRecheckCount >= MAX_SAFE_CARD_RECHECKS_BEFORE_NEXT_SWIPE) {
-                    accountBrowseSession.safeCardRecheckCount = 0
-                    accountBrowseSession.scrollEventSeen = false
-                    accountBrowseSession.scrollEventCount = 0
-                    accountBrowseSession.lastScrollEventAt = 0L
-                    accountBrowseSession.fallbackScrollAttempted = false
+                accountBrowseSafeCardRecheckCount++
+                if (accountBrowseSafeCardRecheckCount >= MAX_SAFE_CARD_RECHECKS_BEFORE_NEXT_SWIPE) {
+                    accountBrowseSafeCardRecheckCount = 0
+                    accountBrowseScrollEventSeen = false
+                    accountBrowseScrollEventCount = 0
+                    accountBrowseLastScrollEventAt = 0L
+                    accountBrowseFallbackScrollAttempted = false
                     accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_LIST_SCROLL
                     val nextSwipeDelay = randomScrollIntervalMs()
                     addLog(
@@ -1671,13 +1913,13 @@ class FreedomAccessibilityService : AccessibilityService() {
                     scheduleAccountBrowseStep(nextSwipeDelay)
                 } else {
                     addLog(
-                        "第 ${accountBrowseSession.safeCardRecheckCount} 次定时复查：当前仍没有符合条件的普通动态；" +
+                        "第 $accountBrowseSafeCardRecheckCount 次定时复查：当前仍没有符合条件的普通动态；" +
                             "保持等待 ${SAFE_CARD_RECHECK_INTERVAL_MS / 1_000.0} 秒，不点击广告、直播或未知卡片"
                     )
                     scheduleAccountBrowseStep(SAFE_CARD_RECHECK_INTERVAL_MS)
                 }
             } else {
-                accountBrowseSession.safeCardRecheckCount = 0
+                accountBrowseSafeCardRecheckCount = 0
                 accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_SAFE_CARD
                 addLog(
                     "本轮没有找到可安全打开的普通动态；已跳过广告、直播和未知卡片，" +
@@ -1688,14 +1930,14 @@ class FreedomAccessibilityService : AccessibilityService() {
             }
             return
         }
-        accountBrowseSession.safeCardRecheckCount = 0
+        accountBrowseSafeCardRecheckCount = 0
 
         // ACTION_CLICK activates an accessibility node rather than injecting a physical tap.
         // Capture its real screen bounds so the overlay can mark the target control accurately.
         val clickTargetBounds = Rect()
         runCatching { cardNode?.getBoundsInScreen(clickTargetBounds) }
-        accountBrowseSession.programmaticActionLabel = "Freedom ACTION_CLICK 动态卡片"
-        accountBrowseSession.ignoreManualEventsUntil = System.currentTimeMillis() + PROGRAMMATIC_CLICK_EVENT_WINDOW_MS
+        accountBrowseProgrammaticActionLabel = "Freedom ACTION_CLICK 动态卡片"
+        accountBrowseIgnoreManualEventsUntil = System.currentTimeMillis() + PROGRAMMATIC_CLICK_EVENT_WINDOW_MS
         val clicked = try {
             cardNode?.performAction(AccessibilityNodeInfo.ACTION_CLICK) == true
         } catch (_: Exception) {
@@ -1715,13 +1957,13 @@ class FreedomAccessibilityService : AccessibilityService() {
         } else {
             addLog("点击可视化未显示：系统没有返回动态卡片的有效屏幕边界")
         }
-        accountBrowseSession.returnedStableSamples = 0
-        accountBrowseSession.lastReturnedSnapshot = ""
-        accountBrowseSession.returnMismatchLogged = false
+        accountBrowseReturnedStableSamples = 0
+        accountBrowseLastReturnedSnapshot = ""
+        accountBrowseReturnMismatchLogged = false
         accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_DETAIL_LOAD
-        accountBrowseSession.deadlineAt = System.currentTimeMillis() + DETAIL_LOAD_TIMEOUT_MS
-        accountBrowseSession.lastStableFingerprint = ""
-        accountBrowseSession.stableSamples = 0
+        accountBrowseDeadlineAt = System.currentTimeMillis() + DETAIL_LOAD_TIMEOUT_MS
+        accountBrowseLastStableFingerprint = ""
+        accountBrowseStableSamples = 0
         addLog("已点击一条符合条件的普通动态；正在确认详情页面是否成功载入")
         scheduleAccountBrowseStep(PAGE_STATE_POLL_MS)
     }
@@ -1765,35 +2007,35 @@ class FreedomAccessibilityService : AccessibilityService() {
         val fingerprint = pageState.second
 
         if (!isFeedPage &&
-            accountBrowseSession.currentActivityClass == MOMO_DYNAMIC_DETAIL_ACTIVITY &&
-            fingerprint.signature != accountBrowseSession.sourceFingerprint &&
+            accountBrowseCurrentActivityClass == MOMO_DYNAMIC_DETAIL_ACTIVITY &&
+            fingerprint.signature != accountBrowseSourceFingerprint &&
             fingerprint.nodeCount >= MIN_DETAIL_NODE_COUNT
         ) {
-            if (fingerprint.signature == accountBrowseSession.lastStableFingerprint) {
-                accountBrowseSession.stableSamples++
+            if (fingerprint.signature == accountBrowseLastStableFingerprint) {
+                accountBrowseStableSamples++
             } else {
-                accountBrowseSession.lastStableFingerprint = fingerprint.signature
-                accountBrowseSession.stableSamples = 1
+                accountBrowseLastStableFingerprint = fingerprint.signature
+                accountBrowseStableSamples = 1
             }
-            if (accountBrowseSession.stableSamples >= REQUIRED_STABLE_PAGE_SAMPLES) {
-                accountBrowseSession.detailFingerprint = fingerprint.signature
-                accountBrowseSession.detailActivityClass = accountBrowseSession.currentActivityClass
+            if (accountBrowseStableSamples >= REQUIRED_STABLE_PAGE_SAMPLES) {
+                accountBrowseDetailFingerprint = fingerprint.signature
+                accountBrowseDetailActivityClass = accountBrowseCurrentActivityClass
                     .ifBlank { MOMO_DYNAMIC_DETAIL_ACTIVITY }
                 val dwell = randomBrowseDelayMs()
                 accountBrowsePhase = AccountBrowsePhase.DETAIL_DWELL
-                accountBrowseSession.detailDwellRemainingMs = dwell
-                accountBrowseSession.detailDwellDueAt = System.currentTimeMillis() + dwell
+                accountBrowseDetailDwellRemainingMs = dwell
+                accountBrowseDetailDwellDueAt = System.currentTimeMillis() + dwell
                 addLog("动态详情已确认载入；本次阅读停留 ${dwell / 1000.0} 秒")
                 scheduleAccountBrowseStep(dwell)
                 return
             }
         } else {
-            accountBrowseSession.lastStableFingerprint = ""
-            accountBrowseSession.stableSamples = 0
+            accountBrowseLastStableFingerprint = ""
+            accountBrowseStableSamples = 0
         }
 
-        if (System.currentTimeMillis() >= accountBrowseSession.deadlineAt) {
-            beginDynamicNavigationRecovery("等待动态详情超时；当前 Activity=${accountBrowseSession.currentActivityClass.ifBlank { "未知" }}，重新分析当前页面层级")
+        if (System.currentTimeMillis() >= accountBrowseDeadlineAt) {
+            beginDynamicNavigationRecovery("等待动态详情超时；当前 Activity=${accountBrowseCurrentActivityClass.ifBlank { "未知" }}，重新分析当前页面层级")
         } else {
             scheduleAccountBrowseStep(PAGE_STATE_POLL_MS)
         }
@@ -1810,10 +2052,10 @@ class FreedomAccessibilityService : AccessibilityService() {
         if (identity.isFeedPage) {
             addLog("详情停留结束时重新扫描发现已经回到动态列表；不再重复执行返回，直接验证原列表位置")
             accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_LIST_RETURN
-            accountBrowseSession.returnedStableSamples = 0
-            accountBrowseSession.lastReturnedSnapshot = ""
-            accountBrowseSession.returnMismatchLogged = false
-            accountBrowseSession.deadlineAt = System.currentTimeMillis() + LIST_RETURN_TIMEOUT_MS
+            accountBrowseReturnedStableSamples = 0
+            accountBrowseLastReturnedSnapshot = ""
+            accountBrowseReturnMismatchLogged = false
+            accountBrowseDeadlineAt = System.currentTimeMillis() + LIST_RETURN_TIMEOUT_MS
             scheduleAccountBrowseStep(PAGE_STATE_POLL_MS)
             return
         }
@@ -1824,25 +2066,25 @@ class FreedomAccessibilityService : AccessibilityService() {
             return
         }
 
-        if (identity.fingerprint.signature != accountBrowseSession.detailFingerprint) {
+        if (identity.fingerprint.signature != accountBrowseDetailFingerprint) {
             addLog(
                 "动态详情内容结构在阅读期间发生变化（可见节点=${identity.fingerprint.nodeCount}）；" +
                     "但 Activity 和详情页面身份仍然匹配，按正常内容更新处理，不触发暂停"
             )
-            accountBrowseSession.detailFingerprint = identity.fingerprint.signature
+            accountBrowseDetailFingerprint = identity.fingerprint.signature
         }
 
-        accountBrowseSession.programmaticActionLabel = "Freedom GLOBAL_ACTION_BACK 返回详情"
-        accountBrowseSession.ignoreManualEventsUntil = System.currentTimeMillis() + 1_500L
+        accountBrowseProgrammaticActionLabel = "Freedom GLOBAL_ACTION_BACK 返回详情"
+        accountBrowseIgnoreManualEventsUntil = System.currentTimeMillis() + 1_500L
         if (!momoNavigationController.performBack()) {
             beginDynamicNavigationRecovery("详情页面身份已确认，但系统未接受返回操作")
             return
         }
         accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_LIST_RETURN
-        accountBrowseSession.returnedStableSamples = 0
-        accountBrowseSession.lastReturnedSnapshot = ""
-        accountBrowseSession.returnMismatchLogged = false
-        accountBrowseSession.deadlineAt = System.currentTimeMillis() + LIST_RETURN_TIMEOUT_MS
+        accountBrowseReturnedStableSamples = 0
+        accountBrowseLastReturnedSnapshot = ""
+        accountBrowseReturnMismatchLogged = false
+        accountBrowseDeadlineAt = System.currentTimeMillis() + LIST_RETURN_TIMEOUT_MS
         addLog("动态详情身份已确认；阅读停留结束，正在返回并验证原动态列表位置")
         scheduleAccountBrowseStep(PAGE_STATE_POLL_MS)
     }
@@ -1855,8 +2097,8 @@ class FreedomAccessibilityService : AccessibilityService() {
         root: AccessibilityNodeInfo
     ): DetailPageIdentityInspection = momoPageInspector.inspectCurrentDynamicDetailIdentity(
         root = root,
-        expectedActivity = accountBrowseSession.detailActivityClass.ifBlank { MOMO_DYNAMIC_DETAIL_ACTIVITY },
-        currentActivity = accountBrowseSession.currentActivityClass
+        expectedActivity = accountBrowseDetailActivityClass.ifBlank { MOMO_DYNAMIC_DETAIL_ACTIVITY },
+        currentActivity = accountBrowseCurrentActivityClass
     )
 
     /** Machine-detected page uncertainty should enter the same verified navigator, not dead-end PAUSED. */
@@ -1885,40 +2127,40 @@ class FreedomAccessibilityService : AccessibilityService() {
     private fun handleMomoActivityTransition(activityClass: String) {
         if (!activityClass.endsWith("Activity")) return
 
-        val previousActivity = accountBrowseSession.currentActivityClass
-        accountBrowseSession.currentActivityClass = activityClass
+        val previousActivity = accountBrowseCurrentActivityClass
+        accountBrowseCurrentActivityClass = activityClass
 
         if (activityClass == MOMO_FEED_IMAGE_BROWSER_ACTIVITY) {
-            if (accountBrowsePhase == AccountBrowsePhase.PAUSED && accountBrowseSession.manualResumeAllowed) {
-                accountBrowseSession.imageBrowserReturnActivityClass = previousActivity
+            if (accountBrowsePhase == AccountBrowsePhase.PAUSED && accountBrowseManualResumeAllowed) {
+                accountBrowseImageBrowserReturnActivityClass = previousActivity
                     .takeIf { it.isNotBlank() && it != MOMO_FEED_IMAGE_BROWSER_ACTIVITY }
                     ?: MOMO_DYNAMIC_DETAIL_ACTIVITY
-                accountBrowseSession.imageBrowserActive = true
-                accountBrowseSession.detailDwellRemainingMs =
-                    (accountBrowseSession.detailDwellDueAt - System.currentTimeMillis()).coerceAtLeast(0L)
+                accountBrowseImageBrowserActive = true
+                accountBrowseDetailDwellRemainingMs =
+                    (accountBrowseDetailDwellDueAt - System.currentTimeMillis()).coerceAtLeast(0L)
                 addLog("已识别用户暂停期间进入陌陌动态图片浏览页面：保留 PAUSED 状态；静默结束后由恢复导航逐级返回动态标签")
             } else if (accountBrowsePhase == AccountBrowsePhase.DETAIL_DWELL) {
-                accountBrowseSession.imageBrowserReturnActivityClass = previousActivity
+                accountBrowseImageBrowserReturnActivityClass = previousActivity
                     .takeIf { it.isNotBlank() && it != MOMO_FEED_IMAGE_BROWSER_ACTIVITY }
                     ?: MOMO_DYNAMIC_DETAIL_ACTIVITY
-                accountBrowseSession.imageBrowserActive = true
-                accountBrowseSession.detailDwellRemainingMs =
-                    (accountBrowseSession.detailDwellDueAt - System.currentTimeMillis()).coerceAtLeast(0L)
+                accountBrowseImageBrowserActive = true
+                accountBrowseDetailDwellRemainingMs =
+                    (accountBrowseDetailDwellDueAt - System.currentTimeMillis()).coerceAtLeast(0L)
                 mainHandler.removeCallbacks(manualTouchResumeRunnable)
                 accountBrowseScheduler.cancel()
-                accountBrowseSession.manualResumeAllowed = false
+                accountBrowseManualResumeAllowed = false
                 accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_IMAGE_BROWSER_RETURN
-                accountBrowseSession.deadlineAt = System.currentTimeMillis() + IMAGE_BROWSER_RETURN_TIMEOUT_MS
+                accountBrowseDeadlineAt = System.currentTimeMillis() + IMAGE_BROWSER_RETURN_TIMEOUT_MS
                 addLog("自动详情停留期间进入陌陌图片浏览页面：保留详情上下文，等待图片页面返回")
                 scheduleAccountBrowseStep(PAGE_STATE_POLL_MS)
             }
             return
         }
 
-        if (accountBrowseSession.imageBrowserActive) {
-            if (accountBrowsePhase == AccountBrowsePhase.PAUSED && accountBrowseSession.manualResumeAllowed) {
-                if (activityClass == accountBrowseSession.imageBrowserReturnActivityClass) {
-                    accountBrowseSession.imageBrowserActive = false
+        if (accountBrowseImageBrowserActive) {
+            if (accountBrowsePhase == AccountBrowsePhase.PAUSED && accountBrowseManualResumeAllowed) {
+                if (activityClass == accountBrowseImageBrowserReturnActivityClass) {
+                    accountBrowseImageBrowserActive = false
                     addLog("用户已手动退出图片浏览页面；保持安全暂停，静默结束后仍会重新识别并导航到动态标签")
                 } else {
                     addLog("用户暂停期间图片浏览 Activity 已变化：$activityClass；保持安全暂停，交由恢复导航重新判断")
@@ -1929,38 +2171,38 @@ class FreedomAccessibilityService : AccessibilityService() {
                 accountBrowsePhase == AccountBrowsePhase.VERIFY_NAVIGATION_ACTION ||
                 accountBrowsePhase == AccountBrowsePhase.WAIT_FOR_FEED_STABLE
             ) {
-                if (activityClass == accountBrowseSession.imageBrowserReturnActivityClass) {
-                    accountBrowseSession.imageBrowserActive = false
-                    accountBrowseSession.imageBrowserReturnActivityClass = ""
+                if (activityClass == accountBrowseImageBrowserReturnActivityClass) {
+                    accountBrowseImageBrowserActive = false
+                    accountBrowseImageBrowserReturnActivityClass = ""
                     addLog("恢复导航已退出图片浏览页面并回到详情层级；继续主动寻找动态主页面")
                 }
                 return
             }
-            if (activityClass == accountBrowseSession.imageBrowserReturnActivityClass) {
+            if (activityClass == accountBrowseImageBrowserReturnActivityClass) {
                 accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_DETAIL_RESTABILIZE
-                accountBrowseSession.deadlineAt = System.currentTimeMillis() + DETAIL_RESTABILIZE_TIMEOUT_MS
-                accountBrowseSession.lastStableFingerprint = ""
-                accountBrowseSession.stableSamples = 0
+                accountBrowseDeadlineAt = System.currentTimeMillis() + DETAIL_RESTABILIZE_TIMEOUT_MS
+                accountBrowseLastStableFingerprint = ""
+                accountBrowseStableSamples = 0
                 addLog("检测到已退出图片浏览器并返回原动态详情 Activity：$activityClass；正在重新确认详情页面稳定性")
                 scheduleAccountBrowseStep(PAGE_STATE_POLL_MS)
             } else {
-                accountBrowseSession.imageBrowserActive = false
+                accountBrowseImageBrowserActive = false
                 pauseAccountBrowse("图片浏览器退出后进入了非原动态详情页面：$activityClass；为避免误返回或误点击，已安全暂停")
             }
         }
     }
 
     private fun waitForImageBrowserReturn() {
-        if (!accountBrowseSession.imageBrowserActive) {
+        if (!accountBrowseImageBrowserActive) {
             accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_DETAIL_RESTABILIZE
-            accountBrowseSession.deadlineAt = System.currentTimeMillis() + DETAIL_RESTABILIZE_TIMEOUT_MS
-            accountBrowseSession.lastStableFingerprint = ""
-            accountBrowseSession.stableSamples = 0
+            accountBrowseDeadlineAt = System.currentTimeMillis() + DETAIL_RESTABILIZE_TIMEOUT_MS
+            accountBrowseLastStableFingerprint = ""
+            accountBrowseStableSamples = 0
             scheduleAccountBrowseStep(PAGE_STATE_POLL_MS)
             return
         }
 
-        if (System.currentTimeMillis() >= accountBrowseSession.deadlineAt) {
+        if (System.currentTimeMillis() >= accountBrowseDeadlineAt) {
             pauseAccountBrowse("等待动态图片浏览页面返回原详情超时；没有执行返回或点击操作")
         } else {
             scheduleAccountBrowseStep(PAGE_STATE_POLL_MS)
@@ -1975,16 +2217,16 @@ class FreedomAccessibilityService : AccessibilityService() {
             runCatching { root.recycle() }
         }
 
-        val expectedActivity = accountBrowseSession.imageBrowserReturnActivityClass
-            .ifBlank { accountBrowseSession.detailActivityClass.ifBlank { MOMO_DYNAMIC_DETAIL_ACTIVITY } }
-        if (accountBrowseSession.currentActivityClass != expectedActivity || !identity.identityConfirmed) {
+        val expectedActivity = accountBrowseImageBrowserReturnActivityClass
+            .ifBlank { accountBrowseDetailActivityClass.ifBlank { MOMO_DYNAMIC_DETAIL_ACTIVITY } }
+        if (accountBrowseCurrentActivityClass != expectedActivity || !identity.identityConfirmed) {
             if (identity.isFeedPage) {
                 addLog("退出图片浏览器后已经回到动态列表；直接验证列表状态，不重复返回")
-                accountBrowseSession.imageBrowserActive = false
+                accountBrowseImageBrowserActive = false
                 accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_LIST_RETURN
-                accountBrowseSession.deadlineAt = System.currentTimeMillis() + LIST_RETURN_TIMEOUT_MS
-                accountBrowseSession.returnedStableSamples = 0
-                accountBrowseSession.lastReturnedSnapshot = ""
+                accountBrowseDeadlineAt = System.currentTimeMillis() + LIST_RETURN_TIMEOUT_MS
+                accountBrowseReturnedStableSamples = 0
+                accountBrowseLastReturnedSnapshot = ""
                 scheduleAccountBrowseStep(PAGE_STATE_POLL_MS)
                 return
             }
@@ -1995,15 +2237,15 @@ class FreedomAccessibilityService : AccessibilityService() {
         // The content fingerprint may change while images and text finish loading. Two
         // consecutive identity checks on the expected detail Activity are sufficient;
         // descendant equality is intentionally not required.
-        accountBrowseSession.stableSamples++
-        accountBrowseSession.detailFingerprint = identity.fingerprint.signature
-        accountBrowseSession.detailActivityClass = expectedActivity
-        if (accountBrowseSession.stableSamples >= REQUIRED_STABLE_PAGE_SAMPLES) {
-            accountBrowseSession.imageBrowserActive = false
-            accountBrowseSession.imageBrowserReturnActivityClass = ""
-            accountBrowseSession.detailDwellDueAt = System.currentTimeMillis() + accountBrowseSession.detailDwellRemainingMs
+        accountBrowseStableSamples++
+        accountBrowseDetailFingerprint = identity.fingerprint.signature
+        accountBrowseDetailActivityClass = expectedActivity
+        if (accountBrowseStableSamples >= REQUIRED_STABLE_PAGE_SAMPLES) {
+            accountBrowseImageBrowserActive = false
+            accountBrowseImageBrowserReturnActivityClass = ""
+            accountBrowseDetailDwellDueAt = System.currentTimeMillis() + accountBrowseDetailDwellRemainingMs
             accountBrowsePhase = AccountBrowsePhase.DETAIL_DWELL
-            val remaining = accountBrowseSession.detailDwellRemainingMs
+            val remaining = accountBrowseDetailDwellRemainingMs
             addLog(
                 "图片浏览器已返回原动态详情；页面身份连续 ${REQUIRED_STABLE_PAGE_SAMPLES} 次确认，" +
                     "内容节点变化不影响页面身份；继续剩余阅读时间 ${remaining / 1000.0} 秒"
@@ -2012,7 +2254,7 @@ class FreedomAccessibilityService : AccessibilityService() {
             return
         }
 
-        if (System.currentTimeMillis() >= accountBrowseSession.deadlineAt) {
+        if (System.currentTimeMillis() >= accountBrowseDeadlineAt) {
             beginDynamicNavigationRecovery("图片浏览器已退出，但原动态详情身份未能连续确认")
         } else {
             scheduleAccountBrowseStep(PAGE_STATE_POLL_MS)
@@ -2039,18 +2281,18 @@ class FreedomAccessibilityService : AccessibilityService() {
     /** True only when the current event matches an action Freedom itself submitted. */
     private fun isProgrammaticInteractionEvent(eventType: Int, now: Long): Boolean {
         if (eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED &&
-            (accountBrowseSession.gestureInFlight || accountBrowsePhase == AccountBrowsePhase.WAIT_FOR_SCROLL_SETTLE)
+            (accountBrowseGestureInFlight || accountBrowsePhase == AccountBrowsePhase.WAIT_FOR_SCROLL_SETTLE)
         ) {
             return true
         }
-        if (now >= accountBrowseSession.ignoreManualEventsUntil) return false
+        if (now >= accountBrowseIgnoreManualEventsUntil) return false
         return when {
             eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED &&
-                (accountBrowseSession.programmaticActionLabel.contains("滑动") ||
-                    accountBrowseSession.programmaticActionLabel.contains("滚动")) -> true
+                (accountBrowseProgrammaticActionLabel.contains("滑动") ||
+                    accountBrowseProgrammaticActionLabel.contains("滚动")) -> true
             eventType == AccessibilityEvent.TYPE_VIEW_CLICKED &&
-                (accountBrowseSession.programmaticActionLabel.contains("ACTION_CLICK") ||
-                    accountBrowseSession.programmaticActionLabel.contains("弹窗关闭")) -> true
+                (accountBrowseProgrammaticActionLabel.contains("ACTION_CLICK") ||
+                    accountBrowseProgrammaticActionLabel.contains("弹窗关闭")) -> true
             else -> false
         }
     }
@@ -2058,7 +2300,7 @@ class FreedomAccessibilityService : AccessibilityService() {
     private fun isDetailLoadContainerScroll(eventType: Int, className: String): Boolean =
         eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED &&
             accountBrowsePhase == AccountBrowsePhase.WAIT_FOR_DETAIL_LOAD &&
-            accountBrowseSession.currentActivityClass == MOMO_DYNAMIC_DETAIL_ACTIVITY &&
+            accountBrowseCurrentActivityClass == MOMO_DYNAMIC_DETAIL_ACTIVITY &&
             className.substringAfterLast('.') == "RecyclerView"
 
     private fun isNavigationVerificationScroll(eventType: Int, className: String): Boolean =
@@ -2075,7 +2317,7 @@ class FreedomAccessibilityService : AccessibilityService() {
             accountBrowsePhase == AccountBrowsePhase.WAIT_FOR_SCROLL_SETTLE ->
             "Freedom 自动滑动确认阶段的列表事件；仅凭列表事件无法区分系统手势反馈与同期手动滚动，不归类为用户操作"
         isProgrammaticInteractionEvent(eventType, now) ->
-            "${accountBrowseSession.programmaticActionLabel.ifBlank { "Freedom 自动动作" }}的系统回调；不按手动操作处理"
+            "${accountBrowseProgrammaticActionLabel.ifBlank { "Freedom 自动动作" }}的系统回调；不按手动操作处理"
         else ->
             "目标应用交互事件；未匹配到 Freedom 对应的自动动作窗口，作为用户手动操作候选"
     }
@@ -2129,7 +2371,7 @@ class FreedomAccessibilityService : AccessibilityService() {
             addLog("导航页面正在切换或加载；检测到 RecyclerView 滚动事件，但没有独立用户触摸证据，暂不触发暂停")
             return
         }
-        if (accountBrowseSession.imageBrowserActive ||
+        if (accountBrowseImageBrowserActive ||
             accountBrowsePhase == AccountBrowsePhase.WAIT_FOR_IMAGE_BROWSER_RETURN ||
             accountBrowsePhase == AccountBrowsePhase.WAIT_FOR_DETAIL_RESTABILIZE
         ) return
@@ -2137,9 +2379,9 @@ class FreedomAccessibilityService : AccessibilityService() {
         val eventName = AccessibilityEventFormatter.rawEventName(eventType)
         val target = sequenceOf(content, description, className).firstOrNull { it.isNotBlank() }
             ?.take(120) ?: "未提供控件文本"
-        val globalTouchRecent = now - accountBrowseSession.lastGlobalTouchEventAt <= GLOBAL_TOUCH_EVENT_ASSOCIATION_MS
+        val globalTouchRecent = now - accountBrowseLastGlobalTouchEventAt <= GLOBAL_TOUCH_EVENT_ASSOCIATION_MS
         val touchEvidence = if (globalTouchRecent) {
-            "附近收到全局触摸事件=${accountBrowseSession.lastGlobalTouchEventName}；事件来源=${accountBrowseSession.lastGlobalTouchEventOrigin.ifBlank { "未归类" }}"
+            "附近收到全局触摸事件=$accountBrowseLastGlobalTouchEventName；事件来源=${accountBrowseLastGlobalTouchEventOrigin.ifBlank { "未归类" }}"
         } else {
             "附近未收到 TYPE_TOUCH_INTERACTION_START/END；本次按目标应用控件事件推断用户操作，系统没有提供手指坐标"
         }
@@ -2147,7 +2389,7 @@ class FreedomAccessibilityService : AccessibilityService() {
         val reason = "检测到用户在操作屏幕（目标应用事件：$eventName；控件：${className.substringAfterLast('.')}；内容：$target）"
 
         addLog(
-            "$reason；Activity=${accountBrowseSession.currentActivityClass.ifBlank { "未知" }}；" +
+            "$reason；Activity=${accountBrowseCurrentActivityClass.ifBlank { "未知" }}；" +
                 "自动浏览阶段=${accountBrowsePhase.name}；${currentMonitorPageContext()}；$touchEvidence；$sourceDetails"
         )
         if (accountBrowsePhase != AccountBrowsePhase.PAUSED) {
@@ -2157,18 +2399,18 @@ class FreedomAccessibilityService : AccessibilityService() {
             )
         } else {
             accountBrowseController.recordManualTakeoverWhilePaused(
-                activityClass = accountBrowseSession.currentActivityClass,
-                sourceFingerprint = accountBrowseSession.sourceFingerprint,
-                detailFingerprint = accountBrowseSession.detailFingerprint,
-                imageBrowserActive = accountBrowseSession.imageBrowserActive,
-                lastProgrammaticAction = accountBrowseSession.programmaticActionLabel,
+                activityClass = accountBrowseCurrentActivityClass,
+                sourceFingerprint = accountBrowseSourceFingerprint,
+                detailFingerprint = accountBrowseDetailFingerprint,
+                imageBrowserActive = accountBrowseImageBrowserActive,
+                lastProgrammaticAction = accountBrowseProgrammaticActionLabel,
                 currentTimeMillis = { now }
             )
-            addLog("用户操作发生时自动浏览已处于安全暂停；原暂停原因=${accountBrowseSession.pauseReason.ifBlank { "未记录" }}；静默结束后重新分析页面层级并导航到动态标签")
+            addLog("用户操作发生时自动浏览已处于安全暂停；原暂停原因=${accountBrowsePauseReason.ifBlank { "未记录" }}；静默结束后重新分析页面层级并导航到动态标签")
         }
 
         mainHandler.removeCallbacks(manualTouchResumeRunnable)
-        if (accountBrowseSession.touchActive) {
+        if (accountBrowseTouchActive) {
             addLog("目标控件事件发生时全局触摸仍处于活动状态；暂不启动静默倒计时，等待 TYPE_TOUCH_INTERACTION_END")
         } else {
             addLog("已记录目标控件交互；最后一次操作后等待 ${MANUAL_TOUCH_RESUME_MS / 1000.0} 秒静默，再重新识别当前页面")
@@ -2199,22 +2441,22 @@ class FreedomAccessibilityService : AccessibilityService() {
         val isFeedList = returnState.first
         val currentSnapshot = returnState.second
 
-        if (isFeedList && isFeedPositionRestored(accountBrowseSession.sourceSnapshot, currentSnapshot)) {
-            if (currentSnapshot == accountBrowseSession.lastReturnedSnapshot) {
-                accountBrowseSession.returnedStableSamples++
+        if (isFeedList && isFeedPositionRestored(accountBrowseSourceSnapshot, currentSnapshot)) {
+            if (currentSnapshot == accountBrowseLastReturnedSnapshot) {
+                accountBrowseReturnedStableSamples++
             } else {
-                accountBrowseSession.lastReturnedSnapshot = currentSnapshot
-                accountBrowseSession.returnedStableSamples = 1
+                accountBrowseLastReturnedSnapshot = currentSnapshot
+                accountBrowseReturnedStableSamples = 1
             }
 
-            if (accountBrowseSession.returnedStableSamples >= REQUIRED_STABLE_PAGE_SAMPLES) {
-                accountBrowseSession.detailActivityClass = ""
-                accountBrowseSession.detailFingerprint = ""
-                accountBrowseSession.programmaticActionLabel = ""
+            if (accountBrowseReturnedStableSamples >= REQUIRED_STABLE_PAGE_SAMPLES) {
+                accountBrowseDetailActivityClass = ""
+                accountBrowseDetailFingerprint = ""
+                accountBrowseProgrammaticActionLabel = ""
                 accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_LIST_SCROLL
-                accountBrowseSession.returnedStableSamples = 0
-                accountBrowseSession.lastReturnedSnapshot = ""
-                accountBrowseSession.returnMismatchLogged = false
+                accountBrowseReturnedStableSamples = 0
+                accountBrowseLastReturnedSnapshot = ""
+                accountBrowseReturnMismatchLogged = false
                 val delay = randomScrollIntervalMs()
                 addLog(
                     "已返回原动态列表，位置快照连续 ${REQUIRED_STABLE_PAGE_SAMPLES} 次匹配；" +
@@ -2224,18 +2466,18 @@ class FreedomAccessibilityService : AccessibilityService() {
                 return
             }
         } else if (isFeedList) {
-            accountBrowseSession.returnedStableSamples = 0
-            accountBrowseSession.lastReturnedSnapshot = ""
-            if (!accountBrowseSession.returnMismatchLogged) {
+            accountBrowseReturnedStableSamples = 0
+            accountBrowseLastReturnedSnapshot = ""
+            if (!accountBrowseReturnMismatchLogged) {
                 addLog(
                     "已识别动态列表，但当前可见内容与打开动态前的位置快照不匹配；" +
                         "暂不继续滑动，等待列表位置恢复并稳定"
                 )
-                accountBrowseSession.returnMismatchLogged = true
+                accountBrowseReturnMismatchLogged = true
             }
         }
 
-        if (System.currentTimeMillis() >= accountBrowseSession.deadlineAt) {
+        if (System.currentTimeMillis() >= accountBrowseDeadlineAt) {
             pauseAccountBrowse(
                 if (isFeedList) {
                     "已返回动态列表，但无法确认恢复到打开动态前的位置；为避免跳过内容，已暂停"
@@ -2323,8 +2565,9 @@ class FreedomAccessibilityService : AccessibilityService() {
     }
 
     private fun refreshViews() {
-        sendBroadcast(Intent(MonitorActions.ACTION_REFRESH).setPackage(packageName))
-        MonitorOverlay.update(this)
+        if (refreshViewsQueued) return
+        refreshViewsQueued = true
+        mainHandler.postDelayed(refreshViewsRunnable, VIEW_REFRESH_INTERVAL_MS)
     }
 
     override fun onInterrupt() {
@@ -2336,7 +2579,9 @@ class FreedomAccessibilityService : AccessibilityService() {
         GestureTrailOverlay.clear()
         restoreMonitorOverlayTouchPassthrough()
         mainHandler.removeCallbacksAndMessages(null)
+        refreshViewsQueued = false
         accountBrowseScheduler.cancel()
+        MonitorStore.flushPendingLogs(this)
         scanQueued = false
         hideFirstSwipeCountdown()
         if (targetReceiverRegistered) {
@@ -2357,6 +2602,8 @@ class FreedomAccessibilityService : AccessibilityService() {
 
     companion object {
         private const val SCAN_DEBOUNCE_MS = 350L
+        private const val MIN_NODE_SCAN_INTERVAL_MS = 900L
+        private const val VIEW_REFRESH_INTERVAL_MS = 200L
 
         private const val ACCOUNT_BROWSE_PREFS = "freedom_main_ui"
         private const val ACCOUNT_BROWSE_KEY = "keep_account_mode_enabled"

@@ -124,12 +124,13 @@
 - 本地完成 reset 字段顺序与原 Service 逐项对照、Controller 独立 Kotlin 编译/行为顺序检查、引用和差异检查；当前环境没有 Android SDK/Gradle，未执行完整 `assembleDebug` 或真机回归，仍须通过 GitHub Actions 验证。
 
 
-## Stage 10 — 最终结构整理（2026-11-07）
+## Runtime performance — batched logs, coalesced overlay updates and selective scanning
 
-- 基线：用户上传的 `Freedom(20261107-131555).zip`，Git HEAD `f5203d9`，包含第九阶段尚未提交的工作区变更。
-- 从 `FreedomAccessibilityService.kt` 移除 53 个逐字段兼容代理属性；所有会话字段引用改为直接读取/写入 `accountBrowseSession.<field>`，该引用仍指向 `accountBrowseController.session` 唯一实例。
-- 保留 `accountBrowsePhase` 的单一代理，以确保写入继续经过 `AccountBrowseController.transitionTo()`；保留 `performAccountBrowseStep()` 对 `performStep()` 的 Service 入口。
-- 清理 `MainActivity.kt`、`MonitorOverlay.kt`、`ConfigPanel.kt` 和 Service 中由组件抽取遗留的未使用 imports。
-- 更新架构文档，明确 Service 的平台职责与 Controller 的阶段/会话职责边界。
-- 未改变字段类型/默认值、状态枚举、状态分派、pause/reset/recovery 顺序、Android 系统调用、计时常量、自动操作行为、Manifest、Gradle 配置或依赖。
-- 本地完成字段映射与引用检查、未使用 import 静态检查、XML 解析和源码差异审查。当前环境没有 Android SDK/Gradle，未执行完整 `assembleDebug` 或真机回归；需由 GitHub Actions 和设备完成最终验收。
+- `MonitorStore.addLog()` now appends to a bounded 300-entry in-memory deque. A dedicated background `HandlerThread` persists a snapshot of the latest entries in batches (350ms delay) to the app-private `freedom_event_logs.log` file. Existing SharedPreferences JSON logs are migrated once; log clear and lifecycle flush paths are retained. Settings and small configuration values remain in SharedPreferences; no Room/database dependency was introduced.
+- `MonitorOverlay.update()` coalesces concurrent refresh requests and caps rendering at approximately 5Hz (200ms minimum interval). `FreedomAccessibilityService.refreshViews()` similarly coalesces refresh broadcasts. Unchanged TextView text is not reassigned.
+- Added `AccessibilityEventPolicy` to separate ordinary events, page metadata changes and structural page changes. Ordinary events continue to be logged and sent through the existing manual-interaction fallback but do not schedule full BFS scans.
+- Window-state/window-list changes and structural subtree/pane changes can request scanning. Text-only metadata changes update the app/page hint without a full scan; click, text-input and scroll events do not independently request a tree traversal.
+- `requestNodeScan()` debounces structural requests by 350ms and enforces a 900ms minimum interval between scan starts.
+- `MonitorStore.updateAppPage()` writes only changed app/page values. `saveSnapshot()` compares the complete persisted snapshot and skips identical data; the scanner only logs and refreshes the overlay after a changed snapshot.
+- The BFS implementation, `MAX_NODES_PER_SCAN` (3000), `MAX_DISPLAY_NODES` (140), target-window root selection and AccessibilityNodeInfo recycling remain unchanged.
+- No Room, new Gradle dependency, permission, broadcast action or settings key was added.

@@ -8,9 +8,9 @@ Freedom 是一个基于 Android AccessibilityService 的原生 Kotlin 应用。�
 app/src/main/java/com/freedom/
 ├── MainActivity.kt                 # 主界面、运行启停、权限与系统文档导出入口
 ├── accessibility/
-│   ├── FreedomAccessibilityService.kt  # Android 无障碍生命周期、事件入口与平台操作执行
+│   ├── FreedomAccessibilityService.kt  # Android 无障碍生命周期、事件入口和自动浏览状态机
 │   ├── browse/                     # 陌陌适配与自动浏览协调（AccountBrowseController、AccountBrowseSessionState、Momo*）
-│   ├── event/                      # 无障碍事件描述格式化
+│   ├── event/                      # 事件描述格式化与事件处理策略分类
 │   ├── gesture/                    # 手势参数、设备采样计算与校准执行控制器
 │   ├── scan/                        # 无障碍节点树扫描和快照
 │   └── scheduling/                  # 自动浏览主流程单步调度
@@ -23,7 +23,7 @@ app/src/main/java/com/freedom/
     └── logs/                        # 运行记录展示与文本格式化
 ```
 
-`FreedomAccessibilityService` 负责 Android 无障碍生命周期、事件入口和平台操作；`AccountBrowseController` 拥有自动浏览阶段与会话状态，并协调暂停、恢复、重置和阶段分派。`AccountBrowseSessionState` 只保存本次会话的暂停/恢复上下文、页面与返回指纹、触摸接管、手势/滚动证据、导航和弹窗验证状态，不自行执行状态转换或 Android 操作。`MomoNavigationController` 只负责导航目标查找及低层无障碍点击/返回动作，不持有重试计数。其他页面识别、弹窗识别和手势规划组件只返回识别/规划结果。
+`FreedomAccessibilityService` 负责 Android 无障碍生命周期、事件入口和平台操作；`AccountBrowseController` 拥有当前浏览阶段、会话状态，并负责阶段到现有 Service 操作的分派。`AccountBrowseSessionState` 只保存本次会话的暂停/恢复上下文、页面与返回指纹、触摸接管、手势/滚动证据、导航和弹窗验证状态，不自行执行状态转换或 Android 操作。`MomoNavigationController` 只负责导航目标查找及低层无障碍点击/返回动作，不持有重试计数。其他页面识别、弹窗识别和手势规划组件只返回识别/规划结果。
 
 ## 构建
 
@@ -47,3 +47,12 @@ Freedom 需要用户主动开启无障碍服务和悬浮窗权限。前台伴随
 
 
 第五阶段新增 `accessibility/browse/MomoFeedGestureController.kt`，负责动态列表目标发现、可见节点快照、手势参数读取和滑动路径规划；真实手势派发及自动浏览状态机仍由无障碍服务负责。
+
+
+## 事件、日志与悬浮窗性能策略
+
+- 普通无障碍事件仍记录日志，但不再自动触发完整节点树 BFS。
+- 窗口切换/窗口结构变化事件才请求节点扫描；文本/描述类内容变化只更新页面提示，不默认启动 BFS。
+- 节点扫描请求经过 350ms 防抖，并至少间隔 900ms；扫描结果与上次快照完全相同时不重复写入 SharedPreferences，也不重复刷新悬浮窗。
+- 运行日志保存在最多 300 条的内存环形队列中，由后台单线程每批异步写入应用私有文件；旧 SharedPreferences JSON 日志会在首次读取时迁移。设置项仍使用 SharedPreferences，不引入 Room。
+- Service 的广播刷新与悬浮窗实际渲染均合并到最多约每秒 5 次；悬浮窗内容相同则跳过 TextView 文本赋值。

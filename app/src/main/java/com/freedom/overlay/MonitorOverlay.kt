@@ -3,12 +3,14 @@ package com.freedom.overlay
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.provider.Settings
 import android.view.Gravity
 import android.view.MotionEvent
@@ -27,6 +29,22 @@ import com.freedom.stability.MonitorKeepAliveService
 object MonitorOverlay {
 
     private val mainHandler = Handler(Looper.getMainLooper())
+    private val updateLock = Any()
+    private var pendingUpdateContext: Context? = null
+    private var updateScheduled = false
+    private var lastUpdateAt = 0L
+
+    private val updateRunnable = Runnable {
+        val context = synchronized(updateLock) {
+            updateScheduled = false
+            val latest = pendingUpdateContext
+            pendingUpdateContext = null
+            latest.also {
+                if (it != null) lastUpdateAt = SystemClock.uptimeMillis()
+            }
+        }
+        if (context != null) renderUpdate(context)
+    }
 
     private var windowManager: WindowManager? = null
     private var rootView: LinearLayout? = null
@@ -436,48 +454,74 @@ object MonitorOverlay {
             "可见=$visible，触摸穿透=$touchPassthrough"
     }
 
+    /**
+     * Coalesce frequent event-driven refreshes and cap actual overlay rendering at 5 Hz.
+     * While a refresh is pending, later calls replace the context but do not enqueue more work.
+     */
     fun update(context: Context) {
         val appContext = context.applicationContext
-        mainHandler.post {
-            if (!MonitorStore.isFloatingLogEnabled(appContext)) {
-                hide()
-                return@post
-            }
-            if (!attached) return@post
+        val delayMs: Long
+        synchronized(updateLock) {
+            pendingUpdateContext = appContext
+            if (updateScheduled) return
+            val elapsed = SystemClock.uptimeMillis() - lastUpdateAt
+            delayMs = (MIN_UPDATE_INTERVAL_MS - elapsed).coerceAtLeast(0L)
+            updateScheduled = true
+        }
+        mainHandler.postDelayed(updateRunnable, delayMs)
+    }
 
-            val snapshot = MonitorStore.snapshot(appContext)
-            val accessibilityEnabled = isAccessibilityEnabled(appContext)
-            val overlayAllowed = Build.VERSION.SDK_INT < 23 || Settings.canDrawOverlays(appContext)
-            val serviceState = when {
-                !accessibilityEnabled -> "异常（无障碍未授权）"
-                !overlayAllowed -> "异常（悬浮窗未授权）"
-                MonitorStore.isRunning(appContext) -> "运行中"
-                else -> "已停止"
-            }
-            statusView?.text = "服务状态：$serviceState"
-            appView?.text = snapshot.app
-            pageView?.text = snapshot.page
+    private fun renderUpdate(appContext: Context) {
+        if (!MonitorStore.isFloatingLogEnabled(appContext)) {
+            hide()
+            return
+        }
+        if (!attached) return
 
-            val showLogs = MonitorStore.isFloatingLogEnabled(appContext)
-            eventLabelView?.visibility = if (showLogs) View.VISIBLE else View.GONE
-            technicalDetailsButton?.visibility = if (showLogs) View.VISIBLE else View.GONE
-            eventView?.visibility = if (showLogs) View.VISIBLE else View.GONE
-            technicalDetailsButton?.text =
-                if (showTechnicalDetails) "收起技术详情" else "查看技术详情"
-            eventView?.text = formatLogLines(
+        val snapshot = MonitorStore.snapshot(appContext)
+        val accessibilityEnabled = isAccessibilityEnabled(appContext)
+        val overlayAllowed = Build.VERSION.SDK_INT < 23 || Settings.canDrawOverlays(appContext)
+        val serviceState = when {
+            !accessibilityEnabled -> "异常（无障碍未授权）"
+            !overlayAllowed -> "异常（悬浮窗未授权）"
+            MonitorStore.isRunning(appContext) -> "运行中"
+            else -> "已停止"
+        }
+        setTextIfChanged(statusView, "服务状态：$serviceState")
+        setTextIfChanged(appView, snapshot.app)
+        setTextIfChanged(pageView, snapshot.page)
+
+        val showLogs = MonitorStore.isFloatingLogEnabled(appContext)
+        eventLabelView?.visibility = if (showLogs) View.VISIBLE else View.GONE
+        technicalDetailsButton?.visibility = if (showLogs) View.VISIBLE else View.GONE
+        eventView?.visibility = if (showLogs) View.VISIBLE else View.GONE
+        setTextIfChanged(
+            technicalDetailsButton,
+            if (showTechnicalDetails) "收起技术详情" else "查看技术详情"
+        )
+        setTextIfChanged(
+            eventView,
+            formatLogLines(
                 MonitorStore.logs(appContext).takeLast(12),
                 showTechnicalDetails
             ).ifBlank { "等待目标应用产生事件……" }
+        )
 
-            nodeView?.text = buildString {
-                if (snapshot.nodes.isEmpty()) {
-                    append("尚无节点快照。进入目标应用并触发页面变化后，将显示系统公开的无障碍节点。")
-                } else {
-                    append(snapshot.nodes.joinToString("\n"))
-                    append("\n\n已访问 ${snapshot.visitedCount} 个节点；预览 ${snapshot.nodes.size} 个")
-                    if (snapshot.truncated) append("；达到单次扫描上限，结果可能不完整")
-                }
+        val nodeText = buildString {
+            if (snapshot.nodes.isEmpty()) {
+                append("尚无节点快照。进入目标应用并触发页面变化后，将显示系统公开的无障碍节点。")
+            } else {
+                append(snapshot.nodes.joinToString("\n"))
+                append("\n\n已访问 ${snapshot.visitedCount} 个节点；预览 ${snapshot.nodes.size} 个")
+                if (snapshot.truncated) append("；达到单次扫描上限，结果可能不完整")
             }
+        }
+        setTextIfChanged(nodeView, nodeText)
+    }
+
+    private fun setTextIfChanged(view: TextView?, value: String) {
+        if (view != null && view.text?.toString() != value) {
+            view.text = value
         }
     }
 
@@ -495,6 +539,12 @@ object MonitorOverlay {
     }
 
     private fun hideOnMainThread() {
+        mainHandler.removeCallbacks(updateRunnable)
+        synchronized(updateLock) {
+            pendingUpdateContext = null
+            updateScheduled = false
+            lastUpdateAt = 0L
+        }
         val viewToRemove = rootView
         val manager = windowManager
         val wasAttached = attached
@@ -650,5 +700,6 @@ object MonitorOverlay {
     private fun timestamp(): String =
         java.text.SimpleDateFormat("HH:mm:ss.SSS", java.util.Locale.getDefault()).format(java.util.Date())
 
+    private const val MIN_UPDATE_INTERVAL_MS = 200L
     private const val LOG_DETAIL_SEPARATOR = "\u001F"
 }
