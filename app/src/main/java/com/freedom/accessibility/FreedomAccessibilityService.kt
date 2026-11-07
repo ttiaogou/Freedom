@@ -47,6 +47,7 @@ class FreedomAccessibilityService : AccessibilityService() {
     private enum class AccountBrowsePhase {
         IDLE,
         WAIT_FOR_DYNAMIC_TAB,
+        VERIFY_NAVIGATION_ACTION,
         WAIT_FOR_FEED_STABLE,
         FIRST_SWIPE_COUNTDOWN,
         WAIT_FOR_LIST_SCROLL,
@@ -79,7 +80,27 @@ class FreedomAccessibilityService : AccessibilityService() {
 
     private data class DynamicTabRowEvidence(
         val contentTop: Int,
+        val diagnostic: String,
+        val dynamicBounds: Rect,
+        val dynamicSelected: Boolean,
+        val selectionKnown: Boolean
+    )
+
+    private data class HomeBottomNavEvidence(
+        val homeBounds: Rect,
+        val homeSelected: Boolean,
+        val selectionKnown: Boolean,
         val diagnostic: String
+    )
+
+    private data class ManualResumeContext(
+        val phaseName: String,
+        val activityClass: String,
+        val sourceFingerprint: String,
+        val detailFingerprint: String,
+        val imageBrowserActive: Boolean,
+        val lastProgrammaticAction: String,
+        val capturedAt: Long
     )
 
     private data class DynamicTabInspection(
@@ -142,6 +163,18 @@ class FreedomAccessibilityService : AccessibilityService() {
     private var accountBrowseLastGlobalTouchEventAt = 0L
     private var accountBrowseLastGlobalTouchEventName = ""
     private var accountBrowseLastGlobalTouchEventOrigin = ""
+    private var accountBrowsePausedContext: ManualResumeContext? = null
+    private var accountBrowseNavigationActionKey = ""
+    private var accountBrowseNavigationBeforeActivity = ""
+    private var accountBrowseNavigationBeforeFingerprint = ""
+    private var accountBrowseNavigationActionDeadlineAt = 0L
+    private var accountBrowseNavigationActionAttempts = 0
+    private var accountBrowseRecoveryBackAttempts = 0
+    private var accountBrowseRecoveryHomeClickAttempts = 0
+    private var accountBrowseRecoveryDynamicClickAttempts = 0
+    private var accountBrowseDynamicTabClickConfirmed = false
+    private var accountBrowseNotTargetForegroundLogged = false
+    private var accountBrowseRootUnavailableLogged = false
 
     // Device-only gesture calibration state. Calibration strokes are restricted to
     // Freedom's own calibration surface and never target the selected third-party app.
@@ -214,24 +247,33 @@ class FreedomAccessibilityService : AccessibilityService() {
             accountBrowseTouchActive -> addLog("手动恢复检查未执行：仍检测到屏幕触摸，继续等待用户操作结束")
             !MonitorStore.isRunning(this) -> addLog("手动恢复检查未执行：监听已停止")
             !isAccountBrowseModeEnabled() -> addLog("手动恢复检查未执行：自动浏览模式已关闭")
-            accountBrowseImageBrowserActive -> {
-                addLog("当前仍处于动态图片浏览页面；不重置详情流程，继续等待返回原动态详情")
-                accountBrowseManualResumeAllowed = false
-                scheduleAccountBrowseStep(PAGE_STATE_POLL_MS)
-            }
             else -> {
                 accountBrowseManualResumeAllowed = false
-                addLog("用户最后一次屏幕操作后已静默 ${MANUAL_TOUCH_RESUME_MS / 1000.0} 秒；开始重新识别当前页面")
-                accountBrowsePhase = AccountBrowsePhase.IDLE
+                val context = accountBrowsePausedContext
+                addLog(
+                    "用户最后一次屏幕操作后已静默 ${MANUAL_TOUCH_RESUME_MS / 1000.0} 秒；" +
+                        "开始基于暂停上下文重新分析当前页面；暂停前阶段=${context?.phaseName ?: "未知"}，" +
+                        "暂停前 Activity=${context?.activityClass?.ifBlank { "未知" } ?: "未知"}"
+                )
                 accountBrowsePauseReason = ""
                 accountBrowseSourceFingerprint = ""
                 accountBrowseDetailFingerprint = ""
-                startAccountBrowseIfNeeded()
-                if (accountBrowsePhase == AccountBrowsePhase.IDLE) {
-                    addLog("手动恢复检查未能启动页面识别；等待目标应用的下一次界面事件")
-                } else {
-                    addLog("手动恢复检查已启动；当前识别阶段=${accountBrowsePhase.name}，后续仍需通过动态标签和列表稳定性验证")
-                }
+                accountBrowseLastStableFingerprint = ""
+                accountBrowseStableSamples = 0
+                accountBrowseNavigationActionKey = ""
+                accountBrowseNavigationBeforeActivity = ""
+                accountBrowseNavigationBeforeFingerprint = ""
+                accountBrowseNavigationActionDeadlineAt = 0L
+                accountBrowseNavigationActionAttempts = 0
+                accountBrowseRecoveryBackAttempts = 0
+                accountBrowseRecoveryHomeClickAttempts = 0
+                accountBrowseRecoveryDynamicClickAttempts = 0
+                accountBrowseDynamicTabClickConfirmed = false
+                accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_DYNAMIC_TAB
+                accountBrowseDeadlineAt = System.currentTimeMillis() + INITIAL_DYNAMIC_TAB_WAIT_TIMEOUT_MS
+                accountBrowseLastDynamicTabWaitReason = ""
+                addLog("手动恢复已进入主动导航：先识别页面层级，再返回必要的上级页面，主动定位并验证‘动态’标签")
+                scheduleAccountBrowseStep(PAGE_STATE_POLL_MS)
             }
         }
     }
@@ -397,7 +439,18 @@ class FreedomAccessibilityService : AccessibilityService() {
                             )
                         } else {
                             accountBrowseManualResumeAllowed = true
-                            addLog("检测到用户正在操作屏幕；原暂停原因=${accountBrowsePauseReason.ifBlank { "未记录" }}；操作结束后只重新验证页面，不直接执行点击或滑动")
+                            if (accountBrowsePausedContext == null) {
+                                accountBrowsePausedContext = ManualResumeContext(
+                                    phaseName = "PAUSED",
+                                    activityClass = accountBrowseCurrentActivityClass,
+                                    sourceFingerprint = accountBrowseSourceFingerprint,
+                                    detailFingerprint = accountBrowseDetailFingerprint,
+                                    imageBrowserActive = accountBrowseImageBrowserActive,
+                                    lastProgrammaticAction = accountBrowseProgrammaticActionLabel,
+                                    capturedAt = System.currentTimeMillis()
+                                )
+                            }
+                            addLog("检测到用户正在操作屏幕；原暂停原因=${accountBrowsePauseReason.ifBlank { "未记录" }}；操作结束后重新分析页面层级并导航到动态标签")
                         }
                     }
                 }
@@ -501,7 +554,7 @@ class FreedomAccessibilityService : AccessibilityService() {
             if (content.isNotBlank()) add("事件文本=$content")
             if (description.isNotBlank()) add("内容描述=$description")
             if (isTrackedInteractionEvent(eventType)) {
-                add("操作来源判断=${classifyInteractionEventOrigin(eventType, now)}")
+                add("操作来源判断=${classifyInteractionEventOrigin(eventType, now, className)}")
                 add("当前 Activity=${accountBrowseCurrentActivityClass.ifBlank { "未知" }}")
                 add("自动浏览阶段=${accountBrowsePhase.name}")
                 add(accessibilitySourceDetails(event))
@@ -726,7 +779,10 @@ class FreedomAccessibilityService : AccessibilityService() {
             return
         }
         val root = runCatching { rootInActiveWindow }.getOrNull() ?: run {
-            addLog("恢复检查暂时无法读取当前前台页面；等待后续页面事件再次触发检查")
+            if (!accountBrowseRootUnavailableLogged) {
+                addLog("恢复检查暂时无法读取当前前台页面；等待后续页面事件再次触发检查")
+                accountBrowseRootUnavailableLogged = true
+            }
             return
         }
         val isTargetForeground = runCatching {
@@ -734,16 +790,21 @@ class FreedomAccessibilityService : AccessibilityService() {
         }.getOrDefault(false)
         runCatching { root.recycle() }
         if (!isTargetForeground) {
-            addLog("恢复检查发现当前前台不是陌陌；不会执行自动操作，等待进入陌陌后重新识别")
+            if (!accountBrowseNotTargetForegroundLogged) {
+                addLog("恢复检查发现当前前台不是陌陌；不会执行自动操作，等待进入陌陌后重新识别")
+                accountBrowseNotTargetForegroundLogged = true
+            }
             return
         }
+        accountBrowseNotTargetForegroundLogged = false
+        accountBrowseRootUnavailableLogged = false
 
         accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_DYNAMIC_TAB
         accountBrowseDeadlineAt = System.currentTimeMillis() + INITIAL_DYNAMIC_TAB_WAIT_TIMEOUT_MS
         accountBrowseLastDynamicTabWaitReason = ""
         accountBrowseLastStableFingerprint = ""
         accountBrowseStableSamples = 0
-        addLog("已检测到陌陌进入前台；等待首页顶部‘动态’标签被选中（最多等待 ${INITIAL_DYNAMIC_TAB_WAIT_TIMEOUT_MS / 1_000} 秒），之后再单独检查列表稳定性")
+        addLog("已检测到陌陌进入前台；开始识别页面层级并定位首页顶部‘动态’标签（最多 ${INITIAL_DYNAMIC_TAB_WAIT_TIMEOUT_MS / 1_000} 秒），进入后再验证列表稳定性")
         scheduleAccountBrowseStep(PAGE_STATE_POLL_MS)
     }
 
@@ -799,6 +860,18 @@ class FreedomAccessibilityService : AccessibilityService() {
         accountBrowseLastGlobalTouchEventAt = 0L
         accountBrowseLastGlobalTouchEventName = ""
         accountBrowseLastGlobalTouchEventOrigin = ""
+        accountBrowsePausedContext = null
+        accountBrowseNavigationActionKey = ""
+        accountBrowseNavigationBeforeActivity = ""
+        accountBrowseNavigationBeforeFingerprint = ""
+        accountBrowseNavigationActionDeadlineAt = 0L
+        accountBrowseNavigationActionAttempts = 0
+        accountBrowseRecoveryBackAttempts = 0
+        accountBrowseRecoveryHomeClickAttempts = 0
+        accountBrowseRecoveryDynamicClickAttempts = 0
+        accountBrowseDynamicTabClickConfirmed = false
+        accountBrowseNotTargetForegroundLogged = false
+        accountBrowseRootUnavailableLogged = false
         hideFirstSwipeCountdown()
     }
 
@@ -806,6 +879,23 @@ class FreedomAccessibilityService : AccessibilityService() {
         reason: String,
         allowManualResume: Boolean = false
     ) {
+        if (allowManualResume && accountBrowsePhase != AccountBrowsePhase.PAUSED) {
+            accountBrowsePausedContext = ManualResumeContext(
+                phaseName = accountBrowsePhase.name,
+                activityClass = accountBrowseCurrentActivityClass,
+                sourceFingerprint = accountBrowseSourceFingerprint,
+                detailFingerprint = accountBrowseDetailFingerprint,
+                imageBrowserActive = accountBrowseImageBrowserActive,
+                lastProgrammaticAction = accountBrowseProgrammaticActionLabel,
+                capturedAt = System.currentTimeMillis()
+            )
+            addLog(
+                "已保存暂停上下文：阶段=${accountBrowsePhase.name}；" +
+                    "Activity=${accountBrowseCurrentActivityClass.ifBlank { "未知" }}；" +
+                    "详情上下文=${if (accountBrowseDetailFingerprint.isNotBlank()) "已保存" else "无"}；" +
+                    "图片浏览状态=$accountBrowseImageBrowserActive"
+            )
+        }
         GestureTrailOverlay.clear()
         restoreMonitorOverlayTouchPassthrough()
         mainHandler.removeCallbacks(accountBrowseRunnable)
@@ -833,6 +923,7 @@ class FreedomAccessibilityService : AccessibilityService() {
             AccountBrowsePhase.IDLE,
             AccountBrowsePhase.PAUSED -> return
             AccountBrowsePhase.WAIT_FOR_DYNAMIC_TAB -> waitForMomoDynamicTab()
+            AccountBrowsePhase.VERIFY_NAVIGATION_ACTION -> verifyNavigationAction()
             AccountBrowsePhase.WAIT_FOR_FEED_STABLE -> waitForMomoFeedStable()
             AccountBrowsePhase.FIRST_SWIPE_COUNTDOWN -> runFirstSwipeCountdown()
             AccountBrowsePhase.WAIT_FOR_LIST_SCROLL -> performFeedScroll()
@@ -847,7 +938,10 @@ class FreedomAccessibilityService : AccessibilityService() {
         }
     }
 
-    /** Wait for the user to enter the Dynamic tab, with its own bounded timeout. */
+    /**
+     * Analyze the current Momo page and actively navigate to Home -> Dynamic.
+     * A click or Back is never treated as successful until the next page inspection verifies it.
+     */
     private fun waitForMomoDynamicTab() {
         val root = runCatching { rootInActiveWindow }.getOrNull()
         var reason = "暂时无法读取当前页面"
@@ -856,21 +950,124 @@ class FreedomAccessibilityService : AccessibilityService() {
                 val activePackage = runCatching { root.packageName?.toString().orEmpty() }
                     .getOrDefault("")
                 if (activePackage != MOMO_PACKAGE) {
-                    reason = "陌陌当前不在前台"
+                    reason = "陌陌当前不在前台；保留导航上下文，不对其他应用执行操作"
                 } else {
+                    accountBrowseNotTargetForegroundLogged = false
+                    accountBrowseRootUnavailableLogged = false
+
                     val tabInspection = inspectDynamicTabRow(root)
-                    val evidence = tabInspection.evidence
-                    if (evidence != null) {
-                        accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_FEED_STABLE
-                        accountBrowseDeadlineAt = System.currentTimeMillis() + INITIAL_FEED_STABILITY_TIMEOUT_MS
-                        accountBrowseLastDynamicTabWaitReason = ""
-                        accountBrowseLastStableFingerprint = ""
-                        accountBrowseStableSamples = 0
-                        addLog("已确认陌陌首页顶部‘动态’标签；现在开始独立等待动态列表稳定（最多 ${INITIAL_FEED_STABILITY_TIMEOUT_MS / 1_000} 秒）。${evidence.diagnostic}")
-                        scheduleAccountBrowseStep(PAGE_STATE_POLL_MS)
-                        return
+                    val tabEvidence = tabInspection.evidence
+                    if (tabEvidence != null) {
+                        if (tabEvidence.selectionKnown && !tabEvidence.dynamicSelected) {
+                            val dynamicTarget = findClickableNodeForLabel(
+                                root = root,
+                                label = MOMO_DYNAMIC_TAB_LABEL,
+                                expectedBounds = tabEvidence.dynamicBounds,
+                                minCenterY = 0,
+                                maxCenterY = (resources.displayMetrics.heightPixels * DYNAMIC_TAB_UPPER_BAND_RATIO).toInt()
+                            )
+                            if (dynamicTarget != null) {
+                                submitNavigationClick(
+                                    root = root,
+                                    target = dynamicTarget,
+                                    actionKey = NAV_ACTION_DYNAMIC_TAB,
+                                    actionDescription = "首页顶部‘动态’标签"
+                                )
+                                return
+                            }
+                            reason = "已确认首页顶部动态导航行，但没有找到可安全点击的‘动态’控件"
+                        } else {
+                            val readiness = inspectMomoFeedReadiness(root)
+                            val shouldVerifyUnknownSelectionByClick =
+                                !tabEvidence.selectionKnown &&
+                                    !accountBrowseDynamicTabClickConfirmed &&
+                                    accountBrowseRecoveryDynamicClickAttempts < MAX_RECOVERY_TAB_CLICK_ATTEMPTS
+                            if (shouldVerifyUnknownSelectionByClick) {
+                                val dynamicTarget = findClickableNodeForLabel(
+                                    root = root,
+                                    label = MOMO_DYNAMIC_TAB_LABEL,
+                                    expectedBounds = tabEvidence.dynamicBounds,
+                                    minCenterY = 0,
+                                    maxCenterY = (resources.displayMetrics.heightPixels * DYNAMIC_TAB_UPPER_BAND_RATIO).toInt()
+                                )
+                                if (dynamicTarget != null) {
+                                    addLog("动态标签选中状态未被系统明确暴露；为确保进入目标页，主动点击已由同排导航结构确认的‘动态’并验证结果")
+                                    submitNavigationClick(
+                                        root = root,
+                                        target = dynamicTarget,
+                                        actionKey = NAV_ACTION_DYNAMIC_TAB,
+                                        actionDescription = "首页顶部‘动态’标签"
+                                    )
+                                    return
+                                }
+                                reason = "已找到首页顶部动态导航行，但动态标签没有安全可点击的节点；不把当前列表直接认定为目标页"
+                            }
+                            if (readiness.fingerprint != null &&
+                                (tabEvidence.selectionKnown || accountBrowseDynamicTabClickConfirmed)
+                            ) {
+                                accountBrowseImageBrowserActive = false
+                                accountBrowseImageBrowserReturnActivityClass = ""
+                                accountBrowseDetailDwellDueAt = 0L
+                                accountBrowseDetailDwellRemainingMs = 0L
+                                accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_FEED_STABLE
+                                accountBrowseDeadlineAt = System.currentTimeMillis() + INITIAL_FEED_STABILITY_TIMEOUT_MS
+                                accountBrowseLastDynamicTabWaitReason = ""
+                                accountBrowseLastStableFingerprint = ""
+                                accountBrowseStableSamples = 0
+                                addLog(
+                                    "已确认当前位于陌陌动态列表；现在独立等待列表稳定（最多 ${INITIAL_FEED_STABILITY_TIMEOUT_MS / 1_000} 秒）。" +
+                                        readiness.reason
+                                )
+                                scheduleAccountBrowseStep(PAGE_STATE_POLL_MS)
+                                return
+                            }
+                            if (!shouldVerifyUnknownSelectionByClick || accountBrowseDynamicTabClickConfirmed) {
+                                reason = readiness.reason
+                            }
+                        }
+                    } else {
+                        val homeEvidence = inspectHomeBottomNav(root)
+                        if (homeEvidence != null) {
+                            val homeTarget = findClickableNodeForLabel(
+                                root = root,
+                                label = MOMO_HOME_TAB_LABEL,
+                                expectedBounds = homeEvidence.homeBounds,
+                                minCenterY = (resources.displayMetrics.heightPixels * HOME_NAV_LOWER_BAND_RATIO).toInt(),
+                                maxCenterY = resources.displayMetrics.heightPixels
+                            )
+                            if (homeTarget != null) {
+                                if (homeEvidence.selectionKnown && homeEvidence.homeSelected) {
+                                    reason = "已确认底部‘首页’处于选中状态，但首页顶部动态导航行尚未出现；等待页面内容加载"
+                                } else {
+                                    submitNavigationClick(
+                                        root = root,
+                                        target = homeTarget,
+                                        actionKey = NAV_ACTION_HOME_TAB,
+                                        actionDescription = "陌陌底部‘首页’标签"
+                                    )
+                                    return
+                                }
+                            } else {
+                                reason = "识别到陌陌底部‘首页’导航，但没有找到可安全点击的控件"
+                            }
+                        } else if (isKnownMomoChildPage()) {
+                            if (accountBrowseRecoveryBackAttempts >= MAX_RECOVERY_BACK_STEPS) {
+                                pauseAccountBrowse("已连续返回 $MAX_RECOVERY_BACK_STEPS 次，仍无法识别动态标签页；停止导航以避免误退出陌陌")
+                                return
+                            }
+                            submitNavigationBack(root)
+                            return
+                        } else {
+                            reason = when {
+                                accountBrowseCurrentActivityClass == MOMO_MAIN_ACTIVITY ->
+                                    "当前位于陌陌主 Activity，但无障碍节点暂未暴露可验证的首页/动态导航控件"
+                                accountBrowseCurrentActivityClass.isBlank() ->
+                                    "尚未取得可靠的陌陌 Activity 信息，也没有识别到动态导航行或底部首页导航"
+                                else ->
+                                    "当前页面层级无法确认；不执行猜测性返回或点击"
+                            }
+                        }
                     }
-                    reason = tabInspection.reason
                 }
             } finally {
                 runCatching { root.recycle() }
@@ -879,16 +1076,358 @@ class FreedomAccessibilityService : AccessibilityService() {
 
         if (reason != accountBrowseLastDynamicTabWaitReason) {
             accountBrowseLastDynamicTabWaitReason = reason
-            addLog("等待进入陌陌动态页面：$reason；尚未执行任何自动滑动或点击")
+            addLog("主动导航分析：$reason")
+        }
+        if (accountBrowsePausedContext != null) {
+            // Manual recovery remains pending while the app/page is unavailable or unknown.
+            // Keep analyzing at a low frequency; do not guess-click or give up after a timeout.
+            accountBrowseDeadlineAt = System.currentTimeMillis() + INITIAL_DYNAMIC_TAB_WAIT_TIMEOUT_MS
+            scheduleAccountBrowseStep(1_000L)
+            return
         }
         if (System.currentTimeMillis() >= accountBrowseDeadlineAt) {
-            pauseAccountBrowse("等待进入陌陌动态页面超时；没有执行任何自动操作，请手动切换到首页顶部‘动态’标签后重新启动")
+            pauseAccountBrowse("主动导航动态标签超时；当前页面未能被可靠识别，没有执行滑动或动态卡片点击")
         } else {
             scheduleAccountBrowseStep(PAGE_STATE_POLL_MS)
         }
     }
 
-    /** Wait until the selected Dynamic tab's visible feed list is ready and stable. */
+    private fun isKnownMomoChildPage(): Boolean {
+        val activity = accountBrowseCurrentActivityClass
+        return activity.isNotBlank() &&
+            activity != MOMO_MAIN_ACTIVITY &&
+            activity != packageName
+    }
+
+    private fun submitNavigationClick(
+        root: AccessibilityNodeInfo,
+        target: AccessibilityNodeInfo,
+        actionKey: String,
+        actionDescription: String
+    ) {
+        val targetBounds = Rect()
+        runCatching { target.getBoundsInScreen(targetBounds) }
+        val beforeFingerprint = pageFingerprint(root).signature
+        val beforeActivity = accountBrowseCurrentActivityClass
+        val attempt = when (actionKey) {
+            NAV_ACTION_DYNAMIC_TAB -> ++accountBrowseRecoveryDynamicClickAttempts
+            NAV_ACTION_HOME_TAB -> ++accountBrowseRecoveryHomeClickAttempts
+            else -> 1
+        }
+        val maxAttempts = if (actionKey == NAV_ACTION_DYNAMIC_TAB) {
+            MAX_RECOVERY_TAB_CLICK_ATTEMPTS
+        } else {
+            MAX_RECOVERY_HOME_CLICK_ATTEMPTS
+        }
+        if (attempt > maxAttempts) {
+            runCatching { target.recycle() }
+            pauseAccountBrowse("导航控件‘$actionDescription’连续 $maxAttempts 次未能验证进入；已停止重复点击")
+            return
+        }
+
+        accountBrowseProgrammaticActionLabel = "Freedom ACTION_CLICK $actionDescription"
+        accountBrowseIgnoreManualEventsUntil = System.currentTimeMillis() + NAVIGATION_ACTION_EVENT_WINDOW_MS
+        val clicked = try {
+            target.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+        } catch (_: Exception) {
+            false
+        } finally {
+            runCatching { target.recycle() }
+        }
+        if (!clicked) {
+            pauseAccountBrowse("系统未接受‘$actionDescription’的无障碍点击；没有继续尝试其他控件")
+            return
+        }
+
+        accountBrowseNavigationActionKey = actionKey
+        accountBrowseNavigationBeforeActivity = beforeActivity
+        accountBrowseNavigationBeforeFingerprint = beforeFingerprint
+        accountBrowseNavigationActionAttempts = attempt
+        accountBrowseNavigationActionDeadlineAt = System.currentTimeMillis() + NAVIGATION_ACTION_VERIFY_TIMEOUT_MS
+        accountBrowsePhase = AccountBrowsePhase.VERIFY_NAVIGATION_ACTION
+        addLog(
+            "已向‘$actionDescription’提交无障碍点击（第 $attempt/$maxAttempts 次）；" +
+                "目标控件范围=${if (targetBounds.isEmpty) "系统未提供" else targetBounds.toShortString()}；" +
+                "等待重新扫描页面并验证导航结果，不会直接假定点击成功"
+        )
+        scheduleAccountBrowseStep(NAVIGATION_ACTION_VERIFY_POLL_MS)
+    }
+
+    private fun submitNavigationBack(root: AccessibilityNodeInfo) {
+        val beforeFingerprint = pageFingerprint(root).signature
+        val beforeActivity = accountBrowseCurrentActivityClass
+        accountBrowseRecoveryBackAttempts++
+        accountBrowseProgrammaticActionLabel = "Freedom GLOBAL_ACTION_BACK 页面层级返回"
+        accountBrowseIgnoreManualEventsUntil = System.currentTimeMillis() + NAVIGATION_ACTION_EVENT_WINDOW_MS
+        val accepted = runCatching { performGlobalAction(GLOBAL_ACTION_BACK) }.getOrDefault(false)
+        if (!accepted) {
+            pauseAccountBrowse("当前已识别为陌陌子页面，但系统未接受返回操作；停止自动导航")
+            return
+        }
+
+        accountBrowseNavigationActionKey = NAV_ACTION_BACK
+        accountBrowseNavigationBeforeActivity = beforeActivity
+        accountBrowseNavigationBeforeFingerprint = beforeFingerprint
+        accountBrowseNavigationActionAttempts = accountBrowseRecoveryBackAttempts
+        accountBrowseNavigationActionDeadlineAt = System.currentTimeMillis() + NAVIGATION_ACTION_VERIFY_TIMEOUT_MS
+        accountBrowsePhase = AccountBrowsePhase.VERIFY_NAVIGATION_ACTION
+        addLog(
+            "当前页面识别为陌陌子页面（Activity=${beforeActivity.ifBlank { "未知" }}）；" +
+                "已提交第 $accountBrowseRecoveryBackAttempts/$MAX_RECOVERY_BACK_STEPS 次返回；" +
+                "等待验证返回后的页面层级"
+        )
+        scheduleAccountBrowseStep(NAVIGATION_ACTION_VERIFY_POLL_MS)
+    }
+
+    private fun verifyNavigationAction() {
+        val root = runCatching { rootInActiveWindow }.getOrNull()
+        if (root == null) {
+            if (System.currentTimeMillis() >= accountBrowseNavigationActionDeadlineAt) {
+                accountBrowseNavigationActionKey = ""
+                accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_DYNAMIC_TAB
+            }
+            scheduleAccountBrowseStep(PAGE_STATE_POLL_MS)
+            return
+        }
+
+        val activePackage = runCatching { root.packageName?.toString().orEmpty() }.getOrDefault("")
+        if (activePackage != MOMO_PACKAGE) {
+            runCatching { root.recycle() }
+            if (System.currentTimeMillis() >= accountBrowseNavigationActionDeadlineAt) {
+                accountBrowseNavigationActionKey = ""
+                accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_DYNAMIC_TAB
+            }
+            scheduleAccountBrowseStep(PAGE_STATE_POLL_MS)
+            return
+        }
+
+        val currentActivity = accountBrowseCurrentActivityClass
+        val currentFingerprint = try {
+            pageFingerprint(root).signature
+        } finally {
+            runCatching { root.recycle() }
+        }
+        val actionKey = accountBrowseNavigationActionKey
+        val tabEvidence = if (actionKey == NAV_ACTION_DYNAMIC_TAB) {
+            val freshRoot = runCatching { rootInActiveWindow }.getOrNull()
+            if (freshRoot == null) null else try {
+                inspectDynamicTabRow(freshRoot).evidence
+            } finally {
+                runCatching { freshRoot.recycle() }
+            }
+        } else null
+        val feedConfirmed = if (actionKey == NAV_ACTION_DYNAMIC_TAB || actionKey == NAV_ACTION_HOME_TAB) {
+            val freshRoot = runCatching { rootInActiveWindow }.getOrNull()
+            if (freshRoot == null) false else try {
+                isMomoDynamicFeedPage(freshRoot)
+            } finally {
+                runCatching { freshRoot.recycle() }
+            }
+        } else false
+
+        val structureChanged = currentActivity != accountBrowseNavigationBeforeActivity ||
+            currentFingerprint != accountBrowseNavigationBeforeFingerprint
+        val backPageEvidence = if (actionKey == NAV_ACTION_BACK) {
+            val freshRoot = runCatching { rootInActiveWindow }.getOrNull()
+            if (freshRoot == null) false else try {
+                inspectDynamicTabRow(freshRoot).evidence != null ||
+                    inspectHomeBottomNav(freshRoot) != null ||
+                    (accountBrowseImageBrowserActive &&
+                        currentActivity == accountBrowseImageBrowserReturnActivityClass)
+            } finally {
+                runCatching { freshRoot.recycle() }
+            }
+        } else false
+        val confirmed = when (actionKey) {
+            NAV_ACTION_DYNAMIC_TAB -> feedConfirmed ||
+                (tabEvidence?.let { it.selectionKnown && it.dynamicSelected } == true) ||
+                (tabEvidence != null && structureChanged)
+            NAV_ACTION_HOME_TAB -> feedConfirmed || tabEvidence != null || structureChanged
+            NAV_ACTION_BACK -> currentActivity != accountBrowseNavigationBeforeActivity ||
+                (currentFingerprint != accountBrowseNavigationBeforeFingerprint && backPageEvidence)
+            else -> false
+        }
+
+        if (confirmed) {
+            if (actionKey == NAV_ACTION_DYNAMIC_TAB) {
+                accountBrowseDynamicTabClickConfirmed = true
+            }
+            addLog("导航结果已验证：动作=$actionKey；Activity=${currentActivity.ifBlank { "未知" }}；页面结构已重新识别")
+            accountBrowseNavigationActionKey = ""
+            accountBrowseNavigationBeforeActivity = ""
+            accountBrowseNavigationBeforeFingerprint = ""
+            accountBrowseNavigationActionDeadlineAt = 0L
+            accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_DYNAMIC_TAB
+            accountBrowseLastDynamicTabWaitReason = ""
+            scheduleAccountBrowseStep(PAGE_STATE_POLL_MS)
+            return
+        }
+
+        if (System.currentTimeMillis() >= accountBrowseNavigationActionDeadlineAt) {
+            val attempts = accountBrowseNavigationActionAttempts
+            val maxAttempts = when (actionKey) {
+                NAV_ACTION_BACK -> MAX_RECOVERY_BACK_STEPS
+                NAV_ACTION_HOME_TAB -> MAX_RECOVERY_HOME_CLICK_ATTEMPTS
+                NAV_ACTION_DYNAMIC_TAB -> MAX_RECOVERY_TAB_CLICK_ATTEMPTS
+                else -> 1
+            }
+            addLog("导航结果未得到确认：动作=$actionKey；页面仍未出现可验证变化（$attempts/$maxAttempts 次）；重新分析当前页面后再决定下一步")
+            accountBrowseNavigationActionKey = ""
+            accountBrowseNavigationBeforeActivity = ""
+            accountBrowseNavigationBeforeFingerprint = ""
+            accountBrowseNavigationActionDeadlineAt = 0L
+            accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_DYNAMIC_TAB
+            if (attempts >= maxAttempts && actionKey != NAV_ACTION_BACK) {
+                pauseAccountBrowse("导航动作 $actionKey 连续 $maxAttempts 次未验证成功；已停止重复点击")
+                return
+            }
+            if (actionKey == NAV_ACTION_BACK && accountBrowseRecoveryBackAttempts >= MAX_RECOVERY_BACK_STEPS) {
+                pauseAccountBrowse("连续返回 $MAX_RECOVERY_BACK_STEPS 次后仍未能确认页面层级；已停止自动导航")
+                return
+            }
+            scheduleAccountBrowseStep(NAVIGATION_ACTION_RETRY_DELAY_MS)
+            return
+        }
+
+        scheduleAccountBrowseStep(PAGE_STATE_POLL_MS)
+    }
+
+    private fun inspectHomeBottomNav(root: AccessibilityNodeInfo): HomeBottomNavEvidence? {
+        val lowerBandTop = (resources.displayMetrics.heightPixels * HOME_NAV_LOWER_BAND_RATIO).toInt()
+        val rowTolerance = maxOf(dp(DYNAMIC_TAB_ROW_TOLERANCE_DP), (resources.displayMetrics.heightPixels * 0.04f).toInt())
+        val labels = ArrayList<TabLabelEvidence>()
+        val queue = ArrayDeque<Pair<AccessibilityNodeInfo, Boolean>>()
+        queue.add(AccessibilityNodeInfo.obtain(root) to false)
+        var visited = 0
+        try {
+            while (queue.isNotEmpty() && visited < PAGE_FINGERPRINT_MAX_NODES) {
+                val (node, selectedInPath) = queue.removeFirst()
+                visited++
+                try {
+                    val selected = selectedInPath || node.isSelected || node.isChecked
+                    val bounds = Rect()
+                    runCatching { node.getBoundsInScreen(bounds) }
+                    val text = runCatching { node.text?.toString()?.trim().orEmpty() }.getOrDefault("")
+                    val description = runCatching { node.contentDescription?.toString()?.trim().orEmpty() }
+                        .getOrDefault("")
+                    val label = when {
+                        text in MOMO_HOME_NAV_LABELS -> text
+                        description in MOMO_HOME_NAV_LABELS -> description
+                        else -> ""
+                    }
+                    if (label.isNotEmpty() && node.isVisibleToUser && bounds.width() > 0 &&
+                        bounds.height() > 0 && bounds.centerY() >= lowerBandTop
+                    ) {
+                        labels.add(TabLabelEvidence(label, Rect(bounds), selected))
+                    }
+                    val childCount = runCatching { node.childCount }.getOrDefault(0)
+                    for (index in 0 until childCount) {
+                        if (visited + queue.size >= PAGE_FINGERPRINT_MAX_NODES) break
+                        val child = runCatching { node.getChild(index) }.getOrNull() ?: continue
+                        queue.add(child to selected)
+                    }
+                } finally {
+                    runCatching { node.recycle() }
+                }
+            }
+        } finally {
+            while (queue.isNotEmpty()) runCatching { queue.removeFirst().first.recycle() }
+        }
+
+        val homeLabels = labels.filter { it.label == MOMO_HOME_TAB_LABEL }
+        for (home in homeLabels) {
+            val peerLabels = labels.filter {
+                it.label != MOMO_HOME_TAB_LABEL &&
+                    kotlin.math.abs(it.bounds.centerY() - home.bounds.centerY()) <= rowTolerance
+            }
+            if (peerLabels.isEmpty()) continue
+            val selectedLabels = (listOf(home) + peerLabels).filter { it.selected }.map { it.label }.distinct()
+            val selectionKnown = selectedLabels.size == 1
+            val homeSelected = selectionKnown && selectedLabels.single() == MOMO_HOME_TAB_LABEL
+            return HomeBottomNavEvidence(
+                homeBounds = Rect(home.bounds),
+                homeSelected = homeSelected,
+                selectionKnown = selectionKnown,
+                diagnostic = if (selectionKnown) {
+                    "底部导航选中项=${selectedLabels.single()}"
+                } else {
+                    "底部导航存在，但选中状态未能唯一确认"
+                }
+            )
+        }
+        return null
+    }
+
+    private fun findClickableNodeForLabel(
+        root: AccessibilityNodeInfo,
+        label: String,
+        expectedBounds: Rect,
+        minCenterY: Int,
+        maxCenterY: Int
+    ): AccessibilityNodeInfo? {
+        val queue = ArrayDeque<AccessibilityNodeInfo>()
+        queue.add(AccessibilityNodeInfo.obtain(root))
+        var visited = 0
+        try {
+            while (queue.isNotEmpty() && visited < PAGE_FINGERPRINT_MAX_NODES) {
+                val node = queue.removeFirst()
+                visited++
+                try {
+                    val bounds = Rect()
+                    runCatching { node.getBoundsInScreen(bounds) }
+                    val text = runCatching { node.text?.toString()?.trim().orEmpty() }.getOrDefault("")
+                    val description = runCatching { node.contentDescription?.toString()?.trim().orEmpty() }
+                        .getOrDefault("")
+                    val nodeLabel = text.ifBlank { description }
+                    val sameTarget = nodeLabel == label && node.isVisibleToUser &&
+                        bounds.width() > 0 && bounds.height() > 0 &&
+                        bounds.centerY() in minCenterY..maxCenterY &&
+                        kotlin.math.abs(bounds.centerX() - expectedBounds.centerX()) <= dp(TAB_TARGET_MATCH_TOLERANCE_DP) &&
+                        kotlin.math.abs(bounds.centerY() - expectedBounds.centerY()) <= dp(TAB_TARGET_MATCH_TOLERANCE_DP)
+                    if (sameTarget) {
+                        val clickable = findClickableAncestor(node, bounds)
+                        if (clickable != null) return clickable
+                    }
+                    val childCount = runCatching { node.childCount }.getOrDefault(0)
+                    for (index in 0 until childCount) {
+                        if (visited + queue.size >= PAGE_FINGERPRINT_MAX_NODES) break
+                        val child = runCatching { node.getChild(index) }.getOrNull() ?: continue
+                        queue.add(child)
+                    }
+                } finally {
+                    runCatching { node.recycle() }
+                }
+            }
+        } finally {
+            while (queue.isNotEmpty()) runCatching { queue.removeFirst().recycle() }
+        }
+        return null
+    }
+
+    private fun findClickableAncestor(
+        node: AccessibilityNodeInfo,
+        labelBounds: Rect
+    ): AccessibilityNodeInfo? {
+        var current: AccessibilityNodeInfo? = AccessibilityNodeInfo.obtain(node)
+        val maxWidth = (resources.displayMetrics.widthPixels * 0.98f).toInt()
+        val maxHeight = (resources.displayMetrics.heightPixels * MAX_TAB_CLICK_TARGET_HEIGHT_RATIO).toInt()
+        repeat(MAX_TAB_CLICK_ANCESTOR_DEPTH) {
+            val candidate = current ?: return null
+            val bounds = Rect()
+            runCatching { candidate.getBoundsInScreen(bounds) }
+            val usable = candidate.isVisibleToUser && candidate.isClickable &&
+                bounds.width() > 0 && bounds.width() <= maxWidth &&
+                bounds.height() > 0 && bounds.height() <= maxHeight &&
+                bounds.contains(labelBounds)
+            if (usable) return candidate
+            val parent = runCatching { candidate.parent }.getOrNull()
+            runCatching { candidate.recycle() }
+            current = parent
+        }
+        runCatching { current?.recycle() }
+        return null
+    }
+
     private fun waitForMomoFeedStable() {
         val root = runCatching { rootInActiveWindow }.getOrNull()
         if (root == null) {
@@ -927,6 +1466,10 @@ class FreedomAccessibilityService : AccessibilityService() {
 
         if (accountBrowseStableSamples >= REQUIRED_STABLE_FEED_SAMPLES) {
             accountBrowseSwipeCount = 0
+            if (accountBrowsePausedContext != null) {
+                addLog("暂停上下文已完成校验：当前动态列表连续稳定；恢复后先执行新的列表滑动，再选择动态，避免重新点击暂停前已打开的卡片")
+                accountBrowsePausedContext = null
+            }
             accountBrowsePhase = AccountBrowsePhase.FIRST_SWIPE_COUNTDOWN
             accountBrowseCountdownRemaining = FIRST_SWIPE_COUNTDOWN_SECONDS
             addLog(
@@ -1720,9 +2263,15 @@ class FreedomAccessibilityService : AccessibilityService() {
         accountBrowseCurrentActivityClass = activityClass
 
         if (activityClass == MOMO_FEED_IMAGE_BROWSER_ACTIVITY) {
-            if (accountBrowsePhase == AccountBrowsePhase.DETAIL_DWELL ||
-                (accountBrowsePhase == AccountBrowsePhase.PAUSED && accountBrowseManualResumeAllowed)
-            ) {
+            if (accountBrowsePhase == AccountBrowsePhase.PAUSED && accountBrowseManualResumeAllowed) {
+                accountBrowseImageBrowserReturnActivityClass = previousActivity
+                    .takeIf { it.isNotBlank() && it != MOMO_FEED_IMAGE_BROWSER_ACTIVITY }
+                    ?: MOMO_DYNAMIC_DETAIL_ACTIVITY
+                accountBrowseImageBrowserActive = true
+                accountBrowseDetailDwellRemainingMs =
+                    (accountBrowseDetailDwellDueAt - System.currentTimeMillis()).coerceAtLeast(0L)
+                addLog("已识别用户暂停期间进入陌陌动态图片浏览页面：保留 PAUSED 状态；静默结束后由恢复导航逐级返回动态标签")
+            } else if (accountBrowsePhase == AccountBrowsePhase.DETAIL_DWELL) {
                 accountBrowseImageBrowserReturnActivityClass = previousActivity
                     .takeIf { it.isNotBlank() && it != MOMO_FEED_IMAGE_BROWSER_ACTIVITY }
                     ?: MOMO_DYNAMIC_DETAIL_ACTIVITY
@@ -1735,13 +2284,33 @@ class FreedomAccessibilityService : AccessibilityService() {
                 accountBrowseStepPending = false
                 accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_IMAGE_BROWSER_RETURN
                 accountBrowseDeadlineAt = System.currentTimeMillis() + IMAGE_BROWSER_RETURN_TIMEOUT_MS
-                addLog("已识别陌陌动态内部图片浏览页面：$activityClass；保留原动态详情上下文，暂停阅读倒计时，等待返回原详情页面")
+                addLog("自动详情停留期间进入陌陌图片浏览页面：保留详情上下文，等待图片页面返回")
                 scheduleAccountBrowseStep(PAGE_STATE_POLL_MS)
             }
             return
         }
 
         if (accountBrowseImageBrowserActive) {
+            if (accountBrowsePhase == AccountBrowsePhase.PAUSED && accountBrowseManualResumeAllowed) {
+                if (activityClass == accountBrowseImageBrowserReturnActivityClass) {
+                    accountBrowseImageBrowserActive = false
+                    addLog("用户已手动退出图片浏览页面；保持安全暂停，静默结束后仍会重新识别并导航到动态标签")
+                } else {
+                    addLog("用户暂停期间图片浏览 Activity 已变化：$activityClass；保持安全暂停，交由恢复导航重新判断")
+                }
+                return
+            }
+            if (accountBrowsePhase == AccountBrowsePhase.WAIT_FOR_DYNAMIC_TAB ||
+                accountBrowsePhase == AccountBrowsePhase.VERIFY_NAVIGATION_ACTION ||
+                accountBrowsePhase == AccountBrowsePhase.WAIT_FOR_FEED_STABLE
+            ) {
+                if (activityClass == accountBrowseImageBrowserReturnActivityClass) {
+                    accountBrowseImageBrowserActive = false
+                    accountBrowseImageBrowserReturnActivityClass = ""
+                    addLog("恢复导航已退出图片浏览页面并回到详情层级；继续主动寻找动态主页面")
+                }
+                return
+            }
             if (activityClass == accountBrowseImageBrowserReturnActivityClass) {
                 accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_DETAIL_RESTABILIZE
                 accountBrowseDeadlineAt = System.currentTimeMillis() + DETAIL_RESTABILIZE_TIMEOUT_MS
@@ -1859,7 +2428,22 @@ class FreedomAccessibilityService : AccessibilityService() {
         }
     }
 
-    private fun classifyInteractionEventOrigin(eventType: Int, now: Long): String = when {
+    private fun isDetailLoadContainerScroll(eventType: Int, className: String): Boolean =
+        eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED &&
+            accountBrowsePhase == AccountBrowsePhase.WAIT_FOR_DETAIL_LOAD &&
+            accountBrowseCurrentActivityClass == MOMO_DYNAMIC_DETAIL_ACTIVITY &&
+            className.substringAfterLast('.') == "RecyclerView"
+
+    private fun isNavigationVerificationScroll(eventType: Int, className: String): Boolean =
+        eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED &&
+            accountBrowsePhase == AccountBrowsePhase.VERIFY_NAVIGATION_ACTION &&
+            className.substringAfterLast('.') == "RecyclerView"
+
+    private fun classifyInteractionEventOrigin(eventType: Int, now: Long, className: String): String = when {
+        isDetailLoadContainerScroll(eventType, className) ->
+            "动态详情加载期间 RecyclerView 的容器滚动/布局事件；缺少独立触摸证据，不按用户操作处理"
+        isNavigationVerificationScroll(eventType, className) ->
+            "导航动作后的页面切换/列表加载事件；正在验证页面层级，单独的 RecyclerView 滚动不足以认定为用户操作"
         eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED &&
             accountBrowsePhase == AccountBrowsePhase.WAIT_FOR_SCROLL_SETTLE ->
             "Freedom 自动滑动确认阶段的列表事件；仅凭列表事件无法区分系统手势反馈与同期手动滚动，不归类为用户操作"
@@ -1910,6 +2494,14 @@ class FreedomAccessibilityService : AccessibilityService() {
         if (!isTrackedInteractionEvent(eventType)) return
         val now = System.currentTimeMillis()
         if (isProgrammaticInteractionEvent(eventType, now)) return
+        if (isDetailLoadContainerScroll(eventType, className)) {
+            addLog("详情页面正在初始化；检测到 RecyclerView 滚动/布局事件，但没有独立用户触摸证据，来源标记为待确认，不触发暂停")
+            return
+        }
+        if (isNavigationVerificationScroll(eventType, className)) {
+            addLog("导航页面正在切换或加载；检测到 RecyclerView 滚动事件，但没有独立用户触摸证据，暂不触发暂停")
+            return
+        }
         if (accountBrowseImageBrowserActive ||
             accountBrowsePhase == AccountBrowsePhase.WAIT_FOR_IMAGE_BROWSER_RETURN ||
             accountBrowsePhase == AccountBrowsePhase.WAIT_FOR_DETAIL_RESTABILIZE
@@ -1938,7 +2530,18 @@ class FreedomAccessibilityService : AccessibilityService() {
             )
         } else {
             accountBrowseManualResumeAllowed = true
-            addLog("用户操作发生时自动浏览已处于安全暂停；原暂停原因=${accountBrowsePauseReason.ifBlank { "未记录" }}；静默结束后只重新识别页面，不跳过安全检查")
+            if (accountBrowsePausedContext == null) {
+                accountBrowsePausedContext = ManualResumeContext(
+                    phaseName = "PAUSED",
+                    activityClass = accountBrowseCurrentActivityClass,
+                    sourceFingerprint = accountBrowseSourceFingerprint,
+                    detailFingerprint = accountBrowseDetailFingerprint,
+                    imageBrowserActive = accountBrowseImageBrowserActive,
+                    lastProgrammaticAction = accountBrowseProgrammaticActionLabel,
+                    capturedAt = now
+                )
+            }
+            addLog("用户操作发生时自动浏览已处于安全暂停；原暂停原因=${accountBrowsePauseReason.ifBlank { "未记录" }}；静默结束后重新分析页面层级并导航到动态标签")
         }
 
         mainHandler.removeCallbacks(manualTouchResumeRunnable)
@@ -2054,6 +2657,9 @@ class FreedomAccessibilityService : AccessibilityService() {
         val tabInspection = inspectDynamicTabRow(root)
         val tabEvidence = tabInspection.evidence
             ?: return FeedReadinessInspection(null, tabInspection.reason)
+        if (tabEvidence.selectionKnown && !tabEvidence.dynamicSelected) {
+            return FeedReadinessInspection(null, "首页顶部当前选中项不是‘动态’；${tabEvidence.diagnostic}")
+        }
 
         val listNode = findVisibleFeedContainer(root, tabEvidence.contentTop)
             ?: return FeedReadinessInspection(null, "已确认首页顶部动态标签行，但下方没有找到足够大的可见列表容器")
@@ -2126,9 +2732,9 @@ class FreedomAccessibilityService : AccessibilityService() {
     /**
      * Locate the upper horizontal tab row. Resource IDs are deliberately not required:
      * Momo versions may expose different IDs or omit IDs from accessibility nodes.
-     * If selected state is exposed and another tab is selected, the Dynamic tab is rejected.
-     * If no selection semantics are exposed, the exact three-label row is used as a
-     * structural fallback and the fallback is written to the diagnostic log.
+     * If another tab is selected, its state and the Dynamic label bounds are both retained
+     * so the caller can actively click Dynamic. If selection semantics are unavailable,
+     * the same-row navigation labels provide a bounded structural fallback.
      */
     private fun inspectDynamicTabRow(root: AccessibilityNodeInfo): DynamicTabInspection {
         val metrics = resources.displayMetrics
@@ -2212,26 +2818,26 @@ class FreedomAccessibilityService : AccessibilityService() {
         )
         val dynamic = row.first { it.label == MOMO_DYNAMIC_TAB_LABEL }
         val selectedLabels = row.filter { it.selected }.map { it.label }.distinct()
-        if (selectedLabels.size == 1 && selectedLabels.single() != MOMO_DYNAMIC_TAB_LABEL) {
-            return DynamicTabInspection(
-                null,
-                "顶部导航选中项不是‘动态’：${selectedLabels.single()}"
-            )
-        }
+        val selectionKnown = selectedLabels.size == 1
+        val dynamicSelected = selectionKnown && selectedLabels.single() == MOMO_DYNAMIC_TAB_LABEL
 
         val rowBottom = row.maxOf { it.bounds.bottom }
         val contentTop = rowBottom + dp(DYNAMIC_TAB_CONTENT_GAP_DP)
         val selectionDescription = when {
-            selectedLabels.size == 1 && selectedLabels.single() == MOMO_DYNAMIC_TAB_LABEL ->
-                "顶部‘动态’标签已选中"
-            selectedLabels.size > 1 ->
-                "Tab选中状态存在祖先节点歧义，按顶部标签行结构确认"
-            else ->
-                "无障碍节点未暴露Tab选中状态，按‘动态/附近/AI小陌’同排结构确认"
+            dynamicSelected -> "顶部‘动态’标签已选中"
+            selectionKnown -> "顶部导航当前选中项为‘${selectedLabels.single()}’；可以主动切换到‘动态’"
+            selectedLabels.size > 1 -> "Tab选中状态存在祖先节点歧义，按顶部标签行结构识别"
+            else -> "无障碍节点未暴露Tab选中状态，按‘动态/附近/AI小陌’同排结构识别"
         }
         val neighborDescription = if (bestScore == 2) "附近与AI小陌同排" else "附近或AI小陌同排"
         return DynamicTabInspection(
-            DynamicTabRowEvidence(contentTop, "$selectionDescription，$neighborDescription"),
+            DynamicTabRowEvidence(
+                contentTop = contentTop,
+                diagnostic = "$selectionDescription，$neighborDescription",
+                dynamicBounds = Rect(dynamic.bounds),
+                dynamicSelected = dynamicSelected,
+                selectionKnown = selectionKnown
+            ),
             ""
         )
     }
@@ -2773,6 +3379,10 @@ class FreedomAccessibilityService : AccessibilityService() {
         private const val MOMO_DYNAMIC_TAB_LABEL = "动态"
         private const val MOMO_NEARBY_TAB_LABEL = "附近"
         private const val MOMO_AI_TAB_LABEL = "AI小陌"
+        private const val MOMO_MAIN_ACTIVITY = "com.immomo.momo.maintab.MaintabActivity"
+        private const val MOMO_HOME_TAB_LABEL = "首页"
+        private val MOMO_HOME_NAV_LABELS = setOf("首页", "附近", "消息", "我的", "直播", "动态")
+        private const val HOME_NAV_LOWER_BAND_RATIO = 0.72f
         private val DYNAMIC_TAB_LABELS = setOf(
             MOMO_DYNAMIC_TAB_LABEL,
             MOMO_NEARBY_TAB_LABEL,
@@ -2781,6 +3391,19 @@ class FreedomAccessibilityService : AccessibilityService() {
         private const val DYNAMIC_TAB_UPPER_BAND_RATIO = 0.28f
         private const val DYNAMIC_TAB_ROW_TOLERANCE_DP = 48
         private const val DYNAMIC_TAB_CONTENT_GAP_DP = 8
+        private const val TAB_TARGET_MATCH_TOLERANCE_DP = 18
+        private const val MAX_TAB_CLICK_TARGET_HEIGHT_RATIO = 0.24f
+        private const val MAX_TAB_CLICK_ANCESTOR_DEPTH = 5
+        private const val NAV_ACTION_DYNAMIC_TAB = "DYNAMIC_TAB"
+        private const val NAV_ACTION_HOME_TAB = "HOME_TAB"
+        private const val NAV_ACTION_BACK = "BACK"
+        private const val NAVIGATION_ACTION_EVENT_WINDOW_MS = 1_800L
+        private const val NAVIGATION_ACTION_VERIFY_TIMEOUT_MS = 2_100L
+        private const val NAVIGATION_ACTION_VERIFY_POLL_MS = 350L
+        private const val NAVIGATION_ACTION_RETRY_DELAY_MS = 700L
+        private const val MAX_RECOVERY_TAB_CLICK_ATTEMPTS = 2
+        private const val MAX_RECOVERY_HOME_CLICK_ATTEMPTS = 2
+        private const val MAX_RECOVERY_BACK_STEPS = 4
 
         private const val MIN_BROWSE_DELAY_MS = 3_000L
         private const val MAX_BROWSE_DELAY_MS = 15_000L
