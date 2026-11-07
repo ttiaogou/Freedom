@@ -110,6 +110,9 @@ class FreedomAccessibilityService : AccessibilityService() {
     private var accountBrowseLastStableFingerprint = ""
     private var accountBrowseStableSamples = 0
     private var accountBrowseTouchActive = false
+    private var accountBrowseManualResumeAllowed = false
+    private var accountBrowseTouchStartedDuringGesture = false
+    private var accountBrowseTouchEndedDuringGesture = false
     private var accountBrowseGestureInFlight = false
     private var accountBrowseScrollEventSeen = false
     private var accountBrowseScrollEventCount = 0
@@ -189,9 +192,11 @@ class FreedomAccessibilityService : AccessibilityService() {
 
     // Resume after the user finishes navigating or interacting with the target app.
     private val manualTouchResumeRunnable = Runnable {
-        if (!accountBrowseTouchActive &&
+        if (accountBrowseManualResumeAllowed && !accountBrowseTouchActive &&
             MonitorStore.isRunning(this) && isAccountBrowseModeEnabled()
         ) {
+            accountBrowseManualResumeAllowed = false
+            addLog("手动操作静默期结束；正在重新检查当前前台应用和动态列表条件")
             accountBrowsePhase = AccountBrowsePhase.IDLE
             accountBrowsePauseReason = ""
             accountBrowseSourceFingerprint = ""
@@ -240,7 +245,7 @@ class FreedomAccessibilityService : AccessibilityService() {
             gestureCalibrationReceiverRegistered = true
         }
         applyTargetPackageFilter()
-        addLog("无障碍服务已连接；当前仅接收指定目标应用的事件")
+        addLog("无障碍服务已连接；普通应用事件仅处理指定目标应用，系统触摸事件用于识别用户操作")
 
         // A persisted run request is restored only after Android has rebound this service.
         if (MonitorStore.isRunning(this)) {
@@ -279,7 +284,10 @@ class FreedomAccessibilityService : AccessibilityService() {
     private fun applyTargetPackageFilter() {
         runCatching {
             val info = serviceInfo ?: return
-            info.packageNames = arrayOf(MonitorStore.targetPackage(this))
+            // System-generated TOUCH_INTERACTION events have no view-tree source package.
+            // A package whitelist would discard them before onAccessibilityEvent is called.
+            // Ordinary app events remain restricted to the selected target below.
+            info.packageNames = null
             setServiceInfo(info)
         }.onFailure {
             addLog("更新目标应用过滤器失败：${it.javaClass.simpleName}")
@@ -303,9 +311,64 @@ class FreedomAccessibilityService : AccessibilityService() {
 
         val targetPackage = MonitorStore.targetPackage(this)
         val eventPackage = event.packageName?.toString().orEmpty()
+        val eventType = event.eventType
+
+        // These two events are emitted by Android itself, not populated from a view tree.
+        // Handle them before checking event.packageName; it may be null or not Momo's package.
+        if (eventType == AccessibilityEvent.TYPE_TOUCH_INTERACTION_START ||
+            eventType == AccessibilityEvent.TYPE_TOUCH_INTERACTION_END
+        ) {
+            if (!isAccountBrowseModeEnabled()) {
+                resetAccountBrowseSession()
+                return
+            }
+
+            when (eventType) {
+                AccessibilityEvent.TYPE_TOUCH_INTERACTION_START -> {
+                    if (accountBrowseGestureInFlight) {
+                        accountBrowseTouchStartedDuringGesture = true
+                        return
+                    }
+                    if (!accountBrowseTouchActive) {
+                        accountBrowseTouchActive = true
+                        mainHandler.removeCallbacks(manualTouchResumeRunnable)
+                        if (accountBrowsePhase != AccountBrowsePhase.PAUSED ||
+                            accountBrowseManualResumeAllowed
+                        ) {
+                            pauseAccountBrowse(
+                                "检测到手动触摸；自动浏览暂时让出操作权",
+                                allowManualResume = true
+                            )
+                        } else {
+                            addLog("检测到手动触摸；自动浏览此前已因安全条件暂停，本次操作不会清除原有暂停")
+                        }
+                    }
+                }
+
+                AccessibilityEvent.TYPE_TOUCH_INTERACTION_END -> {
+                    if (accountBrowseGestureInFlight) {
+                        accountBrowseTouchEndedDuringGesture = true
+                        return
+                    }
+                    if (accountBrowseTouchActive) {
+                        accountBrowseTouchActive = false
+                        if (accountBrowseManualResumeAllowed) {
+                            addLog("手动触摸已结束；页面安静 ${MANUAL_TOUCH_RESUME_MS / 1000.0} 秒后重新识别并尝试恢复")
+                            mainHandler.removeCallbacks(manualTouchResumeRunnable)
+                            mainHandler.postDelayed(manualTouchResumeRunnable, MANUAL_TOUCH_RESUME_MS)
+                        } else {
+                            addLog("手动触摸已结束；原有安全暂停状态保持不变")
+                        }
+                    }
+                }
+            }
+            return
+        }
+
+        // Keep all non-touch event processing restricted to the configured target app.
         if (eventPackage != targetPackage || eventPackage == packageName) return
 
-        if (event.eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED &&
+        if (eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED &&
             accountBrowsePhase == AccountBrowsePhase.WAIT_FOR_SCROLL_SETTLE
         ) {
             accountBrowseLastScrollEventAt = System.currentTimeMillis()
@@ -318,31 +381,8 @@ class FreedomAccessibilityService : AccessibilityService() {
 
         if (!isAccountBrowseModeEnabled()) {
             resetAccountBrowseSession()
-        } else {
-            when (event.eventType) {
-                AccessibilityEvent.TYPE_TOUCH_INTERACTION_START -> {
-                    if (accountBrowseGestureInFlight) return
-                    if (!accountBrowseTouchActive) {
-                        accountBrowseTouchActive = true
-                        mainHandler.removeCallbacks(manualTouchResumeRunnable)
-                        pauseAccountBrowse("检测到手动触摸；自动浏览暂时让出操作权")
-                    }
-                    return
-                }
-                AccessibilityEvent.TYPE_TOUCH_INTERACTION_END -> {
-                    if (accountBrowseGestureInFlight) return
-                    if (accountBrowseTouchActive) {
-                        accountBrowseTouchActive = false
-                        addLog("手动触摸已结束；页面安静一段时间后自动恢复浏览")
-                        mainHandler.removeCallbacks(manualTouchResumeRunnable)
-                        mainHandler.postDelayed(manualTouchResumeRunnable, MANUAL_TOUCH_RESUME_MS)
-                    }
-                    return
-                }
-            }
-            if (accountBrowsePhase == AccountBrowsePhase.IDLE) {
-                startAccountBrowseIfNeeded()
-            }
+        } else if (accountBrowsePhase == AccountBrowsePhase.IDLE) {
+            startAccountBrowseIfNeeded()
         }
 
         val rawEventName = rawEventName(event.eventType)
@@ -590,12 +630,18 @@ class FreedomAccessibilityService : AccessibilityService() {
             pauseAccountBrowse("当前阶段仅支持陌陌动态列表；其他应用暂未接入浏览适配")
             return
         }
-        val root = runCatching { rootInActiveWindow }.getOrNull() ?: return
+        val root = runCatching { rootInActiveWindow }.getOrNull() ?: run {
+            addLog("恢复检查暂时无法读取当前前台页面；等待后续页面事件再次触发检查")
+            return
+        }
         val isTargetForeground = runCatching {
             root.packageName?.toString().orEmpty() == MOMO_PACKAGE
         }.getOrDefault(false)
         runCatching { root.recycle() }
-        if (!isTargetForeground) return
+        if (!isTargetForeground) {
+            addLog("恢复检查发现当前前台不是陌陌；不会执行自动操作，等待进入陌陌后重新识别")
+            return
+        }
 
         accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_FEED_STABLE
         accountBrowseDeadlineAt = System.currentTimeMillis() + INITIAL_FEED_STABILITY_TIMEOUT_MS
@@ -634,6 +680,9 @@ class FreedomAccessibilityService : AccessibilityService() {
         accountBrowseLastStableFingerprint = ""
         accountBrowseStableSamples = 0
         accountBrowseTouchActive = false
+        accountBrowseManualResumeAllowed = false
+        accountBrowseTouchStartedDuringGesture = false
+        accountBrowseTouchEndedDuringGesture = false
         accountBrowseGestureInFlight = false
         accountBrowseScrollEventSeen = false
         accountBrowseScrollEventCount = 0
@@ -644,10 +693,14 @@ class FreedomAccessibilityService : AccessibilityService() {
         hideFirstSwipeCountdown()
     }
 
-    private fun pauseAccountBrowse(reason: String) {
+    private fun pauseAccountBrowse(
+        reason: String,
+        allowManualResume: Boolean = false
+    ) {
         restoreMonitorOverlayTouchPassthrough()
         mainHandler.removeCallbacks(accountBrowseRunnable)
         accountBrowseStepPending = false
+        accountBrowseManualResumeAllowed = allowManualResume
         accountBrowseGestureInFlight = false
         accountBrowseCountdownRemaining = 0
         hideFirstSwipeCountdown()
@@ -968,6 +1021,8 @@ class FreedomAccessibilityService : AccessibilityService() {
         accountBrowseLastScrollEventAt = 0L
         accountBrowseFallbackScrollAttempted = false
         accountBrowseGestureInFlight = false
+        accountBrowseTouchStartedDuringGesture = false
+        accountBrowseTouchEndedDuringGesture = false
         addLog(
             "第 ${accountBrowseSwipeCount + 1} 轮列表区域坐标滑动准备：容器=${target.className}，边界=$bounds，" +
                 "起点 (${gesturePlan.startX},${gesturePlan.startY})，终点 (${gesturePlan.endX},${gesturePlan.endY})，" +
@@ -988,6 +1043,8 @@ class FreedomAccessibilityService : AccessibilityService() {
                 dispatchGesture(gesture, object : AccessibilityService.GestureResultCallback() {
                     override fun onCompleted(gestureDescription: GestureDescription?) {
                         accountBrowseGestureInFlight = false
+                        accountBrowseTouchStartedDuringGesture = false
+                        accountBrowseTouchEndedDuringGesture = false
                         if (accountBrowsePhase != AccountBrowsePhase.WAIT_FOR_SCROLL_SETTLE ||
                             !MonitorStore.isRunning(this@FreedomAccessibilityService)
                         ) return
@@ -996,9 +1053,28 @@ class FreedomAccessibilityService : AccessibilityService() {
                     }
 
                     override fun onCancelled(gestureDescription: GestureDescription?) {
+                        val touchStarted = accountBrowseTouchStartedDuringGesture
+                        val touchEnded = accountBrowseTouchEndedDuringGesture
                         accountBrowseGestureInFlight = false
+                        accountBrowseTouchStartedDuringGesture = false
+                        accountBrowseTouchEndedDuringGesture = false
                         if (accountBrowsePhase == AccountBrowsePhase.WAIT_FOR_SCROLL_SETTLE) {
-                            pauseAccountBrowse("第 ${accountBrowseSwipeCount + 1} 轮屏幕滑动被系统或用户操作中断")
+                            val interruptedByTouch = touchStarted || touchEnded
+                            pauseAccountBrowse(
+                                "第 ${accountBrowseSwipeCount + 1} 轮屏幕滑动被系统或用户操作中断",
+                                allowManualResume = interruptedByTouch
+                            )
+                            if (interruptedByTouch) {
+                                if (touchEnded) {
+                                    accountBrowseTouchActive = false
+                                    addLog("检测到手动触摸中断了自动滑动，且触摸已经结束；开始 ${MANUAL_TOUCH_RESUME_MS / 1000.0} 秒静默等待")
+                                    mainHandler.removeCallbacks(manualTouchResumeRunnable)
+                                    mainHandler.postDelayed(manualTouchResumeRunnable, MANUAL_TOUCH_RESUME_MS)
+                                } else {
+                                    accountBrowseTouchActive = true
+                                    addLog("检测到手动触摸中断了自动滑动；等待用户松开屏幕后再开始静默等待")
+                                }
+                            }
                         }
                     }
                 }, mainHandler)
