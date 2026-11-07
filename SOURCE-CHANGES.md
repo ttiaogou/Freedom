@@ -99,3 +99,13 @@
 - Controller 的 `Actions` 仅回调到 Service 既有的阶段处理函数。页面检查、弹窗、安全关闭、导航验证与重试、手势派发、暂停/恢复副作用、各类截止时间和会话证据继续由 Service 或既有专职组件管理。
 - 保留原门控次序及全部 13 个阶段分支，不更改阶段枚举、阶段转换赋值、延迟、重试次数、扫描阈值或手势参数。
 - 本次不新增功能、依赖、权限、广播或持久化键。完整 Android 构建与真机验证仍需通过 GitHub Actions。
+
+
+## Stage 8 — 自动浏览会话状态归属整理（2026-11-07）
+
+- 新增 `app/src/main/java/com/freedom/accessibility/browse/AccountBrowseSessionState.kt`。
+- 将原 `FreedomAccessibilityService` 内 53 个自动浏览会话字段迁入 `AccountBrowseController.session`，涵盖暂停原因与恢复上下文、页面/Activity 指纹、稳定采样与列表返回验证、人工触摸接管、手势与滚动事件、详情停留、导航尝试上下文、弹窗关闭验证状态。
+- 原字段默认值和类型保持一致；Service 的所有状态读写改为访问 `accountBrowseSession`。未改变原赋值/递增/清零顺序、条件、调度或日志文字含义。
+- `accountBrowsePhase` 和阶段分派仍归 `AccountBrowseController`；各类系统事件、手势执行、延时、导航重试、弹窗处理和 reset 副作用仍由 Service 及既有专职组件执行。
+- 将上传基线中漏掉的 `AccountBrowseController` import 一并补齐；同时添加 `AccountBrowseSessionState` import。
+- 无新功能、权限、广播、持久化键、依赖或时间/阈值变更。完整 Android 编译及真机测试仍需 GitHub Actions 和设备验证。

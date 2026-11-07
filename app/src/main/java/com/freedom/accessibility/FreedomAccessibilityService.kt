@@ -26,7 +26,9 @@ import com.freedom.accessibility.browse.MomoFeedGestureController
 import com.freedom.accessibility.browse.MomoPageInspector
 import com.freedom.accessibility.browse.MomoPopupInspector
 import com.freedom.accessibility.browse.MomoNavigationController
+import com.freedom.accessibility.browse.AccountBrowseController
 import com.freedom.accessibility.browse.AccountBrowsePhase
+import com.freedom.accessibility.browse.AccountBrowseSessionState
 import com.freedom.accessibility.browse.DetailPageIdentityInspection
 import com.freedom.accessibility.browse.DynamicTabInspection
 import com.freedom.accessibility.browse.DynamicTabRowEvidence
@@ -61,62 +63,226 @@ class FreedomAccessibilityService : AccessibilityService() {
     private var accountBrowsePhase: AccountBrowsePhase
         get() = accountBrowseController.phase
         set(value) = accountBrowseController.transitionTo(value)
-    private var accountBrowsePauseReason = ""
-    private var accountBrowseLastDynamicTabWaitReason = ""
-    private var accountBrowseDeadlineAt = 0L
-    private var accountBrowseSourceFingerprint = ""
-    private var accountBrowseDetailFingerprint = ""
-    private var accountBrowseDetailActivityClass = ""
-    private var accountBrowseLastStableFingerprint = ""
-    private var accountBrowseStableSamples = 0
-    private var accountBrowseTouchActive = false
-    private var accountBrowseManualResumeAllowed = false
-    private var accountBrowseTouchStartedDuringGesture = false
-    private var accountBrowseTouchEndedDuringGesture = false
-    private var accountBrowseGestureInFlight = false
-    private var accountBrowseScrollEventSeen = false
-    private var accountBrowseScrollEventCount = 0
-    private var accountBrowseLastScrollEventAt = 0L
-    private var accountBrowseSwipeCount = 0
-    private var accountBrowseFallbackScrollAttempted = false
-    private var accountBrowseSourceSnapshot = ""
-    private var accountBrowseReturnedStableSamples = 0
-    private var accountBrowseLastReturnedSnapshot = ""
-    private var accountBrowseReturnMismatchLogged = false
-    private var accountBrowseCountdownRemaining = 0
-    private var accountBrowseOverlayPassthroughActive = false
-    private var accountBrowseCurrentActivityClass = ""
-    private var accountBrowseImageBrowserReturnActivityClass = ""
-    private var accountBrowseImageBrowserActive = false
-    private var accountBrowseDetailDwellDueAt = 0L
-    private var accountBrowseDetailDwellRemainingMs = 0L
-    private var accountBrowseIgnoreManualEventsUntil = 0L
-    private var accountBrowseProgrammaticActionLabel = ""
-    private var accountBrowseSafeCardRecheckCount = 0
-    private var accountBrowseLastGlobalTouchEventAt = 0L
-    private var accountBrowseLastGlobalTouchEventName = ""
-    private var accountBrowseLastGlobalTouchEventOrigin = ""
-    private var accountBrowsePausedContext: ManualResumeContext? = null
-    private var accountBrowseNavigationActionKey = ""
-    private var accountBrowseNavigationBeforeActivity = ""
-    private var accountBrowseNavigationBeforeFingerprint = ""
-    private var accountBrowseNavigationActionDeadlineAt = 0L
-    private var accountBrowseNavigationActionAttempts = 0
-    private var accountBrowseRecoveryBackAttempts = 0
-    private var accountBrowseRecoveryHomeClickAttempts = 0
-    private var accountBrowseRecoveryDynamicClickAttempts = 0
-    private var accountBrowseDynamicTabClickConfirmed = false
-    private var accountBrowseNotTargetForegroundLogged = false
-    private var accountBrowseRootUnavailableLogged = false
-    private var accountBrowseLastPopupSignature = ""
-    private var accountBrowsePopupDismissPending = false
-    private var accountBrowsePopupDismissDeadlineAt = 0L
-    private var accountBrowsePopupNextAttemptAt = 0L
-    private var accountBrowsePopupActionAttempts = 0
-    private var accountBrowsePopupExhaustedLogged = false
 
-    // Owns the automatic-browse phase and dispatches each phase to the existing
-    // service implementation. Android-specific operations and session evidence remain here.
+    // Compatibility accessors keep the existing Service methods unchanged; backing
+    // session values are owned by AccountBrowseController.session.
+    private val accountBrowseSession: AccountBrowseSessionState
+        get() = accountBrowseController.session
+
+    private var accountBrowsePauseReason: String
+        get() = accountBrowseSession.pauseReason
+        set(value) { accountBrowseSession.pauseReason = value }
+
+    private var accountBrowseLastDynamicTabWaitReason: String
+        get() = accountBrowseSession.lastDynamicTabWaitReason
+        set(value) { accountBrowseSession.lastDynamicTabWaitReason = value }
+
+    private var accountBrowseDeadlineAt: Long
+        get() = accountBrowseSession.deadlineAt
+        set(value) { accountBrowseSession.deadlineAt = value }
+
+    private var accountBrowseSourceFingerprint: String
+        get() = accountBrowseSession.sourceFingerprint
+        set(value) { accountBrowseSession.sourceFingerprint = value }
+
+    private var accountBrowseDetailFingerprint: String
+        get() = accountBrowseSession.detailFingerprint
+        set(value) { accountBrowseSession.detailFingerprint = value }
+
+    private var accountBrowseDetailActivityClass: String
+        get() = accountBrowseSession.detailActivityClass
+        set(value) { accountBrowseSession.detailActivityClass = value }
+
+    private var accountBrowseLastStableFingerprint: String
+        get() = accountBrowseSession.lastStableFingerprint
+        set(value) { accountBrowseSession.lastStableFingerprint = value }
+
+    private var accountBrowseStableSamples: Int
+        get() = accountBrowseSession.stableSamples
+        set(value) { accountBrowseSession.stableSamples = value }
+
+    private var accountBrowseTouchActive: Boolean
+        get() = accountBrowseSession.touchActive
+        set(value) { accountBrowseSession.touchActive = value }
+
+    private var accountBrowseManualResumeAllowed: Boolean
+        get() = accountBrowseSession.manualResumeAllowed
+        set(value) { accountBrowseSession.manualResumeAllowed = value }
+
+    private var accountBrowseTouchStartedDuringGesture: Boolean
+        get() = accountBrowseSession.touchStartedDuringGesture
+        set(value) { accountBrowseSession.touchStartedDuringGesture = value }
+
+    private var accountBrowseTouchEndedDuringGesture: Boolean
+        get() = accountBrowseSession.touchEndedDuringGesture
+        set(value) { accountBrowseSession.touchEndedDuringGesture = value }
+
+    private var accountBrowseGestureInFlight: Boolean
+        get() = accountBrowseSession.gestureInFlight
+        set(value) { accountBrowseSession.gestureInFlight = value }
+
+    private var accountBrowseScrollEventSeen: Boolean
+        get() = accountBrowseSession.scrollEventSeen
+        set(value) { accountBrowseSession.scrollEventSeen = value }
+
+    private var accountBrowseScrollEventCount: Int
+        get() = accountBrowseSession.scrollEventCount
+        set(value) { accountBrowseSession.scrollEventCount = value }
+
+    private var accountBrowseLastScrollEventAt: Long
+        get() = accountBrowseSession.lastScrollEventAt
+        set(value) { accountBrowseSession.lastScrollEventAt = value }
+
+    private var accountBrowseSwipeCount: Int
+        get() = accountBrowseSession.swipeCount
+        set(value) { accountBrowseSession.swipeCount = value }
+
+    private var accountBrowseFallbackScrollAttempted: Boolean
+        get() = accountBrowseSession.fallbackScrollAttempted
+        set(value) { accountBrowseSession.fallbackScrollAttempted = value }
+
+    private var accountBrowseSourceSnapshot: String
+        get() = accountBrowseSession.sourceSnapshot
+        set(value) { accountBrowseSession.sourceSnapshot = value }
+
+    private var accountBrowseReturnedStableSamples: Int
+        get() = accountBrowseSession.returnedStableSamples
+        set(value) { accountBrowseSession.returnedStableSamples = value }
+
+    private var accountBrowseLastReturnedSnapshot: String
+        get() = accountBrowseSession.lastReturnedSnapshot
+        set(value) { accountBrowseSession.lastReturnedSnapshot = value }
+
+    private var accountBrowseReturnMismatchLogged: Boolean
+        get() = accountBrowseSession.returnMismatchLogged
+        set(value) { accountBrowseSession.returnMismatchLogged = value }
+
+    private var accountBrowseCountdownRemaining: Int
+        get() = accountBrowseSession.countdownRemaining
+        set(value) { accountBrowseSession.countdownRemaining = value }
+
+    private var accountBrowseOverlayPassthroughActive: Boolean
+        get() = accountBrowseSession.overlayPassthroughActive
+        set(value) { accountBrowseSession.overlayPassthroughActive = value }
+
+    private var accountBrowseCurrentActivityClass: String
+        get() = accountBrowseSession.currentActivityClass
+        set(value) { accountBrowseSession.currentActivityClass = value }
+
+    private var accountBrowseImageBrowserReturnActivityClass: String
+        get() = accountBrowseSession.imageBrowserReturnActivityClass
+        set(value) { accountBrowseSession.imageBrowserReturnActivityClass = value }
+
+    private var accountBrowseImageBrowserActive: Boolean
+        get() = accountBrowseSession.imageBrowserActive
+        set(value) { accountBrowseSession.imageBrowserActive = value }
+
+    private var accountBrowseDetailDwellDueAt: Long
+        get() = accountBrowseSession.detailDwellDueAt
+        set(value) { accountBrowseSession.detailDwellDueAt = value }
+
+    private var accountBrowseDetailDwellRemainingMs: Long
+        get() = accountBrowseSession.detailDwellRemainingMs
+        set(value) { accountBrowseSession.detailDwellRemainingMs = value }
+
+    private var accountBrowseIgnoreManualEventsUntil: Long
+        get() = accountBrowseSession.ignoreManualEventsUntil
+        set(value) { accountBrowseSession.ignoreManualEventsUntil = value }
+
+    private var accountBrowseProgrammaticActionLabel: String
+        get() = accountBrowseSession.programmaticActionLabel
+        set(value) { accountBrowseSession.programmaticActionLabel = value }
+
+    private var accountBrowseSafeCardRecheckCount: Int
+        get() = accountBrowseSession.safeCardRecheckCount
+        set(value) { accountBrowseSession.safeCardRecheckCount = value }
+
+    private var accountBrowseLastGlobalTouchEventAt: Long
+        get() = accountBrowseSession.lastGlobalTouchEventAt
+        set(value) { accountBrowseSession.lastGlobalTouchEventAt = value }
+
+    private var accountBrowseLastGlobalTouchEventName: String
+        get() = accountBrowseSession.lastGlobalTouchEventName
+        set(value) { accountBrowseSession.lastGlobalTouchEventName = value }
+
+    private var accountBrowseLastGlobalTouchEventOrigin: String
+        get() = accountBrowseSession.lastGlobalTouchEventOrigin
+        set(value) { accountBrowseSession.lastGlobalTouchEventOrigin = value }
+
+    private var accountBrowsePausedContext: ManualResumeContext?
+        get() = accountBrowseSession.pausedContext
+        set(value) { accountBrowseSession.pausedContext = value }
+
+    private var accountBrowseNavigationActionKey: String
+        get() = accountBrowseSession.navigationActionKey
+        set(value) { accountBrowseSession.navigationActionKey = value }
+
+    private var accountBrowseNavigationBeforeActivity: String
+        get() = accountBrowseSession.navigationBeforeActivity
+        set(value) { accountBrowseSession.navigationBeforeActivity = value }
+
+    private var accountBrowseNavigationBeforeFingerprint: String
+        get() = accountBrowseSession.navigationBeforeFingerprint
+        set(value) { accountBrowseSession.navigationBeforeFingerprint = value }
+
+    private var accountBrowseNavigationActionDeadlineAt: Long
+        get() = accountBrowseSession.navigationActionDeadlineAt
+        set(value) { accountBrowseSession.navigationActionDeadlineAt = value }
+
+    private var accountBrowseNavigationActionAttempts: Int
+        get() = accountBrowseSession.navigationActionAttempts
+        set(value) { accountBrowseSession.navigationActionAttempts = value }
+
+    private var accountBrowseRecoveryBackAttempts: Int
+        get() = accountBrowseSession.recoveryBackAttempts
+        set(value) { accountBrowseSession.recoveryBackAttempts = value }
+
+    private var accountBrowseRecoveryHomeClickAttempts: Int
+        get() = accountBrowseSession.recoveryHomeClickAttempts
+        set(value) { accountBrowseSession.recoveryHomeClickAttempts = value }
+
+    private var accountBrowseRecoveryDynamicClickAttempts: Int
+        get() = accountBrowseSession.recoveryDynamicClickAttempts
+        set(value) { accountBrowseSession.recoveryDynamicClickAttempts = value }
+
+    private var accountBrowseDynamicTabClickConfirmed: Boolean
+        get() = accountBrowseSession.dynamicTabClickConfirmed
+        set(value) { accountBrowseSession.dynamicTabClickConfirmed = value }
+
+    private var accountBrowseNotTargetForegroundLogged: Boolean
+        get() = accountBrowseSession.notTargetForegroundLogged
+        set(value) { accountBrowseSession.notTargetForegroundLogged = value }
+
+    private var accountBrowseRootUnavailableLogged: Boolean
+        get() = accountBrowseSession.rootUnavailableLogged
+        set(value) { accountBrowseSession.rootUnavailableLogged = value }
+
+    private var accountBrowseLastPopupSignature: String
+        get() = accountBrowseSession.lastPopupSignature
+        set(value) { accountBrowseSession.lastPopupSignature = value }
+
+    private var accountBrowsePopupDismissPending: Boolean
+        get() = accountBrowseSession.popupDismissPending
+        set(value) { accountBrowseSession.popupDismissPending = value }
+
+    private var accountBrowsePopupDismissDeadlineAt: Long
+        get() = accountBrowseSession.popupDismissDeadlineAt
+        set(value) { accountBrowseSession.popupDismissDeadlineAt = value }
+
+    private var accountBrowsePopupNextAttemptAt: Long
+        get() = accountBrowseSession.popupNextAttemptAt
+        set(value) { accountBrowseSession.popupNextAttemptAt = value }
+
+    private var accountBrowsePopupActionAttempts: Int
+        get() = accountBrowseSession.popupActionAttempts
+        set(value) { accountBrowseSession.popupActionAttempts = value }
+
+    private var accountBrowsePopupExhaustedLogged: Boolean
+        get() = accountBrowseSession.popupExhaustedLogged
+        set(value) { accountBrowseSession.popupExhaustedLogged = value }
+
+    // Owns the automatic-browse phase, phase dispatch, and mutable session evidence.
+    // Android-specific operations and lifecycle remain in this service.
     private val accountBrowseController by lazy(LazyThreadSafetyMode.NONE) {
         AccountBrowseController(
             isSessionEnabled = {

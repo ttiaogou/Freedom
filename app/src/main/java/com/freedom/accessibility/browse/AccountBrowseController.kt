@@ -4,9 +4,9 @@ package com.freedom.accessibility.browse
  * Coordinates the automatic-browse phase dispatch while leaving Android-specific work
  * with FreedomAccessibilityService.
  *
- * The controller owns the current phase and the single scheduled-step dispatch decision.
+ * The controller owns the current phase and the per-session evidence state.
  * Page inspection, popup decisions, navigation retries, gesture dispatch, timing and
- * session-specific evidence continue to be supplied/owned by the service.
+ * Android-specific operations continue to be coordinated by the service.
  */
 internal class AccountBrowseController(
     private val isSessionEnabled: () -> Boolean,
@@ -28,6 +28,9 @@ internal class AccountBrowseController(
         val waitForDetailRestabilize: () -> Unit,
         val checkFeedListReturned: () -> Unit
     )
+
+    /** Mutable per-session evidence is owned alongside the phase coordinator. */
+    val session = AccountBrowseSessionState()
 
     var phase: AccountBrowsePhase = AccountBrowsePhase.IDLE
         private set

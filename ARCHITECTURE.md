@@ -102,3 +102,14 @@
 - 保留执行门控顺序：监控或自动浏览模式关闭时先重置；触摸期间或已暂停时不执行；随后按当前阶段分派。
 - 本阶段只建立控制器对当前阶段和阶段分派的所有权，不迁移会话其余字段，也不重写阶段转换、暂停恢复和任何阶段动作。
 - 不新增权限、广播、持久化键、第三方依赖或用户功能。完整 Android `assembleDebug` 和真机行为仍需 GitHub Actions / 设备验证。
+
+
+## Stage 8 — 自动浏览会话状态归属整理
+
+- 新增 `accessibility/browse/AccountBrowseSessionState.kt`，集中承载每次自动浏览会话的可变证据：暂停原因/恢复上下文、前后台 Activity 和页面指纹、列表稳定采样与返回验证、触摸接管、手势执行/滚动事件、详情停留、导航尝试上下文及弹窗关闭验证状态。
+- `AccountBrowseController` 创建并持有唯一的 `session` 实例；`FreedomAccessibilityService` 通过该实例读取/更新原有会话数据，仍保留 Android 无障碍事件、系统手势、日志、计时和状态副作用的执行责任。
+- 53 个原 Service 会话字段的默认值与原类型保持不变；原有字段访问只改为访问 `accountBrowseSession`，原有赋值语句、递增操作、重置顺序和判断条件不调整。
+- `accountBrowsePhase` 继续由 `AccountBrowseController` 持有；阶段变换、`performAccountBrowseStep()` 门控和 `when` 分派未改写。
+- 本阶段不改变页面指纹算法、暂停/恢复时序、手动触摸判定、手势参数、导航/弹窗重试参数或任何自动操作。未增加持久化、广播、权限或第三方依赖。
+- 基线 ZIP 带有上一轮 Stage 7 遗漏的 `AccountBrowseController` import；本次一并补齐该 import，避免将已确认的编译错误继续带入后续版本。
+- 当前环境没有 Android SDK/Gradle，完整 Android `assembleDebug` 与真机回归仍须由 GitHub Actions 和设备完成。
