@@ -122,3 +122,13 @@
 - 两处“已经处于 PAUSED 时记录人工接管上下文”的重复代码改为调用 Controller 的同一方法；保留第一次上下文快照不被覆盖的规则。
 - 未更改状态枚举、各阶段处理动作、导航/弹窗重试参数、手势参数、延时常量、广播、持久化键或权限；无新功能和第三方依赖。
 - 本地完成 reset 字段顺序与原 Service 逐项对照、Controller 独立 Kotlin 编译/行为顺序检查、引用和差异检查；当前环境没有 Android SDK/Gradle，未执行完整 `assembleDebug` 或真机回归，仍须通过 GitHub Actions 验证。
+
+
+## Stage 2.2 — Feed return verification tests and retry handling (2026-11-07)
+
+- `checkFeedListReturned()` no longer treats a temporarily unavailable accessibility root as immediate proof that the feed was lost. It resets pending stable samples and polls again within the existing 10-second return deadline; if the root remains unavailable until the deadline, the session pauses safely.
+- `obtainTargetRootOrPause()` gained an optional `pauseWhenUnavailable` argument, defaulting to the original behavior so all existing callers retain their current semantics.
+- Added pure Kotlin `FeedReturnStability` to enforce that only two consecutive matching snapshots on the feed page can confirm restoration. A changed snapshot restarts the count; a non-feed page, blank/unreadable snapshot, or position mismatch resets it.
+- Added six JVM unit tests for first/second matching sample, changed snapshots, non-feed pages, temporarily unreadable snapshots, and mismatched positions.
+- Existing minimum-match count (3), original-snapshot ratio threshold (70%), return timeout (10 seconds), and polling interval (300 ms) are unchanged. No navigation, card filtering, gesture, or dwell behavior was changed.
+- Android build and unit-test execution are pending GitHub Actions validation; no real-device test is claimed.

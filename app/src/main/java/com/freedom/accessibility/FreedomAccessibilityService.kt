@@ -1551,10 +1551,12 @@ class FreedomAccessibilityService : AccessibilityService() {
     private fun dp(value: Int): Int =
         (value * resources.displayMetrics.density + 0.5f).toInt()
 
-    private fun obtainTargetRootOrPause(): AccessibilityNodeInfo? {
+    private fun obtainTargetRootOrPause(pauseWhenUnavailable: Boolean = true): AccessibilityNodeInfo? {
         val root = runCatching { rootInActiveWindow }.getOrNull()
         if (root == null) {
-            pauseAccountBrowse("暂时无法读取当前页面；请确认陌陌仍在前台")
+            if (pauseWhenUnavailable) {
+                pauseAccountBrowse("暂时无法读取当前页面；请确认陌陌仍在前台")
+            }
             return null
         }
         val activePackage = runCatching { root.packageName?.toString().orEmpty() }.getOrDefault("")
@@ -2393,7 +2395,19 @@ class FreedomAccessibilityService : AccessibilityService() {
     }
 
     private fun checkFeedListReturned() {
-        val root = obtainTargetRootOrPause() ?: return
+        // A temporarily unavailable accessibility root is not proof that the user left
+        // the feed. Keep the existing return-verification deadline and poll again.
+        val root = obtainTargetRootOrPause(pauseWhenUnavailable = false)
+        if (root == null) {
+            accountBrowseReturnedStableSamples = 0
+            accountBrowseLastReturnedSnapshot = ""
+            if (System.currentTimeMillis() >= accountBrowseDeadlineAt) {
+                pauseAccountBrowse("返回后持续无法读取当前页面；为避免误操作，已暂停")
+            } else {
+                scheduleAccountBrowseStep(PAGE_STATE_POLL_MS)
+            }
+            return
+        }
         val returnState = try {
             if (!isMomoDynamicFeedPage(root)) {
                 false to ""
@@ -2415,14 +2429,20 @@ class FreedomAccessibilityService : AccessibilityService() {
         val isFeedList = returnState.first
         val currentSnapshot = returnState.second
 
-        if (isFeedList && isFeedPositionRestored(accountBrowseSourceSnapshot, currentSnapshot)) {
-            if (currentSnapshot == accountBrowseLastReturnedSnapshot) {
-                accountBrowseReturnedStableSamples++
-            } else {
-                accountBrowseLastReturnedSnapshot = currentSnapshot
-                accountBrowseReturnedStableSamples = 1
-            }
+        val positionMatches = isFeedList &&
+            isFeedPositionRestored(accountBrowseSourceSnapshot, currentSnapshot)
+        val stability = FeedReturnStability.update(
+            previousSnapshot = accountBrowseLastReturnedSnapshot,
+            previousSamples = accountBrowseReturnedStableSamples,
+            currentSnapshot = currentSnapshot,
+            isFeedPage = isFeedList,
+            positionMatches = positionMatches,
+            requiredSamples = REQUIRED_STABLE_PAGE_SAMPLES
+        )
+        accountBrowseLastReturnedSnapshot = stability.lastSnapshot
+        accountBrowseReturnedStableSamples = stability.stableSamples
 
+        if (stability.isStable) {
             if (accountBrowseReturnedStableSamples >= REQUIRED_STABLE_PAGE_SAMPLES) {
                 accountBrowseDetailActivityClass = ""
                 accountBrowseDetailFingerprint = ""
@@ -2439,9 +2459,7 @@ class FreedomAccessibilityService : AccessibilityService() {
                 scheduleAccountBrowseStep(delay)
                 return
             }
-        } else if (isFeedList) {
-            accountBrowseReturnedStableSamples = 0
-            accountBrowseLastReturnedSnapshot = ""
+        } else if (isFeedList && !positionMatches) {
             if (!accountBrowseReturnMismatchLogged) {
                 addLog(
                     "已识别动态列表，但当前可见内容与打开动态前的位置快照不匹配；" +
