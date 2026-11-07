@@ -87,7 +87,8 @@ class FreedomAccessibilityService : AccessibilityService() {
 
     private data class ScrollGestureProfile(
         val durationMs: Long,
-        val curveOffsetRatio: Float
+        val curveOffsetRatio: Float,
+        val microPerturbationFrequencyHz: Float
     )
 
     private data class ScrollGesturePlan(
@@ -116,6 +117,28 @@ class FreedomAccessibilityService : AccessibilityService() {
     private var accountBrowseSourceSnapshot = ""
     private var accountBrowseCountdownRemaining = 0
     private var accountBrowseOverlayPassthroughActive = false
+
+    // Device-only gesture calibration state. Calibration strokes are restricted to
+    // Freedom's own calibration surface and never target the selected third-party app.
+    private var gestureCalibrationReceiverRegistered = false
+    private var gestureCalibrationInProgress = false
+    private var gestureCalibrationTrialIndex = 0
+    private var gestureCalibrationBounds: Rect? = null
+
+    private val gestureCalibrationRunnable = Runnable {
+        dispatchNextGestureCalibrationTrial()
+    }
+
+    private val gestureCalibrationReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            when (intent?.action) {
+                GestureTuning.ACTION_START_CALIBRATION -> startGestureCalibration(intent)
+                GestureTuning.ACTION_CANCEL_CALIBRATION -> {
+                    cancelGestureCalibration("用户关闭了校准页面")
+                }
+            }
+        }
+    }
 
     private val monitorOverlayPassthroughWatchdog = Runnable {
         if (accountBrowseOverlayPassthroughActive) {
@@ -193,6 +216,23 @@ class FreedomAccessibilityService : AccessibilityService() {
                 registerReceiver(refreshReceiver, filter)
             }
             refreshReceiverRegistered = true
+        }
+        if (!gestureCalibrationReceiverRegistered) {
+            val filter = IntentFilter().apply {
+                addAction(GestureTuning.ACTION_START_CALIBRATION)
+                addAction(GestureTuning.ACTION_CANCEL_CALIBRATION)
+            }
+            if (Build.VERSION.SDK_INT >= 33) {
+                registerReceiver(
+                    gestureCalibrationReceiver,
+                    filter,
+                    Context.RECEIVER_NOT_EXPORTED
+                )
+            } else {
+                @Suppress("DEPRECATION")
+                registerReceiver(gestureCalibrationReceiver, filter)
+            }
+            gestureCalibrationReceiverRegistered = true
         }
         applyTargetPackageFilter()
         addLog("无障碍服务已连接；当前仅接收指定目标应用的事件")
@@ -341,6 +381,193 @@ class FreedomAccessibilityService : AccessibilityService() {
         mainHandler.removeCallbacks(scanRunnable)
         scanQueued = true
         mainHandler.postDelayed(scanRunnable, SCAN_DEBOUNCE_MS)
+    }
+
+
+    private fun startGestureCalibration(intent: Intent) {
+        if (gestureCalibrationInProgress) {
+            sendGestureCalibrationFailure("已有一组设备采样正在进行。")
+            return
+        }
+        if (accountBrowseGestureInFlight || accountBrowseOverlayPassthroughActive) {
+            sendGestureCalibrationFailure("当前自动浏览手势尚未结束，请停止当前操作后再采样。")
+            return
+        }
+
+        val activeRoot = runCatching { rootInActiveWindow }.getOrNull()
+        if (activeRoot == null) {
+            sendGestureCalibrationFailure("无法读取 Freedom 校准页面；请确认校准窗口仍在前台。")
+            return
+        }
+        val activePackage = try {
+            activeRoot.packageName?.toString().orEmpty()
+        } finally {
+            runCatching { activeRoot.recycle() }
+        }
+        if (activePackage != packageName) {
+            sendGestureCalibrationFailure(
+                "当前前台不是 Freedom 校准页面。采样不会在陌陌或其他应用页面执行。"
+            )
+            return
+        }
+
+        val left = intent.getIntExtra(GestureTuning.EXTRA_LEFT, Int.MIN_VALUE)
+        val top = intent.getIntExtra(GestureTuning.EXTRA_TOP, Int.MIN_VALUE)
+        val width = intent.getIntExtra(GestureTuning.EXTRA_WIDTH, 0)
+        val height = intent.getIntExtra(GestureTuning.EXTRA_HEIGHT, 0)
+        val display = resources.displayMetrics
+        if (left == Int.MIN_VALUE || top == Int.MIN_VALUE ||
+            width < dp(100) || height < dp(100) ||
+            left < 0 || top < 0 ||
+            left + width > display.widthPixels ||
+            top + height > display.heightPixels
+        ) {
+            sendGestureCalibrationFailure("校准区域坐标无效或超出屏幕范围，请重新打开采样页面。")
+            return
+        }
+
+        gestureCalibrationBounds = Rect(left, top, left + width, top + height)
+        gestureCalibrationTrialIndex = 0
+        gestureCalibrationInProgress = true
+        addLog(
+            "开始设备手势自动采样：仅在 Freedom 内部校准区域执行 " +
+                "${GestureTuning.CALIBRATION_TRIAL_COUNT} 组测试手势"
+        )
+        mainHandler.removeCallbacks(gestureCalibrationRunnable)
+        mainHandler.postDelayed(gestureCalibrationRunnable, 350L)
+    }
+
+    private fun dispatchNextGestureCalibrationTrial() {
+        if (!gestureCalibrationInProgress) return
+        val bounds = gestureCalibrationBounds
+        if (bounds == null) {
+            failGestureCalibration("校准区域信息已失效。")
+            return
+        }
+
+        val activeRoot = runCatching { rootInActiveWindow }.getOrNull()
+        if (activeRoot == null) {
+            failGestureCalibration("校准期间无法读取 Freedom 页面；测试已停止。")
+            return
+        }
+        val activePackage = try {
+            activeRoot.packageName?.toString().orEmpty()
+        } finally {
+            runCatching { activeRoot.recycle() }
+        }
+        if (activePackage != packageName) {
+            failGestureCalibration("校准页面已离开 Freedom；为避免触碰其他应用，测试已立即停止。")
+            return
+        }
+
+        val width = bounds.width().toFloat()
+        val height = bounds.height().toFloat()
+        val centerX = bounds.exactCenterX()
+        val startX = centerX - width * 0.12f
+        val endX = centerX + width * 0.12f
+        val startY = bounds.top + height * 0.76f
+        val endY = bounds.top + height * 0.24f
+        val control1X = centerX + width * 0.08f
+        val control2X = centerX - width * 0.08f
+        val control1Y = startY + (endY - startY) / 3f
+        val control2Y = startY + (endY - startY) * 2f / 3f
+
+        val path = Path().apply {
+            moveTo(startX, startY)
+            cubicTo(control1X, control1Y, control2X, control2Y, endX, endY)
+        }
+        val gesture = GestureDescription.Builder()
+            .addStroke(
+                GestureDescription.StrokeDescription(
+                    path,
+                    0L,
+                    GestureTuning.CALIBRATION_GESTURE_DURATION_MS
+                )
+            )
+            .build()
+
+        val trialNumber = gestureCalibrationTrialIndex + 1
+        val accepted = runCatching {
+            dispatchGesture(
+                gesture,
+                object : AccessibilityService.GestureResultCallback() {
+                    override fun onCompleted(gestureDescription: GestureDescription?) {
+                        if (!gestureCalibrationInProgress) return
+                        sendGestureCalibrationProgress(trialNumber)
+                        gestureCalibrationTrialIndex++
+                        if (gestureCalibrationTrialIndex >= GestureTuning.CALIBRATION_TRIAL_COUNT) {
+                            mainHandler.postDelayed({
+                                finishGestureCalibration()
+                            }, 250L)
+                        } else {
+                            mainHandler.postDelayed(
+                                gestureCalibrationRunnable,
+                                GestureTuning.CALIBRATION_TRIAL_GAP_MS
+                            )
+                        }
+                    }
+
+                    override fun onCancelled(gestureDescription: GestureDescription?) {
+                        if (gestureCalibrationInProgress) {
+                            failGestureCalibration("Android 系统中断了第 ${trialNumber} 组内部测试手势。")
+                        }
+                    }
+                },
+                mainHandler
+            )
+        }.getOrDefault(false)
+
+        if (!accepted && gestureCalibrationInProgress) {
+            failGestureCalibration("Android 未接受第 ${trialNumber} 组内部测试手势。")
+        }
+    }
+
+    private fun sendGestureCalibrationProgress(trialNumber: Int) {
+        sendBroadcast(
+            Intent(GestureTuning.ACTION_CALIBRATION_TRIAL_COMPLETED)
+                .setPackage(packageName)
+                .putExtra(GestureTuning.EXTRA_TRIAL_INDEX, trialNumber)
+        )
+    }
+
+    private fun finishGestureCalibration() {
+        if (!gestureCalibrationInProgress) return
+        gestureCalibrationInProgress = false
+        gestureCalibrationBounds = null
+        addLog("Freedom 内部手势采样完成；正在由主界面分析收到的 MotionEvent 时间戳")
+        sendBroadcast(
+            Intent(GestureTuning.ACTION_CALIBRATION_FINISHED)
+                .setPackage(packageName)
+                .putExtra(GestureTuning.EXTRA_SUCCESS, true)
+        )
+    }
+
+    private fun failGestureCalibration(reason: String) {
+        if (!gestureCalibrationInProgress) {
+            sendGestureCalibrationFailure(reason)
+            return
+        }
+        gestureCalibrationInProgress = false
+        gestureCalibrationBounds = null
+        mainHandler.removeCallbacks(gestureCalibrationRunnable)
+        addLog("设备手势自动采样中止：$reason")
+        sendGestureCalibrationFailure(reason)
+    }
+
+    private fun cancelGestureCalibration(reason: String) {
+        if (!gestureCalibrationInProgress) return
+        gestureCalibrationInProgress = false
+        gestureCalibrationBounds = null
+        mainHandler.removeCallbacks(gestureCalibrationRunnable)
+        addLog("设备手势自动采样已取消：$reason")
+    }
+
+    private fun sendGestureCalibrationFailure(reason: String) {
+        sendBroadcast(
+            Intent(GestureTuning.ACTION_CALIBRATION_FAILED)
+                .setPackage(packageName)
+                .putExtra(GestureTuning.EXTRA_MESSAGE, reason)
+        )
     }
 
     /**
@@ -693,6 +920,7 @@ class FreedomAccessibilityService : AccessibilityService() {
         }
     }
 
+
     /**
      * First-stage verification: dispatch one swipe inside the confirmed visible feed container.
      * Card recognition and card interaction remain deferred until after this initial scroll check.
@@ -898,7 +1126,8 @@ class FreedomAccessibilityService : AccessibilityService() {
             durationMs = prefs.getLong(KEY_BROWSE_GESTURE_DURATION_MS, DEFAULT_GESTURE_DURATION_MS)
                 .coerceIn(MIN_GESTURE_DURATION_MS, MAX_GESTURE_DURATION_MS),
             curveOffsetRatio = (prefs.getFloat(KEY_BROWSE_GESTURE_CURVE_OFFSET, DEFAULT_CURVE_OFFSET_RATIO))
-                .coerceIn(0f, MAX_CURVE_OFFSET_RATIO)
+                .coerceIn(0f, MAX_CURVE_OFFSET_RATIO),
+            microPerturbationFrequencyHz = GestureTuning.currentFrequencyHz(this)
         )
     }
 
@@ -975,7 +1204,7 @@ class FreedomAccessibilityService : AccessibilityService() {
             var pathX = x
             var pathY = y
             if (useMicroPerturbation && step > 0 && step < steps) {
-                // 5.1: optional 10 Hz, 1.2 px perturbation along the local curve normal.
+                // 5.1: calibrated device frequency, 1.2 px offset along the local curve normal.
                 val tangentX = 3f * inverseSquared * (control1X - startXf) +
                     6f * inverse * progress * (control2X - control1X) +
                     3f * progressSquared * (endXf - control2X)
@@ -986,7 +1215,7 @@ class FreedomAccessibilityService : AccessibilityService() {
                     .toFloat().coerceAtLeast(1f)
                 val elapsedSeconds = t * profile.durationMs / 1_000f
                 val wave = sin(
-                    2.0 * PI * MICRO_PERTURBATION_FREQUENCY_HZ * elapsedSeconds.toDouble()
+                    2.0 * PI * profile.microPerturbationFrequencyHz * elapsedSeconds.toDouble()
                 ).toFloat() * MICRO_PERTURBATION_AMPLITUDE_PX
                 pathX += (-tangentY / tangentLength) * wave
                 pathY += (tangentX / tangentLength) * wave
@@ -996,6 +1225,7 @@ class FreedomAccessibilityService : AccessibilityService() {
         }
         return ScrollGesturePlan(path, startX, startY, endX, endY)
     }
+
 
     private fun openVisibleFeedCard() {
         // dispatchGesture() can be accepted by Android without producing a real list scroll
@@ -1284,6 +1514,7 @@ class FreedomAccessibilityService : AccessibilityService() {
             runCatching { listNode.recycle() }
         }
     }
+
 
     /**
      * Locate the upper horizontal tab row. Resource IDs are deliberately not required:
@@ -1913,6 +2144,13 @@ class FreedomAccessibilityService : AccessibilityService() {
             runCatching { unregisterReceiver(refreshReceiver) }
             refreshReceiverRegistered = false
         }
+        if (gestureCalibrationReceiverRegistered) {
+            runCatching { unregisterReceiver(gestureCalibrationReceiver) }
+            gestureCalibrationReceiverRegistered = false
+        }
+        gestureCalibrationInProgress = false
+        gestureCalibrationBounds = null
+        mainHandler.removeCallbacks(gestureCalibrationRunnable)
         super.onDestroy()
     }
 
@@ -1970,8 +2208,7 @@ class FreedomAccessibilityService : AccessibilityService() {
         private const val MIN_GESTURE_WIDTH_PX = 220
         private const val MIN_GESTURE_HEIGHT_PX = 300
         private const val GESTURE_PATH_STEPS = 32
-        private const val ENABLE_SCROLL_MICRO_PERTURBATION = false
-        private const val MICRO_PERTURBATION_FREQUENCY_HZ = 10f
+        private const val ENABLE_SCROLL_MICRO_PERTURBATION = true
         private const val MICRO_PERTURBATION_AMPLITUDE_PX = 1.2f
         private const val MICRO_PERTURBATION_PATH_STEPS = 100
         private const val MIN_FEED_CARD_WIDTH_RATIO = 0.75f
