@@ -109,3 +109,16 @@
 - `accountBrowsePhase` 和阶段分派仍归 `AccountBrowseController`；各类系统事件、手势执行、延时、导航重试、弹窗处理和 reset 副作用仍由 Service 及既有专职组件执行。
 - 将上传基线中漏掉的 `AccountBrowseController` import 一并补齐；同时添加 `AccountBrowseSessionState` import。
 - 无新功能、权限、广播、持久化键、依赖或时间/阈值变更。完整 Android 编译及真机测试仍需 GitHub Actions 和设备验证。
+
+
+## Stage 9 — 自动浏览暂停、恢复与会话生命周期协调（2026-11-07）
+
+- 基线：本次上传的 `Freedom(10).zip`，仓库 HEAD `f5203d9`。
+- `AccountBrowseController` 新增统一的会话 reset、pause、暂停期间人工接管快照、手动静默恢复以及导航恢复准备入口。
+- `AccountBrowseSessionState.reset()` 按原 Service reset 方法的顺序清理 52 个显式重置字段；悬浮窗触摸穿透标记仍由原 WindowManager 恢复方法清除，若恢复失败则保留原标记。
+- Service 保留平台副作用和时序边界：手势轨迹清理、悬浮窗状态恢复、Scheduler/Handler 回调取消、倒计时 UI 隐藏、日志和下一步调度通过原有调用点/回调执行。
+- 手动恢复的分支判断顺序、暂停上下文读取、字段清理顺序、进入 `WAIT_FOR_DYNAMIC_TAB`、deadline 计算和轮询调度保持原顺序。
+- 页面状态不确定时的恢复仍仅在没有暂停上下文时创建上下文；先执行原悬浮窗与调度清理，再重置导航状态，进入主动导航阶段并安排原轮询。
+- 两处“已经处于 PAUSED 时记录人工接管上下文”的重复代码改为调用 Controller 的同一方法；保留第一次上下文快照不被覆盖的规则。
+- 未更改状态枚举、各阶段处理动作、导航/弹窗重试参数、手势参数、延时常量、广播、持久化键或权限；无新功能和第三方依赖。
+- 本地完成 reset 字段顺序与原 Service 逐项对照、Controller 独立 Kotlin 编译/行为顺序检查、引用和差异检查；当前环境没有 Android SDK/Gradle，未执行完整 `assembleDebug` 或真机回归，仍须通过 GitHub Actions 验证。

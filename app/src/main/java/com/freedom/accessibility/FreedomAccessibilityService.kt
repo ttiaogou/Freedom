@@ -281,8 +281,8 @@ class FreedomAccessibilityService : AccessibilityService() {
         get() = accountBrowseSession.popupExhaustedLogged
         set(value) { accountBrowseSession.popupExhaustedLogged = value }
 
-    // Owns the automatic-browse phase, phase dispatch, and mutable session evidence.
-    // Android-specific operations and lifecycle remain in this service.
+    // Owns the automatic-browse phase, phase dispatch, session evidence, and lifecycle coordination.
+    // Android-specific operations and platform side effects remain in this service.
     private val accountBrowseController by lazy(LazyThreadSafetyMode.NONE) {
         AccountBrowseController(
             isSessionEnabled = {
@@ -446,40 +446,16 @@ class FreedomAccessibilityService : AccessibilityService() {
 
     // Resume after the user finishes navigating or interacting with the target app.
     private val manualTouchResumeRunnable = Runnable {
-        when {
-            !accountBrowseManualResumeAllowed -> Unit
-            accountBrowseTouchActive -> addLog("手动恢复检查未执行：仍检测到屏幕触摸，继续等待用户操作结束")
-            !MonitorStore.isRunning(this) -> addLog("手动恢复检查未执行：监听已停止")
-            !isAccountBrowseModeEnabled() -> addLog("手动恢复检查未执行：自动浏览模式已关闭")
-            else -> {
-                accountBrowseManualResumeAllowed = false
-                val context = accountBrowsePausedContext
-                addLog(
-                    "用户最后一次屏幕操作后已静默 ${MANUAL_TOUCH_RESUME_MS / 1000.0} 秒；" +
-                        "开始基于暂停上下文重新分析当前页面；暂停前阶段=${context?.phaseName ?: "未知"}，" +
-                        "暂停前 Activity=${context?.activityClass?.ifBlank { "未知" } ?: "未知"}"
-                )
-                accountBrowsePauseReason = ""
-                accountBrowseSourceFingerprint = ""
-                accountBrowseDetailFingerprint = ""
-                accountBrowseLastStableFingerprint = ""
-                accountBrowseStableSamples = 0
-                accountBrowseNavigationActionKey = ""
-                accountBrowseNavigationBeforeActivity = ""
-                accountBrowseNavigationBeforeFingerprint = ""
-                accountBrowseNavigationActionDeadlineAt = 0L
-                accountBrowseNavigationActionAttempts = 0
-                accountBrowseRecoveryBackAttempts = 0
-                accountBrowseRecoveryHomeClickAttempts = 0
-                accountBrowseRecoveryDynamicClickAttempts = 0
-                accountBrowseDynamicTabClickConfirmed = false
-                accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_DYNAMIC_TAB
-                accountBrowseDeadlineAt = System.currentTimeMillis() + INITIAL_DYNAMIC_TAB_WAIT_TIMEOUT_MS
-                accountBrowseLastDynamicTabWaitReason = ""
-                addLog("手动恢复已进入主动导航：先识别页面层级，再返回必要的上级页面，主动定位并验证‘动态’标签")
-                scheduleAccountBrowseStep(PAGE_STATE_POLL_MS)
-            }
-        }
+        accountBrowseController.resumeAfterManualTouch(
+            isMonitoringRunning = { MonitorStore.isRunning(this) },
+            isBrowseModeEnabled = ::isAccountBrowseModeEnabled,
+            quietPeriodMs = MANUAL_TOUCH_RESUME_MS,
+            initialDynamicTabWaitTimeoutMs = INITIAL_DYNAMIC_TAB_WAIT_TIMEOUT_MS,
+            pageStatePollMs = PAGE_STATE_POLL_MS,
+            currentTimeMillis = System::currentTimeMillis,
+            onLog = ::addLog,
+            scheduleStep = ::scheduleAccountBrowseStep
+        )
     }
 
     override fun onServiceConnected() {
@@ -642,18 +618,14 @@ class FreedomAccessibilityService : AccessibilityService() {
                                 allowManualResume = true
                             )
                         } else {
-                            accountBrowseManualResumeAllowed = true
-                            if (accountBrowsePausedContext == null) {
-                                accountBrowsePausedContext = ManualResumeContext(
-                                    phaseName = "PAUSED",
-                                    activityClass = accountBrowseCurrentActivityClass,
-                                    sourceFingerprint = accountBrowseSourceFingerprint,
-                                    detailFingerprint = accountBrowseDetailFingerprint,
-                                    imageBrowserActive = accountBrowseImageBrowserActive,
-                                    lastProgrammaticAction = accountBrowseProgrammaticActionLabel,
-                                    capturedAt = System.currentTimeMillis()
-                                )
-                            }
+                            accountBrowseController.recordManualTakeoverWhilePaused(
+                                activityClass = accountBrowseCurrentActivityClass,
+                                sourceFingerprint = accountBrowseSourceFingerprint,
+                                detailFingerprint = accountBrowseDetailFingerprint,
+                                imageBrowserActive = accountBrowseImageBrowserActive,
+                                lastProgrammaticAction = accountBrowseProgrammaticActionLabel,
+                                currentTimeMillis = System::currentTimeMillis
+                            )
                             addLog("检测到用户正在操作屏幕；原暂停原因=${accountBrowsePauseReason.ifBlank { "未记录" }}；操作结束后重新分析页面层级并导航到动态标签")
                         }
                     }
@@ -830,100 +802,51 @@ class FreedomAccessibilityService : AccessibilityService() {
     }
 
     private fun resetAccountBrowseSession() {
-        GestureTrailOverlay.clear()
-        restoreMonitorOverlayTouchPassthrough()
-        accountBrowseScheduler.cancel()
-        mainHandler.removeCallbacks(manualTouchResumeRunnable)
-        accountBrowsePhase = AccountBrowsePhase.IDLE
-        accountBrowsePauseReason = ""
-        accountBrowseLastDynamicTabWaitReason = ""
-        accountBrowseDeadlineAt = 0L
-        accountBrowseSourceFingerprint = ""
-        accountBrowseSourceSnapshot = ""
-        accountBrowseReturnedStableSamples = 0
-        accountBrowseLastReturnedSnapshot = ""
-        accountBrowseReturnMismatchLogged = false
-        accountBrowseDetailFingerprint = ""
-        accountBrowseDetailActivityClass = ""
-        accountBrowseLastStableFingerprint = ""
-        accountBrowseStableSamples = 0
-        accountBrowseLastPopupSignature = ""
-        accountBrowsePopupDismissPending = false
-        accountBrowsePopupDismissDeadlineAt = 0L
-        accountBrowsePopupNextAttemptAt = 0L
-        accountBrowsePopupActionAttempts = 0
-        accountBrowsePopupExhaustedLogged = false
-        accountBrowseTouchActive = false
-        accountBrowseManualResumeAllowed = false
-        accountBrowseTouchStartedDuringGesture = false
-        accountBrowseTouchEndedDuringGesture = false
-        accountBrowseGestureInFlight = false
-        accountBrowseScrollEventSeen = false
-        accountBrowseScrollEventCount = 0
-        accountBrowseLastScrollEventAt = 0L
-        accountBrowseSwipeCount = 0
-        accountBrowseFallbackScrollAttempted = false
-        accountBrowseCountdownRemaining = 0
-        accountBrowseCurrentActivityClass = ""
-        accountBrowseImageBrowserReturnActivityClass = ""
-        accountBrowseImageBrowserActive = false
-        accountBrowseDetailDwellDueAt = 0L
-        accountBrowseDetailDwellRemainingMs = 0L
-        accountBrowseIgnoreManualEventsUntil = 0L
-        accountBrowseProgrammaticActionLabel = ""
-        accountBrowseSafeCardRecheckCount = 0
-        accountBrowseLastGlobalTouchEventAt = 0L
-        accountBrowseLastGlobalTouchEventName = ""
-        accountBrowseLastGlobalTouchEventOrigin = ""
-        accountBrowsePausedContext = null
-        accountBrowseNavigationActionKey = ""
-        accountBrowseNavigationBeforeActivity = ""
-        accountBrowseNavigationBeforeFingerprint = ""
-        accountBrowseNavigationActionDeadlineAt = 0L
-        accountBrowseNavigationActionAttempts = 0
-        accountBrowseRecoveryBackAttempts = 0
-        accountBrowseRecoveryHomeClickAttempts = 0
-        accountBrowseRecoveryDynamicClickAttempts = 0
-        accountBrowseDynamicTabClickConfirmed = false
-        accountBrowseNotTargetForegroundLogged = false
-        accountBrowseRootUnavailableLogged = false
-        hideFirstSwipeCountdown()
+        accountBrowseController.resetSession(
+            beforeReset = {
+                GestureTrailOverlay.clear()
+                restoreMonitorOverlayTouchPassthrough()
+                accountBrowseScheduler.cancel()
+                mainHandler.removeCallbacks(manualTouchResumeRunnable)
+            },
+            afterReset = ::hideFirstSwipeCountdown
+        )
     }
 
     private fun pauseAccountBrowse(
         reason: String,
         allowManualResume: Boolean = false
     ) {
-        if (allowManualResume && accountBrowsePhase != AccountBrowsePhase.PAUSED) {
-            accountBrowsePausedContext = ManualResumeContext(
-                phaseName = accountBrowsePhase.name,
-                activityClass = accountBrowseCurrentActivityClass,
-                sourceFingerprint = accountBrowseSourceFingerprint,
-                detailFingerprint = accountBrowseDetailFingerprint,
-                imageBrowserActive = accountBrowseImageBrowserActive,
-                lastProgrammaticAction = accountBrowseProgrammaticActionLabel,
-                capturedAt = System.currentTimeMillis()
-            )
-            addLog(
-                "已保存暂停上下文：阶段=${accountBrowsePhase.name}；" +
-                    "Activity=${accountBrowseCurrentActivityClass.ifBlank { "未知" }}；" +
-                    "详情上下文=${if (accountBrowseDetailFingerprint.isNotBlank()) "已保存" else "无"}；" +
-                    "图片浏览状态=$accountBrowseImageBrowserActive"
-            )
-        }
-        GestureTrailOverlay.clear()
-        restoreMonitorOverlayTouchPassthrough()
-        accountBrowseScheduler.cancel()
-        accountBrowseManualResumeAllowed = allowManualResume
-        accountBrowseGestureInFlight = false
-        accountBrowseCountdownRemaining = 0
-        hideFirstSwipeCountdown()
-        accountBrowsePhase = AccountBrowsePhase.PAUSED
-        accountBrowseDeadlineAt = 0L
-        if (accountBrowsePauseReason != reason) {
-            accountBrowsePauseReason = reason
-            addLog("动态浏览已暂停：$reason")
-        }
+        accountBrowseController.pauseSession(
+            reason = reason,
+            allowManualResume = allowManualResume,
+            capturePausedContext = { phaseAtPause ->
+                accountBrowsePausedContext = ManualResumeContext(
+                    phaseName = phaseAtPause.name,
+                    activityClass = accountBrowseCurrentActivityClass,
+                    sourceFingerprint = accountBrowseSourceFingerprint,
+                    detailFingerprint = accountBrowseDetailFingerprint,
+                    imageBrowserActive = accountBrowseImageBrowserActive,
+                    lastProgrammaticAction = accountBrowseProgrammaticActionLabel,
+                    capturedAt = System.currentTimeMillis()
+                )
+                addLog(
+                    "已保存暂停上下文：阶段=${phaseAtPause.name}；" +
+                        "Activity=${accountBrowseCurrentActivityClass.ifBlank { "未知" }}；" +
+                        "详情上下文=${if (accountBrowseDetailFingerprint.isNotBlank()) "已保存" else "无"}；" +
+                        "图片浏览状态=$accountBrowseImageBrowserActive"
+                )
+            },
+            beforePause = {
+                GestureTrailOverlay.clear()
+                restoreMonitorOverlayTouchPassthrough()
+                accountBrowseScheduler.cancel()
+            },
+            hideCountdown = ::hideFirstSwipeCountdown,
+            onPauseReasonChanged = { changedReason ->
+                addLog("动态浏览已暂停：$changedReason")
+            }
+        )
     }
 
     private fun performAccountBrowseStep() {
@@ -2153,36 +2076,21 @@ class FreedomAccessibilityService : AccessibilityService() {
 
     /** Machine-detected page uncertainty should enter the same verified navigator, not dead-end PAUSED. */
     private fun beginDynamicNavigationRecovery(reason: String) {
-        if (accountBrowsePausedContext == null) {
-            accountBrowsePausedContext = ManualResumeContext(
-                phaseName = accountBrowsePhase.name,
-                activityClass = accountBrowseCurrentActivityClass,
-                sourceFingerprint = accountBrowseSourceFingerprint,
-                detailFingerprint = accountBrowseDetailFingerprint,
-                imageBrowserActive = accountBrowseImageBrowserActive,
-                lastProgrammaticAction = accountBrowseProgrammaticActionLabel,
-                capturedAt = System.currentTimeMillis()
-            )
-        }
-        GestureTrailOverlay.clear()
-        restoreMonitorOverlayTouchPassthrough()
-        accountBrowseScheduler.cancel()
-        accountBrowsePauseReason = reason
-        accountBrowseManualResumeAllowed = false
-        accountBrowseNavigationActionKey = ""
-        accountBrowseNavigationBeforeActivity = ""
-        accountBrowseNavigationBeforeFingerprint = ""
-        accountBrowseNavigationActionDeadlineAt = 0L
-        accountBrowseNavigationActionAttempts = 0
-        accountBrowseRecoveryBackAttempts = 0
-        accountBrowseRecoveryHomeClickAttempts = 0
-        accountBrowseRecoveryDynamicClickAttempts = 0
-        accountBrowseDynamicTabClickConfirmed = false
-        accountBrowseLastDynamicTabWaitReason = ""
-        accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_DYNAMIC_TAB
-        accountBrowseDeadlineAt = System.currentTimeMillis() + INITIAL_DYNAMIC_TAB_WAIT_TIMEOUT_MS
-        addLog("页面状态需要重新定位：$reason；启动主动导航，重新识别页面层级并验证动态标签")
-        scheduleAccountBrowseStep(PAGE_STATE_POLL_MS)
+        accountBrowseController.beginNavigationRecovery(
+            reason = reason,
+            beforeRecovery = {
+                GestureTrailOverlay.clear()
+                restoreMonitorOverlayTouchPassthrough()
+                accountBrowseScheduler.cancel()
+            },
+            initialDynamicTabWaitTimeoutMs = INITIAL_DYNAMIC_TAB_WAIT_TIMEOUT_MS,
+            pageStatePollMs = PAGE_STATE_POLL_MS,
+            currentTimeMillis = System::currentTimeMillis,
+            onStarted = { recoveryReason ->
+                addLog("页面状态需要重新定位：$recoveryReason；启动主动导航，重新识别页面层级并验证动态标签")
+            },
+            scheduleStep = ::scheduleAccountBrowseStep
+        )
     }
 
     /**
@@ -2463,18 +2371,14 @@ class FreedomAccessibilityService : AccessibilityService() {
                 allowManualResume = true
             )
         } else {
-            accountBrowseManualResumeAllowed = true
-            if (accountBrowsePausedContext == null) {
-                accountBrowsePausedContext = ManualResumeContext(
-                    phaseName = "PAUSED",
-                    activityClass = accountBrowseCurrentActivityClass,
-                    sourceFingerprint = accountBrowseSourceFingerprint,
-                    detailFingerprint = accountBrowseDetailFingerprint,
-                    imageBrowserActive = accountBrowseImageBrowserActive,
-                    lastProgrammaticAction = accountBrowseProgrammaticActionLabel,
-                    capturedAt = now
-                )
-            }
+            accountBrowseController.recordManualTakeoverWhilePaused(
+                activityClass = accountBrowseCurrentActivityClass,
+                sourceFingerprint = accountBrowseSourceFingerprint,
+                detailFingerprint = accountBrowseDetailFingerprint,
+                imageBrowserActive = accountBrowseImageBrowserActive,
+                lastProgrammaticAction = accountBrowseProgrammaticActionLabel,
+                currentTimeMillis = { now }
+            )
             addLog("用户操作发生时自动浏览已处于安全暂停；原暂停原因=${accountBrowsePauseReason.ifBlank { "未记录" }}；静默结束后重新分析页面层级并导航到动态标签")
         }
 

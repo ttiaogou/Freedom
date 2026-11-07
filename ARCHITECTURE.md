@@ -24,7 +24,7 @@
 4. 原先取消 `accountBrowseRunnable` 并清除 pending 的位置，改为调用同一个 scheduler 的 `cancel()`。
 5. 手动触摸静默恢复、悬浮窗触摸穿透 watchdog、首次滑动倒计时和手势校准仍使用各自独立 Runnable，不合并到主调度器。
 
-页面识别、导航重试、滑动派发与完成回调、详情停留、图片浏览返回、人工接管与恢复状态转换均保留在 `FreedomAccessibilityService`，本阶段只抽取无副作用的类型/格式化及职责边界明确的扫描器，避免改变调度流程。
+页面识别、导航重试、滑动派发与完成回调、详情停留、图片浏览返回及目标应用事件处理仍由 `FreedomAccessibilityService` 执行；自动浏览的阶段状态、会话数据和 pause/reset/manual-resume/recovery 协调由 `AccountBrowseController` 持有并编排，平台副作用仍通过 Service 回调完成。
 
 ## 明确未做
 
@@ -113,3 +113,13 @@
 - 本阶段不改变页面指纹算法、暂停/恢复时序、手动触摸判定、手势参数、导航/弹窗重试参数或任何自动操作。未增加持久化、广播、权限或第三方依赖。
 - 基线 ZIP 带有上一轮 Stage 7 遗漏的 `AccountBrowseController` import；本次一并补齐该 import，避免将已确认的编译错误继续带入后续版本。
 - 当前环境没有 Android SDK/Gradle，完整 Android `assembleDebug` 与真机回归仍须由 GitHub Actions 和设备完成。
+
+## Stage 9 — 自动浏览暂停、恢复与会话生命周期协调
+
+- `AccountBrowseController` 现在统一协调会话 reset、暂停、暂停期间人工接管记录、手动静默结束后的恢复准备，以及页面不确定时的主动导航恢复准备。
+- `AccountBrowseSessionState.reset()` 承接原 Service reset 方法中的 52 项会话字段清理；`overlayPassthroughActive` 仍由 WindowManager 触摸穿透恢复流程负责清除，保持原有失败时保留标记的行为。
+- Service 保留 Android/窗口副作用：清理手势轨迹、恢复悬浮窗触摸状态、取消 Handler 回调、隐藏倒计时，以及日志输出和定时调度；Controller 通过回调在原有顺序点调用这些动作。
+- 手动恢复的运行状态、模式、触摸状态判断顺序，暂停上下文读取、导航证据清理、阶段切换、deadline 计算及后续调度顺序保持原实现。
+- 页面不确定时的恢复仍保留原有暂停上下文只在为空时创建、先清理悬浮窗/调度、再清理导航尝试字段、进入 `WAIT_FOR_DYNAMIC_TAB` 并安排下一步的顺序。
+- `pauseAccountBrowse()`、`resetAccountBrowseSession()`、`beginDynamicNavigationRecovery()` 在 Service 中保留为兼容入口；不迁移 AccessibilityService 生命周期、实际手势、页面识别、导航动作或 Handler 所有权。
+- 本阶段没有改变阶段枚举、超时数值、静默时长、页面识别规则、点击/滑动行为和用户操作方式；没有新增权限、广播、持久化键或第三方依赖。

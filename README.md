@@ -43,7 +43,7 @@ Freedom 需要用户主动开启无障碍服务和悬浮窗权限。前台伴随
 
 ## 本次结构整理
 
-参阅 [ARCHITECTURE.md](ARCHITECTURE.md) 和 [SOURCE-CHANGES.md](SOURCE-CHANGES.md)。目前完成第一阶段职责拆分、第二阶段设备手势校准执行拆分、第三阶段陌陌页面识别拆分、第四阶段陌陌弹窗识别拆分、第五阶段动态列表手势规划拆分、第六阶段导航动作边界拆分和第七阶段自动浏览阶段协调器初步拆分和第八阶段自动浏览会话状态归属整理；均不新增自动化功能。Android 编译和真机验证仍应通过 GitHub Actions 与实际设备完成。
+参阅 [ARCHITECTURE.md](ARCHITECTURE.md) 和 [SOURCE-CHANGES.md](SOURCE-CHANGES.md)。目前已完成第一阶段职责拆分、第二阶段设备手势校准执行拆分、第三阶段陌陌页面识别拆分、第四阶段陌陌弹窗识别拆分、第五阶段动态列表手势规划拆分、第六阶段导航动作边界拆分、第七阶段自动浏览阶段协调器初步拆分、第八阶段自动浏览会话状态归属整理，以及第九阶段暂停/恢复/会话生命周期协调；均不新增自动化功能。Android 编译和真机验证仍应通过 GitHub Actions 与实际设备完成。
 
 
 第五阶段新增 `accessibility/browse/MomoFeedGestureController.kt`，负责动态列表目标发现、可见节点快照、手势参数读取和滑动路径规划；真实手势派发及自动浏览状态机仍由无障碍服务负责。
