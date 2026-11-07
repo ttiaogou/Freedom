@@ -100,6 +100,16 @@ class FreedomAccessibilityService : AccessibilityService() {
     private var accountBrowseFallbackScrollAttempted = false
     private var accountBrowseSourceSnapshot = ""
     private var accountBrowseCountdownRemaining = 0
+    private var accountBrowseOverlayPassthroughActive = false
+
+    private val monitorOverlayPassthroughWatchdog = Runnable {
+        if (accountBrowseOverlayPassthroughActive) {
+            restoreMonitorOverlayTouchPassthrough()
+            if (accountBrowsePhase == AccountBrowsePhase.WAIT_FOR_SCROLL_SETTLE) {
+                pauseAccountBrowse("首次滑动回调超时；已恢复实时监控悬浮窗触摸状态")
+            }
+        }
+    }
     private var firstSwipeCountdownWindow: WindowManager? = null
     private var firstSwipeCountdownView: TextView? = null
     private var refreshReceiverRegistered = false
@@ -355,6 +365,7 @@ class FreedomAccessibilityService : AccessibilityService() {
     }
 
     private fun resetAccountBrowseSession() {
+        restoreMonitorOverlayTouchPassthrough()
         mainHandler.removeCallbacks(accountBrowseRunnable)
         mainHandler.removeCallbacks(manualTouchResumeRunnable)
         accountBrowseStepPending = false
@@ -376,6 +387,7 @@ class FreedomAccessibilityService : AccessibilityService() {
     }
 
     private fun pauseAccountBrowse(reason: String) {
+        restoreMonitorOverlayTouchPassthrough()
         mainHandler.removeCallbacks(accountBrowseRunnable)
         accountBrowseStepPending = false
         accountBrowseGestureInFlight = false
@@ -573,6 +585,40 @@ class FreedomAccessibilityService : AccessibilityService() {
         return root
     }
 
+    /** Temporarily remove the live monitor window from the touch path for the swipe. */
+    private fun enableMonitorOverlayTouchPassthrough(): Boolean {
+        val before = MonitorOverlay.touchStateDescription()
+        val enabled = MonitorOverlay.setTouchPassthrough(true)
+        if (!enabled) {
+            addLog("无法暂时关闭实时监控悬浮窗的触摸拦截；未发送首次滑动。$before")
+            return false
+        }
+        accountBrowseOverlayPassthroughActive = true
+        mainHandler.removeCallbacks(monitorOverlayPassthroughWatchdog)
+        mainHandler.postDelayed(
+            monitorOverlayPassthroughWatchdog,
+            MONITOR_OVERLAY_PASSTHROUGH_WATCHDOG_MS
+        )
+        addLog(
+            "首次滑动前已临时隐藏实时监控悬浮窗并启用触摸穿透。" +
+                "$before；切换后=${MonitorOverlay.touchStateDescription()}"
+        )
+        return true
+    }
+
+    private fun restoreMonitorOverlayTouchPassthrough(): Boolean {
+        if (!accountBrowseOverlayPassthroughActive) return true
+        val restored = MonitorOverlay.setTouchPassthrough(false)
+        if (restored) {
+            accountBrowseOverlayPassthroughActive = false
+            mainHandler.removeCallbacks(monitorOverlayPassthroughWatchdog)
+            addLog("首次滑动检查结束：实时监控悬浮窗已恢复显示和触摸操作")
+            return true
+        }
+        addLog("警告：实时监控悬浮窗触摸状态恢复失败；悬浮窗可能仍处于隐藏/穿透状态")
+        return false
+    }
+
     /**
      * First-stage verification: dispatch one screen-coordinate swipe only.
      * No feed tab, RecyclerView, scroll-node or card lookup is performed before dispatch.
@@ -597,6 +643,11 @@ class FreedomAccessibilityService : AccessibilityService() {
         val gesture = GestureDescription.Builder()
             .addStroke(GestureDescription.StrokeDescription(path, 0L, profile.durationMs))
             .build()
+
+        if (!enableMonitorOverlayTouchPassthrough()) {
+            pauseAccountBrowse("实时监控悬浮窗无法切换为触摸穿透；首次滑动未执行")
+            return
+        }
 
         accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_SCROLL_SETTLE
         accountBrowseScrollEventSeen = false
@@ -651,6 +702,10 @@ class FreedomAccessibilityService : AccessibilityService() {
     /** End this diagnostic cycle after the first swipe; card opening is deliberately deferred. */
     private fun verifyInitialSwipe() {
         if (accountBrowsePhase != AccountBrowsePhase.WAIT_FOR_SCROLL_SETTLE) return
+        if (!restoreMonitorOverlayTouchPassthrough()) {
+            pauseAccountBrowse("首次滑动后无法恢复实时监控悬浮窗；已停止后续操作")
+            return
+        }
         accountBrowseInitialSwipeCompleted = true
 
         val root = runCatching { rootInActiveWindow }.getOrNull()
@@ -1683,6 +1738,7 @@ class FreedomAccessibilityService : AccessibilityService() {
     }
 
     override fun onDestroy() {
+        restoreMonitorOverlayTouchPassthrough()
         mainHandler.removeCallbacksAndMessages(null)
         scanQueued = false
         accountBrowseStepPending = false
@@ -1725,6 +1781,7 @@ class FreedomAccessibilityService : AccessibilityService() {
         private const val LIST_RETURN_TIMEOUT_MS = 10_000L
         private const val PAGE_STATE_POLL_MS = 300L
         private const val SCROLL_SETTLE_MS = 850L
+        private const val MONITOR_OVERLAY_PASSTHROUGH_WATCHDOG_MS = 5_000L
         private const val MANUAL_TOUCH_RESUME_MS = 2_500L
         private const val INITIAL_FEED_STABILITY_TIMEOUT_MS = 10_000L
         private const val REQUIRED_STABLE_FEED_SAMPLES = 3

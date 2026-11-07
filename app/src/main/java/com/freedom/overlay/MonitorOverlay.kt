@@ -46,6 +46,7 @@ object MonitorOverlay {
 
     private var attached = false
     private var expanded = false
+    private var touchPassthrough = false
 
     fun show(context: Context): Boolean {
         if (attached) {
@@ -240,13 +241,21 @@ object MonitorOverlay {
             WindowManager.LayoutParams.TYPE_PHONE
         }
 
+        val baseOverlayFlags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+            WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+            WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+        val overlayFlags = if (touchPassthrough) {
+            baseOverlayFlags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+        } else {
+            baseOverlayFlags
+        }
+        outer.visibility = if (touchPassthrough) View.INVISIBLE else View.VISIBLE
+
         val params = WindowManager.LayoutParams(
             dp(appContext, panelWidthDp),
             WindowManager.LayoutParams.WRAP_CONTENT,
             windowType,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
-                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            overlayFlags,
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.BOTTOM or Gravity.END
@@ -371,6 +380,58 @@ object MonitorOverlay {
         }
     }
 
+    /**
+     * Temporarily removes the monitor panel from the touch path while an accessibility
+     * gesture is dispatched. The root view is made INVISIBLE as well as NOT_TOUCHABLE;
+     * this matters on Android 12+, where opaque TYPE_APPLICATION_OVERLAY windows can
+     * otherwise block pass-through touches even when FLAG_NOT_TOUCHABLE is set.
+     * Must be called on the main thread.
+     */
+    fun setTouchPassthrough(enabled: Boolean): Boolean {
+        if (Looper.myLooper() != Looper.getMainLooper()) return false
+        if (touchPassthrough == enabled) return true
+
+        val view = rootView
+        val params = layoutParams
+        if (!attached || view == null || params == null) {
+            touchPassthrough = enabled
+            return true
+        }
+
+        val oldFlags = params.flags
+        val oldVisibility = view.visibility
+        return try {
+            if (enabled) {
+                view.visibility = View.INVISIBLE
+                params.flags = params.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+            } else {
+                params.flags = params.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
+                view.visibility = View.VISIBLE
+            }
+            val wm = windowManager ?: throw IllegalStateException("WindowManager is unavailable")
+            wm.updateViewLayout(view, params)
+            touchPassthrough = enabled
+            true
+        } catch (_: Exception) {
+            params.flags = oldFlags
+            view.visibility = oldVisibility
+            runCatching { windowManager?.updateViewLayout(view, params) }
+            false
+        }
+    }
+
+    /** Diagnostic geometry used to verify whether the monitor panel overlaps a gesture. */
+    fun touchStateDescription(): String {
+        val view = rootView ?: return "实时监控悬浮窗未附加"
+        val location = IntArray(2)
+        runCatching { view.getLocationOnScreen(location) }
+        val width = runCatching { view.width }.getOrDefault(0)
+        val height = runCatching { view.height }.getOrDefault(0)
+        val visible = view.visibility == View.VISIBLE
+        return "悬浮窗区域=(${location[0]},${location[1]},${location[0] + width},${location[1] + height})，" +
+            "可见=$visible，触摸穿透=$touchPassthrough"
+    }
+
     fun update(context: Context) {
         val appContext = context.applicationContext
         mainHandler.post {
@@ -420,6 +481,7 @@ object MonitorOverlay {
             }
             attached = false
             expanded = false
+            touchPassthrough = false
             rootView = null
             statusView = null
             appView = null
