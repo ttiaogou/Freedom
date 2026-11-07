@@ -1,6 +1,7 @@
 package com.freedom.ui.config
 
 import android.app.Activity
+import android.app.AlertDialog
 import android.app.Dialog
 import android.content.Intent
 import android.graphics.Color
@@ -32,6 +33,8 @@ internal class ConfigPanel(
         val timestamp: () -> String,
         val openAppDetailsSettings: () -> Unit,
         val requestOverlayPermission: () -> Unit,
+        val notificationPermissionStatus: () -> String,
+        val requestNotificationPermission: () -> Unit,
         val showTargetEditor: () -> Unit,
         val requestPhotoPermission: () -> Unit,
         val showPermissionExplanation: () -> Unit,
@@ -109,6 +112,15 @@ internal class ConfigPanel(
             if (Settings.canDrawOverlays(activity)) "已允许" else "去授权"
         ) {
             callbacks.requestOverlayPermission()
+        }
+        val notificationStatus = callbacks.notificationPermissionStatus()
+        addConfigActionRow(
+            rows, "♧", "通知权限（可选）",
+            notificationStatus,
+            if (notificationStatus.startsWith("未授权")) "授权" else "查看"
+        ) {
+            dialog.dismiss()
+            callbacks.requestNotificationPermission()
         }
         addConfigSwitchRow(
             rows, "⛨", "保活服务", "监听运行期间显示持续通知并提高进程优先级",

@@ -1,6 +1,7 @@
 package com.freedom
 
 import android.app.Activity
+import android.app.Dialog
 import android.app.AlertDialog
 import android.content.BroadcastReceiver
 import android.content.ComponentName
@@ -10,6 +11,7 @@ import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.Typeface
+import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.os.Build
@@ -21,11 +23,15 @@ import android.view.ViewGroup
 import android.view.WindowInsets
 import android.widget.Button
 import android.widget.CheckBox
+import android.widget.EditText
 import android.widget.ImageButton
 import android.widget.LinearLayout
+import android.widget.ScrollView
+import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
 import com.freedom.accessibility.FreedomAccessibilityService
+import com.freedom.accessibility.gesture.GestureTuning
 import com.freedom.data.MonitorActions
 import com.freedom.data.MonitorStore
 import com.freedom.overlay.MonitorOverlay
@@ -43,6 +49,7 @@ class MainActivity : Activity() {
     private lateinit var keepAccountCheckBox: CheckBox
     private var receiverRegistered = false
     private var pendingLogExportContent: String? = null
+    private var pendingStartAfterNotificationPermission = false
 
     private val configPanel by lazy(LazyThreadSafetyMode.NONE) {
         ConfigPanel(
@@ -54,6 +61,8 @@ class MainActivity : Activity() {
                 timestamp = ::timestamp,
                 openAppDetailsSettings = ::openAppDetailsSettings,
                 requestOverlayPermission = ::requestOverlayPermission,
+                notificationPermissionStatus = ::notificationPermissionStatus,
+                requestNotificationPermission = ::requestNotificationPermissionFromSettings,
                 showTargetEditor = ::showTargetEditor,
                 requestPhotoPermission = ::requestPhotoPermission,
                 showPermissionExplanation = ::showPermissionExplanation,
@@ -278,29 +287,12 @@ class MainActivity : Activity() {
             return
         }
 
-        MonitorStore.setRunning(this, true)
-        MonitorStore.addLog(this, timestamp() + "  监听已启动，等待目标应用事件")
-
-        if (MonitorStore.isKeepAliveEnabled(this) && !MonitorKeepAliveService.start(this)) {
-            MonitorStore.addLog(
-                this,
-                timestamp() + "  保活服务未能启动；无障碍监听仍会按系统服务状态工作"
-            )
-        }
-
-        if (MonitorStore.isFloatingLogEnabled(this) && !MonitorOverlay.show(this)) {
-            MonitorStore.setRunning(this, false)
-            MonitorKeepAliveService.stop(this)
-            Toast.makeText(
-                this,
-                "悬浮窗创建失败，请检查系统悬浮窗权限",
-                Toast.LENGTH_LONG
-            ).show()
-            refreshScreen()
+        if (!hasNotificationPermission()) {
+            showNotificationPermissionPromptBeforeStart()
             return
         }
-        sendRefresh()
-        refreshScreen()
+
+        startMonitoringAfterPermissionChecks(notificationPermissionGranted = true)
     }
 
     private fun showTargetEditor() {
@@ -334,6 +326,7 @@ class MainActivity : Activity() {
         val options = arrayOf(
             "无障碍服务设置",
             "悬浮窗权限",
+            "通知权限（可选）",
             "照片和视频访问（可选）",
             "查看权限用途说明"
         )
@@ -343,8 +336,9 @@ class MainActivity : Activity() {
                 when (index) {
                     0 -> startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
                     1 -> requestOverlayPermission()
-                    2 -> requestPhotoPermission()
-                    3 -> showPermissionExplanation()
+                    2 -> requestNotificationPermissionFromSettings()
+                    3 -> requestPhotoPermission()
+                    4 -> showPermissionExplanation()
                 }
             }
             .show()
@@ -356,6 +350,7 @@ class MainActivity : Activity() {
             .setMessage(
                 "无障碍服务：接收目标应用的界面事件，并读取系统公开的节点信息。\n\n" +
                     "悬浮窗：在其他应用上方显示实时监控面板。\n\n" +
+                    "通知：在 Android 13 及以上版本，用于显示持续运行通知、运行状态和停止入口，也用于设备重启后的恢复提醒。拒绝通知权限不会阻止无障碍监控，但通知可能无法正常显示。\n\n" +
                     "照片和视频：作为可选权限预留给后续本地媒体功能；当前事件监控与节点读取不依赖相册权限。拒绝该权限不会影响监控。\n\n" +
                     "Freedom 不会把监控记录上传到服务器。"
             )
@@ -373,6 +368,105 @@ class MainActivity : Activity() {
         } else {
             Toast.makeText(this, "悬浮窗权限已允许", Toast.LENGTH_SHORT).show()
         }
+    }
+
+    private fun hasNotificationPermission(): Boolean =
+        Build.VERSION.SDK_INT < 33 ||
+            checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) ==
+            PackageManager.PERMISSION_GRANTED
+
+    private fun notificationPermissionStatus(): String = when {
+        Build.VERSION.SDK_INT < 33 -> "当前 Android 版本无需单独授权"
+        hasNotificationPermission() -> "已授权显示运行通知和恢复提醒"
+        else -> "未授权 · 监控仍可运行，但通知可能无法显示"
+    }
+
+    private fun showNotificationPermissionPromptBeforeStart() {
+        AlertDialog.Builder(this)
+            .setTitle("允许 Freedom 显示运行通知")
+            .setMessage(
+                "通知权限用于在通知栏显示 Freedom 的持续运行状态和停止入口，也用于设备重启后的恢复提醒。\n\n" +
+                    "它不是无障碍服务权限。即使不授权，仍然可以启动实时监控；只是运行通知和恢复提醒可能无法正常显示。"
+            )
+            .setPositiveButton("申请通知权限") { _, _ ->
+                pendingStartAfterNotificationPermission = true
+                requestPermissions(
+                    arrayOf(android.Manifest.permission.POST_NOTIFICATIONS),
+                    REQUEST_NOTIFICATION_PERMISSION
+                )
+            }
+            .setNegativeButton("暂不授权，继续运行") { _, _ ->
+                startMonitoringAfterPermissionChecks(notificationPermissionGranted = false)
+            }
+            .setOnCancelListener {
+                pendingStartAfterNotificationPermission = false
+            }
+            .show()
+    }
+
+    private fun requestNotificationPermissionFromSettings() {
+        if (Build.VERSION.SDK_INT < 33) {
+            Toast.makeText(this, "当前 Android 版本无需单独申请通知权限", Toast.LENGTH_LONG).show()
+            return
+        }
+        if (hasNotificationPermission()) {
+            Toast.makeText(this, "通知权限已允许", Toast.LENGTH_SHORT).show()
+            return
+        }
+        AlertDialog.Builder(this)
+            .setTitle("通知权限用途")
+            .setMessage(
+                "允许后，Freedom 可以在通知栏显示持续运行状态、停止入口和重启后的恢复提醒。拒绝不会影响无障碍监控本身。"
+            )
+            .setPositiveButton("申请权限") { _, _ ->
+                pendingStartAfterNotificationPermission = false
+                requestPermissions(
+                    arrayOf(android.Manifest.permission.POST_NOTIFICATIONS),
+                    REQUEST_NOTIFICATION_PERMISSION
+                )
+            }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    private fun startMonitoringAfterPermissionChecks(notificationPermissionGranted: Boolean) {
+        MonitorStore.setRunning(this, true)
+        MonitorStore.addLog(
+            this,
+            timestamp() + if (notificationPermissionGranted) {
+                "  监听已启动，通知显示能力已满足，等待目标应用事件"
+            } else {
+                "  监听已启动；通知权限未授权，仍允许监控运行，但运行通知和恢复提醒可能无法显示"
+            }
+        )
+        if (!notificationPermissionGranted && Build.VERSION.SDK_INT >= 33) {
+            Toast.makeText(
+                this,
+                "通知权限未授权，监控仍会运行；运行通知和恢复提醒可能无法显示",
+                Toast.LENGTH_LONG
+            ).show()
+        }
+
+        if (MonitorStore.isKeepAliveEnabled(this) && !MonitorKeepAliveService.start(this)) {
+            MonitorStore.addLog(
+                this,
+                timestamp() + "  保活服务未能启动；无障碍监听仍会按系统服务状态工作"
+            )
+        }
+
+        if (MonitorStore.isFloatingLogEnabled(this) && !MonitorOverlay.show(this)) {
+            MonitorStore.setRunning(this, false)
+            MonitorKeepAliveService.stop(this)
+            Toast.makeText(
+                this,
+                "悬浮窗创建失败，请检查系统悬浮窗权限",
+                Toast.LENGTH_LONG
+            ).show()
+            refreshScreen()
+            return
+        }
+        sendRefresh()
+        refreshScreen()
     }
 
     private fun requestPhotoPermission() {
@@ -405,7 +499,32 @@ class MainActivity : Activity() {
         grantResults: IntArray
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == REQUEST_MEDIA_PERMISSION) {
+        if (requestCode == REQUEST_NOTIFICATION_PERMISSION) {
+            val granted = hasNotificationPermission()
+            val shouldStart = pendingStartAfterNotificationPermission
+            pendingStartAfterNotificationPermission = false
+            if (shouldStart) {
+                startMonitoringAfterPermissionChecks(notificationPermissionGranted = granted)
+                if (granted) {
+                    Toast.makeText(this, "通知权限已授予，正在启动监听", Toast.LENGTH_SHORT).show()
+                }
+            } else {
+                MonitorStore.addLog(
+                    this,
+                    timestamp() + if (granted) {
+                        "  通知权限已授予"
+                    } else {
+                        "  通知权限未授予；不影响无障碍监控，但运行通知和恢复提醒可能无法显示"
+                    }
+                )
+                Toast.makeText(
+                    this,
+                    if (granted) "通知权限已授予"
+                    else "通知权限未授予；仍可使用监控功能，通知可能无法显示",
+                    Toast.LENGTH_LONG
+                ).show()
+            }
+        } else if (requestCode == REQUEST_MEDIA_PERMISSION) {
             val granted = grantResults.count { it == PackageManager.PERMISSION_GRANTED }
             Toast.makeText(
                 this,
@@ -594,6 +713,7 @@ class MainActivity : Activity() {
         private const val KEY_KEEP_ACCOUNT_MODE = "keep_account_mode_enabled"
         private const val REQUEST_MEDIA_PERMISSION = 2001
         private const val REQUEST_EXPORT_LOGS = 2002
+        private const val REQUEST_NOTIFICATION_PERMISSION = 2003
         private val PACKAGE_PATTERN = Regex("^[A-Za-z][A-Za-z0-9_]*(\\.[A-Za-z][A-Za-z0-9_]*)+$")
     }
 }

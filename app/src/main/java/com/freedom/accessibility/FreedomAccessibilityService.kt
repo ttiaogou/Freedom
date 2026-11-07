@@ -13,7 +13,6 @@ import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
-import android.os.SystemClock
 import android.provider.Settings
 import android.view.Gravity
 import android.view.WindowManager
@@ -42,7 +41,6 @@ import com.freedom.accessibility.browse.PopupInspection
 import com.freedom.accessibility.browse.ScrollGesturePlan
 import com.freedom.accessibility.browse.ScrollGestureProfile
 import com.freedom.accessibility.event.AccessibilityEventFormatter
-import com.freedom.accessibility.event.AccessibilityEventPolicy
 import com.freedom.accessibility.scan.AccessibilityTreeScanner
 import com.freedom.accessibility.scheduling.AccountBrowseScheduler
 import com.freedom.accessibility.gesture.GestureTuning
@@ -441,19 +439,9 @@ class FreedomAccessibilityService : AccessibilityService() {
         }
     }
 
-    private var lastNodeScanStartedAt = 0L
-
     private val scanRunnable = Runnable {
         scanQueued = false
-        lastNodeScanStartedAt = SystemClock.uptimeMillis()
         accessibilityTreeScanner.scanActiveWindow()
-    }
-
-    private var refreshViewsQueued = false
-    private val refreshViewsRunnable = Runnable {
-        refreshViewsQueued = false
-        sendBroadcast(Intent(MonitorActions.ACTION_REFRESH).setPackage(packageName))
-        MonitorOverlay.update(this)
     }
 
     // Resume after the user finishes navigating or interacting with the target app.
@@ -711,9 +699,7 @@ class FreedomAccessibilityService : AccessibilityService() {
             .orEmpty()
             .take(300)
         val description = event.contentDescription?.toString()?.take(180).orEmpty()
-        val contentChangeTypes = event.contentChangeTypes
-        val eventKind = AccessibilityEventPolicy.classify(eventType, contentChangeTypes)
-        val signature = "$eventPackage|$rawEventName|$className|$content|$description|$contentChangeTypes"
+        val signature = "$eventPackage|$rawEventName|$className|$content|$description"
         val now = System.currentTimeMillis()
         // Reduce identical event bursts while preserving meaningful changes.
         if (signature == lastEventSignature && now - lastEventAt < 250L) return
@@ -724,13 +710,11 @@ class FreedomAccessibilityService : AccessibilityService() {
             handleMomoActivityTransition(className)
         }
 
-        if (eventKind.updatesPageMetadata) {
-            val appLabel = resolveAppLabel(eventPackage)
-            val pageHint = sequenceOf(content, description, className.substringAfterLast('.'))
-                .firstOrNull { it.isNotBlank() }
-                .orEmpty()
-            MonitorStore.updateAppPage(this, app = appLabel, page = pageHint)
-        }
+        val appLabel = resolveAppLabel(eventPackage)
+        val pageHint = sequenceOf(content, description, className.substringAfterLast('.'))
+            .firstOrNull { it.isNotBlank() }
+            .orEmpty()
+        MonitorStore.updateAppPage(this, app = appLabel, page = pageHint)
 
         val friendlyEvent = AccessibilityEventFormatter.friendlyEventDescription(
             eventType = event.eventType,
@@ -762,27 +746,16 @@ class FreedomAccessibilityService : AccessibilityService() {
             event = event
         )
 
-        // Full BFS scans are requested only for window/structure changes.
-        // Ordinary events and text-only metadata updates never trigger tree traversal.
-        if (eventKind.requestsNodeScan) {
-            requestNodeScan()
-        }
+        // Scan once shortly after the latest event, not once for every event in a burst.
+        mainHandler.removeCallbacks(scanRunnable)
+        scanQueued = true
+        mainHandler.postDelayed(scanRunnable, SCAN_DEBOUNCE_MS)
     }
 
     /**
      * The existing checkbox is the user's explicit opt-in. Keep its original key.
      * The first cycle starts only when the selected target app is actually foregrounded.
      */
-    private fun requestNodeScan() {
-        if (!MonitorStore.isRunning(this)) return
-        mainHandler.removeCallbacks(scanRunnable)
-        scanQueued = true
-        val elapsed = SystemClock.uptimeMillis() - lastNodeScanStartedAt
-        val intervalDelay = (MIN_NODE_SCAN_INTERVAL_MS - elapsed).coerceAtLeast(0L)
-        val delay = maxOf(SCAN_DEBOUNCE_MS, intervalDelay)
-        mainHandler.postDelayed(scanRunnable, delay)
-    }
-
     private fun isAccountBrowseModeEnabled(): Boolean =
         getSharedPreferences(ACCOUNT_BROWSE_PREFS, Context.MODE_PRIVATE)
             .getBoolean(ACCOUNT_BROWSE_KEY, false)
@@ -2565,9 +2538,8 @@ class FreedomAccessibilityService : AccessibilityService() {
     }
 
     private fun refreshViews() {
-        if (refreshViewsQueued) return
-        refreshViewsQueued = true
-        mainHandler.postDelayed(refreshViewsRunnable, VIEW_REFRESH_INTERVAL_MS)
+        sendBroadcast(Intent(MonitorActions.ACTION_REFRESH).setPackage(packageName))
+        MonitorOverlay.update(this)
     }
 
     override fun onInterrupt() {
@@ -2579,9 +2551,7 @@ class FreedomAccessibilityService : AccessibilityService() {
         GestureTrailOverlay.clear()
         restoreMonitorOverlayTouchPassthrough()
         mainHandler.removeCallbacksAndMessages(null)
-        refreshViewsQueued = false
         accountBrowseScheduler.cancel()
-        MonitorStore.flushPendingLogs(this)
         scanQueued = false
         hideFirstSwipeCountdown()
         if (targetReceiverRegistered) {
@@ -2602,8 +2572,6 @@ class FreedomAccessibilityService : AccessibilityService() {
 
     companion object {
         private const val SCAN_DEBOUNCE_MS = 350L
-        private const val MIN_NODE_SCAN_INTERVAL_MS = 900L
-        private const val VIEW_REFRESH_INTERVAL_MS = 200L
 
         private const val ACCOUNT_BROWSE_PREFS = "freedom_main_ui"
         private const val ACCOUNT_BROWSE_KEY = "keep_account_mode_enabled"
