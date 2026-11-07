@@ -1,4 +1,4 @@
-# Freedom — Stage 1 structure refactor
+# Freedom — staged structure refactor
 
 基线：本地上传的完整 Freedom 项目源码（`main` 分支源码包）。
 
@@ -36,3 +36,21 @@
 ## 验证限制
 
 本地容器没有 Android SDK、Gradle 可执行程序和 Gradle Wrapper，因此无法在此执行 `assembleDebug`。已执行源码结构/引用检查；最终 Android 编译和设备端行为仍需要 GitHub Actions 与真机验证。
+
+
+## Stage 2 — 设备手势校准执行组件
+
+新增 `accessibility/gesture/GestureCalibrationController.kt`，只接管设备内部手势校准会话：
+
+- 持有校准进行状态、当前测试组序号、校准区域和专属 Runnable。
+- 接收原有开始/取消广播；校准进度、成功、失败广播的 Action、Extra 与目标包名保持不变。
+- 检查 Freedom 是否为当前前台窗口，并验证校准区域仍位于屏幕范围内。
+- 保留原来的四组测试手势、350ms 初始等待、700ms 单次手势时长、350ms 组间等待和最后 250ms 完成等待。
+- 继续使用原来的贝塞尔路径控制点比例、`dispatchGesture` 回调和主线程 Handler。
+- 仍通过原有日志入口记录开始、取消、失败和完成信息。
+
+`FreedomAccessibilityService` 继续负责 Android 无障碍服务生命周期，以及校准广播接收器的注册/注销；控制器通过 Service 执行平台手势派发和发送应用内广播。自动浏览的手势状态、调度器、页面识别与操作流程没有迁入该控制器。
+
+本阶段没有新增权限、Manifest 声明、持久化键、Intent Action、第三方依赖或用户可见功能。
+
+静态检查已确认旧校准状态字段/方法不再由 Service 持有，接收器在连接与销毁时仍由 Service 配对注册/注销；新控制器已使用 Kotlin 编译器和最小 Android API stub 做独立语法/类型形状检查。当前环境没有 Android SDK/Gradle，完整 `assembleDebug` 与真机校准仍需通过 GitHub Actions 和设备确认。

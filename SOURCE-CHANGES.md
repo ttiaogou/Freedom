@@ -38,3 +38,13 @@
 
 - 将原 `accessibility/GestureTuning.kt` 移入 `accessibility/gesture/` 子包；API 名称和持久化键不变。
 - 将监控目标包名编辑界面移入 `ui/config/TargetAppEditor.kt`；校验规则、保存顺序和广播 Action 不变。
+
+
+## Stage 2 — 拆分设备手势校准执行逻辑（2026-11-07）
+
+- 新增 `app/src/main/java/com/freedom/accessibility/gesture/GestureCalibrationController.kt`，承接内部校准会话状态、广播分发、测试手势路径构建、派发回调、组间计时、成功/失败/取消处理。
+- `FreedomAccessibilityService.kt` 保留校准广播接收器的注册/注销与服务销毁生命周期；通过控制器调用原有 AccessibilityService 手势派发能力。
+- 保留原有校准 Action、Extra、包名限定、前台包名检查、屏幕边界校验、四组采样次数、路径控制点、350ms/700ms/350ms/250ms 时间参数和日志/广播顺序。
+- 没有修改自动浏览状态机、自动浏览手势逻辑、页面识别、节点扫描、UI 校准采样器或 GestureTuning 的设备参数计算。
+- 本阶段仅移动职责和建立回调边界，不新增用户功能或第三方依赖。
+- 本地完成控制器独立 Kotlin 编译检查（使用最小 Android API stub）及静态引用/生命周期核对；未执行 Android `assembleDebug`，最终以 GitHub Actions 和真机测试为准。\n
