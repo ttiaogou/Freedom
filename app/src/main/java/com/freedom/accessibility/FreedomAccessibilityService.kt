@@ -52,6 +52,7 @@ class FreedomAccessibilityService : AccessibilityService() {
         WAIT_FOR_LIST_SCROLL,
         WAIT_FOR_SCROLL_SETTLE,
         WAIT_FOR_CARD_OPEN,
+        WAIT_FOR_SAFE_CARD,
         WAIT_FOR_DETAIL_LOAD,
         DETAIL_DWELL,
         WAIT_FOR_IMAGE_BROWSER_RETURN,
@@ -136,6 +137,11 @@ class FreedomAccessibilityService : AccessibilityService() {
     private var accountBrowseDetailDwellDueAt = 0L
     private var accountBrowseDetailDwellRemainingMs = 0L
     private var accountBrowseIgnoreManualEventsUntil = 0L
+    private var accountBrowseProgrammaticActionLabel = ""
+    private var accountBrowseSafeCardRecheckCount = 0
+    private var accountBrowseLastGlobalTouchEventAt = 0L
+    private var accountBrowseLastGlobalTouchEventName = ""
+    private var accountBrowseLastGlobalTouchEventOrigin = ""
 
     // Device-only gesture calibration state. Calibration strokes are restricted to
     // Freedom's own calibration surface and never target the selected third-party app.
@@ -273,6 +279,15 @@ class FreedomAccessibilityService : AccessibilityService() {
         addLog("无障碍服务已连接；普通应用事件仅处理指定目标应用，系统触摸事件用于识别用户操作")
 
         // A persisted run request is restored only after Android has rebound this service.
+        // Never restore monitoring if the user has not explicitly selected a run mode.
+        if (MonitorStore.isRunning(this) && !isAccountBrowseModeEnabled()) {
+            MonitorStore.setRunning(this, false)
+            MonitorKeepAliveService.stop(this)
+            MonitorStore.addLog(
+                this,
+                "恢复监听失败：没有选择运行模式；请先选择模式后重新启动"
+            )
+        }
         if (MonitorStore.isRunning(this)) {
             if (!Settings.canDrawOverlays(this)) {
                 MonitorStore.setRunning(this, false)
@@ -350,12 +365,28 @@ class FreedomAccessibilityService : AccessibilityService() {
 
             when (eventType) {
                 AccessibilityEvent.TYPE_TOUCH_INTERACTION_START -> {
-                    addLog("用户在操作屏幕：收到 TYPE_TOUCH_INTERACTION_START；来源应用=${eventPackage.ifBlank { "系统触摸事件" }}")
+                    accountBrowseLastGlobalTouchEventAt = System.currentTimeMillis()
+                    accountBrowseLastGlobalTouchEventName = "TYPE_TOUCH_INTERACTION_START"
+                    accountBrowseLastGlobalTouchEventOrigin = if (accountBrowseGestureInFlight) {
+                        "Freedom 自动滑动期间收到；具体来源待确认"
+                    } else {
+                        "全局触摸事件；系统未提供来源应用"
+                    }
                     if (accountBrowseGestureInFlight) {
                         accountBrowseTouchStartedDuringGesture = true
-                        addLog("触摸开始发生在自动滑动手势期间；先记录为手势中断候选，不抢占当前手势回调")
+                        addLog(
+                            "收到系统触摸开始事件；发生在 Freedom 自动滑动执行期间，归类为自动手势期间的触摸/中断候选；" +
+                                "Activity=${accountBrowseCurrentActivityClass.ifBlank { "未知" }}；阶段=${accountBrowsePhase.name}；" +
+                                "${currentMonitorPageContext()}；系统未提供该事件的手指坐标"
+                        )
                         return
                     }
+                    addLog(
+                        "用户在操作屏幕：收到 TYPE_TOUCH_INTERACTION_START；" +
+                            "来源应用=${eventPackage.ifBlank { "系统未提供来源应用" }}；" +
+                            "Activity=${accountBrowseCurrentActivityClass.ifBlank { "未知" }}；" +
+                            "自动浏览阶段=${accountBrowsePhase.name}；${currentMonitorPageContext()}；系统未提供手指坐标"
+                    )
                     if (!accountBrowseTouchActive) {
                         accountBrowseTouchActive = true
                         mainHandler.removeCallbacks(manualTouchResumeRunnable)
@@ -372,12 +403,28 @@ class FreedomAccessibilityService : AccessibilityService() {
                 }
 
                 AccessibilityEvent.TYPE_TOUCH_INTERACTION_END -> {
-                    addLog("用户停止操作屏幕：收到 TYPE_TOUCH_INTERACTION_END；来源应用=${eventPackage.ifBlank { "系统触摸事件" }}")
+                    accountBrowseLastGlobalTouchEventAt = System.currentTimeMillis()
+                    accountBrowseLastGlobalTouchEventName = "TYPE_TOUCH_INTERACTION_END"
+                    accountBrowseLastGlobalTouchEventOrigin = if (accountBrowseGestureInFlight) {
+                        "Freedom 自动滑动期间收到；具体来源待确认"
+                    } else {
+                        "全局触摸事件；系统未提供来源应用"
+                    }
                     if (accountBrowseGestureInFlight) {
                         accountBrowseTouchEndedDuringGesture = true
-                        addLog("触摸结束发生在自动滑动手势期间；已记录结束事件")
+                        addLog(
+                            "收到系统触摸结束事件；发生在 Freedom 自动滑动执行期间，归类为自动手势期间的触摸/中断候选；" +
+                                "Activity=${accountBrowseCurrentActivityClass.ifBlank { "未知" }}；阶段=${accountBrowsePhase.name}；" +
+                                "${currentMonitorPageContext()}；系统未提供该事件的手指坐标"
+                        )
                         return
                     }
+                    addLog(
+                        "用户停止操作屏幕：收到 TYPE_TOUCH_INTERACTION_END；" +
+                            "来源应用=${eventPackage.ifBlank { "系统未提供来源应用" }}；" +
+                            "Activity=${accountBrowseCurrentActivityClass.ifBlank { "未知" }}；" +
+                            "自动浏览阶段=${accountBrowsePhase.name}；${currentMonitorPageContext()}；系统未提供手指坐标"
+                    )
                     if (accountBrowseTouchActive) {
                         accountBrowseTouchActive = false
                         if (accountBrowseManualResumeAllowed) {
@@ -387,6 +434,8 @@ class FreedomAccessibilityService : AccessibilityService() {
                         } else {
                             addLog("用户已停止操作屏幕；当前暂停不允许自动恢复，保留原安全暂停状态")
                         }
+                    } else {
+                        addLog("收到 TYPE_TOUCH_INTERACTION_END，但当前没有匹配的触摸开始状态；未推断用户是否完成了实际操作")
                     }
                 }
             }
@@ -451,6 +500,12 @@ class FreedomAccessibilityService : AccessibilityService() {
             if (className.isNotBlank()) add("原始控件类名=$className")
             if (content.isNotBlank()) add("事件文本=$content")
             if (description.isNotBlank()) add("内容描述=$description")
+            if (isTrackedInteractionEvent(eventType)) {
+                add("操作来源判断=${classifyInteractionEventOrigin(eventType, now)}")
+                add("当前 Activity=${accountBrowseCurrentActivityClass.ifBlank { "未知" }}")
+                add("自动浏览阶段=${accountBrowsePhase.name}")
+                add(accessibilitySourceDetails(event))
+            }
         }.joinToString("；")
         addLog("$friendlyEvent$LOG_DETAIL_SEPARATOR$technicalDetails")
 
@@ -458,7 +513,8 @@ class FreedomAccessibilityService : AccessibilityService() {
             eventType = eventType,
             className = className,
             content = content,
-            description = description
+            description = description,
+            event = event
         )
 
         // Scan once shortly after the latest event, not once for every event in a burst.
@@ -738,6 +794,11 @@ class FreedomAccessibilityService : AccessibilityService() {
         accountBrowseDetailDwellDueAt = 0L
         accountBrowseDetailDwellRemainingMs = 0L
         accountBrowseIgnoreManualEventsUntil = 0L
+        accountBrowseProgrammaticActionLabel = ""
+        accountBrowseSafeCardRecheckCount = 0
+        accountBrowseLastGlobalTouchEventAt = 0L
+        accountBrowseLastGlobalTouchEventName = ""
+        accountBrowseLastGlobalTouchEventOrigin = ""
         hideFirstSwipeCountdown()
     }
 
@@ -776,7 +837,8 @@ class FreedomAccessibilityService : AccessibilityService() {
             AccountBrowsePhase.FIRST_SWIPE_COUNTDOWN -> runFirstSwipeCountdown()
             AccountBrowsePhase.WAIT_FOR_LIST_SCROLL -> performFeedScroll()
             AccountBrowsePhase.WAIT_FOR_SCROLL_SETTLE -> verifyInitialSwipe()
-            AccountBrowsePhase.WAIT_FOR_CARD_OPEN -> openVisibleFeedCard()
+            AccountBrowsePhase.WAIT_FOR_CARD_OPEN,
+            AccountBrowsePhase.WAIT_FOR_SAFE_CARD -> openVisibleFeedCard()
             AccountBrowsePhase.WAIT_FOR_DETAIL_LOAD -> checkDetailPageLoaded()
             AccountBrowsePhase.DETAIL_DWELL -> returnFromDetailPage()
             AccountBrowsePhase.WAIT_FOR_IMAGE_BROWSER_RETURN -> waitForImageBrowserReturn()
@@ -1111,6 +1173,7 @@ class FreedomAccessibilityService : AccessibilityService() {
         accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_SCROLL_SETTLE
         accountBrowseScrollEventSeen = false
         accountBrowseScrollEventCount = 0
+        accountBrowseProgrammaticActionLabel = "Freedom dispatchGesture 自动坐标滑动"
         accountBrowseIgnoreManualEventsUntil = System.currentTimeMillis() + profile.durationMs + 2_000L
         accountBrowseLastScrollEventAt = 0L
         accountBrowseFallbackScrollAttempted = false
@@ -1425,6 +1488,8 @@ class FreedomAccessibilityService : AccessibilityService() {
                 pauseAccountBrowse("手势没有触发列表滚动，且未找到可用的备用滚动区域")
                 return
             }
+            accountBrowseProgrammaticActionLabel = "Freedom ACTION_SCROLL_FORWARD 备用滚动"
+            accountBrowseIgnoreManualEventsUntil = System.currentTimeMillis() + 1_800L
             val fallbackScrolled = try {
                 fallbackNode.performAction(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD)
             } catch (_: Exception) {
@@ -1470,15 +1535,48 @@ class FreedomAccessibilityService : AccessibilityService() {
         }
 
         if (cardNode == null) {
-            pauseAccountBrowse("没有找到可安全打开的普通动态卡片；广告、直播和无法确认类型的卡片均已跳过，本轮没有点击任何控件")
+            if (accountBrowsePhase == AccountBrowsePhase.WAIT_FOR_SAFE_CARD) {
+                accountBrowseSafeCardRecheckCount++
+                if (accountBrowseSafeCardRecheckCount >= MAX_SAFE_CARD_RECHECKS_BEFORE_NEXT_SWIPE) {
+                    accountBrowseSafeCardRecheckCount = 0
+                    accountBrowseScrollEventSeen = false
+                    accountBrowseScrollEventCount = 0
+                    accountBrowseLastScrollEventAt = 0L
+                    accountBrowseFallbackScrollAttempted = false
+                    accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_LIST_SCROLL
+                    val nextSwipeDelay = randomScrollIntervalMs()
+                    addLog(
+                        "连续 ${MAX_SAFE_CARD_RECHECKS_BEFORE_NEXT_SWIPE} 次复查仍未发现可安全打开的普通动态；" +
+                            "广告、直播和未知卡片继续全部跳过，${nextSwipeDelay / 1_000.0} 秒后继续滑动列表搜索"
+                    )
+                    scheduleAccountBrowseStep(nextSwipeDelay)
+                } else {
+                    addLog(
+                        "第 $accountBrowseSafeCardRecheckCount 次定时复查：当前仍没有符合条件的普通动态；" +
+                            "保持等待 ${SAFE_CARD_RECHECK_INTERVAL_MS / 1_000.0} 秒，不点击广告、直播或未知卡片"
+                    )
+                    scheduleAccountBrowseStep(SAFE_CARD_RECHECK_INTERVAL_MS)
+                }
+            } else {
+                accountBrowseSafeCardRecheckCount = 0
+                accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_SAFE_CARD
+                addLog(
+                    "本轮没有找到可安全打开的普通动态；已跳过广告、直播和未知卡片，" +
+                        "进入周期性等待，每 ${SAFE_CARD_RECHECK_INTERVAL_MS / 1_000.0} 秒重新检查；" +
+                        "连续复查仍无合适卡片时会继续滑动列表搜索，不会永久停在 PAUSED"
+                )
+                scheduleAccountBrowseStep(SAFE_CARD_RECHECK_INTERVAL_MS)
+            }
             return
         }
+        accountBrowseSafeCardRecheckCount = 0
 
         // ACTION_CLICK activates an accessibility node rather than injecting a physical tap.
         // Capture its real screen bounds so the overlay can mark the target control accurately.
         val clickTargetBounds = Rect()
         runCatching { cardNode?.getBoundsInScreen(clickTargetBounds) }
-        accountBrowseIgnoreManualEventsUntil = System.currentTimeMillis() + 1_800L
+        accountBrowseProgrammaticActionLabel = "Freedom ACTION_CLICK 动态卡片"
+        accountBrowseIgnoreManualEventsUntil = System.currentTimeMillis() + PROGRAMMATIC_CLICK_EVENT_WINDOW_MS
         val clicked = try {
             cardNode?.performAction(AccessibilityNodeInfo.ACTION_CLICK) == true
         } catch (_: Exception) {
@@ -1596,6 +1694,7 @@ class FreedomAccessibilityService : AccessibilityService() {
             return
         }
 
+        accountBrowseProgrammaticActionLabel = "Freedom GLOBAL_ACTION_BACK 返回详情"
         accountBrowseIgnoreManualEventsUntil = System.currentTimeMillis() + 1_500L
         if (!performGlobalAction(GLOBAL_ACTION_BACK)) {
             pauseAccountBrowse("系统未能执行返回操作；请手动返回动态列表后重新启动")
@@ -1729,39 +1828,126 @@ class FreedomAccessibilityService : AccessibilityService() {
      * Some devices do not deliver global touch-interaction events to this service.
      * In that case, infer manual interaction from real target-app click/scroll/input events.
      */
+    private fun currentMonitorPageContext(): String {
+        val snapshot = MonitorStore.snapshot(this)
+        return "当前识别应用=${snapshot.app}；当前识别页面=${snapshot.page}"
+    }
+
+    private fun isTrackedInteractionEvent(eventType: Int): Boolean =
+        eventType == AccessibilityEvent.TYPE_VIEW_CLICKED ||
+            eventType == AccessibilityEvent.TYPE_VIEW_LONG_CLICKED ||
+            eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED ||
+            eventType == AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED ||
+            eventType == AccessibilityEvent.TYPE_VIEW_TEXT_SELECTION_CHANGED ||
+            eventType == AccessibilityEvent.TYPE_VIEW_CONTEXT_CLICKED
+
+    /** True only when the current event matches an action Freedom itself submitted. */
+    private fun isProgrammaticInteractionEvent(eventType: Int, now: Long): Boolean {
+        if (eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED &&
+            (accountBrowseGestureInFlight || accountBrowsePhase == AccountBrowsePhase.WAIT_FOR_SCROLL_SETTLE)
+        ) {
+            return true
+        }
+        if (now >= accountBrowseIgnoreManualEventsUntil) return false
+        return when {
+            eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED &&
+                (accountBrowseProgrammaticActionLabel.contains("滑动") ||
+                    accountBrowseProgrammaticActionLabel.contains("滚动")) -> true
+            eventType == AccessibilityEvent.TYPE_VIEW_CLICKED &&
+                accountBrowseProgrammaticActionLabel.contains("ACTION_CLICK") -> true
+            else -> false
+        }
+    }
+
+    private fun classifyInteractionEventOrigin(eventType: Int, now: Long): String = when {
+        eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED &&
+            accountBrowsePhase == AccountBrowsePhase.WAIT_FOR_SCROLL_SETTLE ->
+            "Freedom 自动滑动确认阶段的列表事件；仅凭列表事件无法区分系统手势反馈与同期手动滚动，不归类为用户操作"
+        isProgrammaticInteractionEvent(eventType, now) ->
+            "${accountBrowseProgrammaticActionLabel.ifBlank { "Freedom 自动动作" }}的系统回调；不按手动操作处理"
+        else ->
+            "目标应用交互事件；未匹配到 Freedom 对应的自动动作窗口，作为用户手动操作候选"
+    }
+
+    /** Describe the public accessibility source node; bounds are view bounds, not finger coordinates. */
+    private fun accessibilitySourceDetails(event: AccessibilityEvent): String {
+        val source = runCatching { event.source }.getOrNull()
+            ?: return "控件来源节点=系统未提供；控件坐标=系统未提供"
+        return try {
+            val bounds = Rect()
+            runCatching { source.getBoundsInScreen(bounds) }
+            val viewId = runCatching { source.viewIdResourceName.orEmpty() }.getOrDefault("")
+            val traits = buildList {
+                if (runCatching { source.isClickable }.getOrDefault(false)) add("可点击")
+                if (runCatching { source.isLongClickable }.getOrDefault(false)) add("可长按")
+                if (runCatching { source.isScrollable }.getOrDefault(false)) add("可滚动")
+                if (runCatching { source.isEditable }.getOrDefault(false)) add("可编辑")
+            }.joinToString("、")
+            buildString {
+                append("控件坐标范围=")
+                append(if (bounds.isEmpty) "系统未提供" else bounds.toShortString())
+                if (viewId.isNotBlank()) append("；控件 ViewId=").append(viewId)
+                if (traits.isNotBlank()) append("；控件能力=").append(traits)
+                append("；注意：这是控件边界，不是手指触摸坐标")
+            }
+        } finally {
+            runCatching { source.recycle() }
+        }
+    }
+
+    /**
+     * Some devices do not deliver global touch-interaction events to this service.
+     * Infer manual interaction from target-app events only when they do not match an
+     * accessibility action that Freedom itself just submitted.
+     */
     private fun handleManualInteractionFallback(
         eventType: Int,
         className: String,
         content: String,
-        description: String
+        description: String,
+        event: AccessibilityEvent
     ) {
-        val isInteractionEvent = eventType == AccessibilityEvent.TYPE_VIEW_CLICKED ||
-            eventType == AccessibilityEvent.TYPE_VIEW_LONG_CLICKED ||
-            eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED ||
-            eventType == AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED
-        if (!isInteractionEvent) return
+        if (!isTrackedInteractionEvent(eventType)) return
+        val now = System.currentTimeMillis()
+        if (isProgrammaticInteractionEvent(eventType, now)) return
         if (accountBrowseImageBrowserActive ||
             accountBrowsePhase == AccountBrowsePhase.WAIT_FOR_IMAGE_BROWSER_RETURN ||
             accountBrowsePhase == AccountBrowsePhase.WAIT_FOR_DETAIL_RESTABILIZE
         ) return
-        if (accountBrowseGestureInFlight || System.currentTimeMillis() < accountBrowseIgnoreManualEventsUntil) return
 
         val eventName = rawEventName(eventType)
         val target = sequenceOf(content, description, className).firstOrNull { it.isNotBlank() }
             ?.take(120) ?: "未提供控件文本"
-        val reason = "检测到用户在操作屏幕（目标应用事件：$eventName；控件：${className.substringAfterLast('.')}；内容：$target）；自动浏览暂时让出操作权"
+        val globalTouchRecent = now - accountBrowseLastGlobalTouchEventAt <= GLOBAL_TOUCH_EVENT_ASSOCIATION_MS
+        val touchEvidence = if (globalTouchRecent) {
+            "附近收到全局触摸事件=$accountBrowseLastGlobalTouchEventName；事件来源=${accountBrowseLastGlobalTouchEventOrigin.ifBlank { "未归类" }}"
+        } else {
+            "附近未收到 TYPE_TOUCH_INTERACTION_START/END；本次按目标应用控件事件推断用户操作，系统没有提供手指坐标"
+        }
+        val sourceDetails = accessibilitySourceDetails(event)
+        val reason = "检测到用户在操作屏幕（目标应用事件：$eventName；控件：${className.substringAfterLast('.')}；内容：$target）"
 
+        addLog(
+            "$reason；Activity=${accountBrowseCurrentActivityClass.ifBlank { "未知" }}；" +
+                "自动浏览阶段=${accountBrowsePhase.name}；${currentMonitorPageContext()}；$touchEvidence；$sourceDetails"
+        )
         if (accountBrowsePhase != AccountBrowsePhase.PAUSED) {
-            pauseAccountBrowse(reason, allowManualResume = true)
+            pauseAccountBrowse(
+                "$reason；自动浏览暂时让出操作权",
+                allowManualResume = true
+            )
         } else {
             accountBrowseManualResumeAllowed = true
-            addLog("$reason；原暂停原因=${accountBrowsePauseReason.ifBlank { "未记录" }}；静默结束后只重新识别页面，不跳过安全检查")
+            addLog("用户操作发生时自动浏览已处于安全暂停；原暂停原因=${accountBrowsePauseReason.ifBlank { "未记录" }}；静默结束后只重新识别页面，不跳过安全检查")
         }
 
-        accountBrowseTouchActive = false
         mainHandler.removeCallbacks(manualTouchResumeRunnable)
-        addLog("已记录用户屏幕操作详情；最后一次操作后等待 ${MANUAL_TOUCH_RESUME_MS / 1000.0} 秒静默，再尝试恢复识别")
-        mainHandler.postDelayed(manualTouchResumeRunnable, MANUAL_TOUCH_RESUME_MS)
+        if (accountBrowseTouchActive) {
+            addLog("目标控件事件发生时全局触摸仍处于活动状态；暂不启动静默倒计时，等待 TYPE_TOUCH_INTERACTION_END")
+        } else {
+            addLog("已记录目标控件交互；最后一次操作后等待 ${MANUAL_TOUCH_RESUME_MS / 1000.0} 秒静默，再重新识别当前页面")
+            mainHandler.postDelayed(manualTouchResumeRunnable, MANUAL_TOUCH_RESUME_MS)
+        }
     }
 
     private fun checkFeedListReturned() {
@@ -2612,6 +2798,10 @@ class FreedomAccessibilityService : AccessibilityService() {
         private const val MOMO_DYNAMIC_DETAIL_ACTIVITY = "com.immomo.momo.luaview.LuaViewActivity"
         private const val MOMO_FEED_IMAGE_BROWSER_ACTIVITY = "com.immomo.momo.imagefactory.imageborwser.impls.FeedImageBrowserActivity"
         private const val MANUAL_TOUCH_RESUME_MS = 2_500L
+        private const val SAFE_CARD_RECHECK_INTERVAL_MS = 2_500L
+        private const val MAX_SAFE_CARD_RECHECKS_BEFORE_NEXT_SWIPE = 2
+        private const val PROGRAMMATIC_CLICK_EVENT_WINDOW_MS = 900L
+        private const val GLOBAL_TOUCH_EVENT_ASSOCIATION_MS = 1_500L
         private const val INITIAL_DYNAMIC_TAB_WAIT_TIMEOUT_MS = 60_000L
         private const val INITIAL_FEED_STABILITY_TIMEOUT_MS = 10_000L
         private const val REQUIRED_STABLE_FEED_SAMPLES = 3

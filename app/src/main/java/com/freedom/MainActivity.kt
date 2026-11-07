@@ -317,6 +317,15 @@ class MainActivity : Activity() {
             return
         }
 
+        if (!keepAccountCheckBox.isChecked) {
+            AlertDialog.Builder(this)
+                .setTitle("错误警告")
+                .setMessage("请先选择模式")
+                .setPositiveButton("确定", null)
+                .show()
+            return
+        }
+
         if (!isAccessibilityEnabled()) {
             AlertDialog.Builder(this)
                 .setTitle("需要开启无障碍服务")
