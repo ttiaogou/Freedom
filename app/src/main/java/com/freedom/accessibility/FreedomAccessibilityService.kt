@@ -53,6 +53,8 @@ class FreedomAccessibilityService : AccessibilityService() {
         WAIT_FOR_CARD_OPEN,
         WAIT_FOR_DETAIL_LOAD,
         DETAIL_DWELL,
+        WAIT_FOR_IMAGE_BROWSER_RETURN,
+        WAIT_FOR_DETAIL_RESTABILIZE,
         WAIT_FOR_LIST_RETURN,
         PAUSED
     }
@@ -127,6 +129,12 @@ class FreedomAccessibilityService : AccessibilityService() {
     private var accountBrowseReturnMismatchLogged = false
     private var accountBrowseCountdownRemaining = 0
     private var accountBrowseOverlayPassthroughActive = false
+    private var accountBrowseCurrentActivityClass = ""
+    private var accountBrowseImageBrowserReturnActivityClass = ""
+    private var accountBrowseImageBrowserActive = false
+    private var accountBrowseDetailDwellDueAt = 0L
+    private var accountBrowseDetailDwellRemainingMs = 0L
+    private var accountBrowseIgnoreManualEventsUntil = 0L
 
     // Device-only gesture calibration state. Calibration strokes are restricted to
     // Freedom's own calibration surface and never target the selected third-party app.
@@ -194,16 +202,30 @@ class FreedomAccessibilityService : AccessibilityService() {
 
     // Resume after the user finishes navigating or interacting with the target app.
     private val manualTouchResumeRunnable = Runnable {
-        if (accountBrowseManualResumeAllowed && !accountBrowseTouchActive &&
-            MonitorStore.isRunning(this) && isAccountBrowseModeEnabled()
-        ) {
-            accountBrowseManualResumeAllowed = false
-            addLog("手动操作静默期结束；正在重新检查当前前台应用和动态列表条件")
-            accountBrowsePhase = AccountBrowsePhase.IDLE
-            accountBrowsePauseReason = ""
-            accountBrowseSourceFingerprint = ""
-            accountBrowseDetailFingerprint = ""
-            startAccountBrowseIfNeeded()
+        when {
+            !accountBrowseManualResumeAllowed -> Unit
+            accountBrowseTouchActive -> addLog("手动恢复检查未执行：仍检测到屏幕触摸，继续等待用户操作结束")
+            !MonitorStore.isRunning(this) -> addLog("手动恢复检查未执行：监听已停止")
+            !isAccountBrowseModeEnabled() -> addLog("手动恢复检查未执行：自动浏览模式已关闭")
+            accountBrowseImageBrowserActive -> {
+                addLog("当前仍处于动态图片浏览页面；不重置详情流程，继续等待返回原动态详情")
+                accountBrowseManualResumeAllowed = false
+                scheduleAccountBrowseStep(PAGE_STATE_POLL_MS)
+            }
+            else -> {
+                accountBrowseManualResumeAllowed = false
+                addLog("用户最后一次屏幕操作后已静默 ${MANUAL_TOUCH_RESUME_MS / 1000.0} 秒；开始重新识别当前页面")
+                accountBrowsePhase = AccountBrowsePhase.IDLE
+                accountBrowsePauseReason = ""
+                accountBrowseSourceFingerprint = ""
+                accountBrowseDetailFingerprint = ""
+                startAccountBrowseIfNeeded()
+                if (accountBrowsePhase == AccountBrowsePhase.IDLE) {
+                    addLog("手动恢复检查未能启动页面识别；等待目标应用的下一次界面事件")
+                } else {
+                    addLog("手动恢复检查已启动；当前识别阶段=${accountBrowsePhase.name}，后续仍需通过动态标签和列表稳定性验证")
+                }
+            }
         }
     }
 
@@ -327,39 +349,42 @@ class FreedomAccessibilityService : AccessibilityService() {
 
             when (eventType) {
                 AccessibilityEvent.TYPE_TOUCH_INTERACTION_START -> {
+                    addLog("用户在操作屏幕：收到 TYPE_TOUCH_INTERACTION_START；来源应用=${eventPackage.ifBlank { "系统触摸事件" }}")
                     if (accountBrowseGestureInFlight) {
                         accountBrowseTouchStartedDuringGesture = true
+                        addLog("触摸开始发生在自动滑动手势期间；先记录为手势中断候选，不抢占当前手势回调")
                         return
                     }
                     if (!accountBrowseTouchActive) {
                         accountBrowseTouchActive = true
                         mainHandler.removeCallbacks(manualTouchResumeRunnable)
-                        if (accountBrowsePhase != AccountBrowsePhase.PAUSED ||
-                            accountBrowseManualResumeAllowed
-                        ) {
+                        if (accountBrowsePhase != AccountBrowsePhase.PAUSED) {
                             pauseAccountBrowse(
                                 "检测到手动触摸；自动浏览暂时让出操作权",
                                 allowManualResume = true
                             )
                         } else {
-                            addLog("检测到手动触摸；自动浏览此前已因安全条件暂停，本次操作不会清除原有暂停")
+                            accountBrowseManualResumeAllowed = true
+                            addLog("检测到用户正在操作屏幕；原暂停原因=${accountBrowsePauseReason.ifBlank { "未记录" }}；操作结束后只重新验证页面，不直接执行点击或滑动")
                         }
                     }
                 }
 
                 AccessibilityEvent.TYPE_TOUCH_INTERACTION_END -> {
+                    addLog("用户停止操作屏幕：收到 TYPE_TOUCH_INTERACTION_END；来源应用=${eventPackage.ifBlank { "系统触摸事件" }}")
                     if (accountBrowseGestureInFlight) {
                         accountBrowseTouchEndedDuringGesture = true
+                        addLog("触摸结束发生在自动滑动手势期间；已记录结束事件")
                         return
                     }
                     if (accountBrowseTouchActive) {
                         accountBrowseTouchActive = false
                         if (accountBrowseManualResumeAllowed) {
-                            addLog("手动触摸已结束；页面安静 ${MANUAL_TOUCH_RESUME_MS / 1000.0} 秒后重新识别并尝试恢复")
+                            addLog("用户已停止操作屏幕；开始 ${MANUAL_TOUCH_RESUME_MS / 1000.0} 秒静默倒计时，期间新操作会重新计时")
                             mainHandler.removeCallbacks(manualTouchResumeRunnable)
                             mainHandler.postDelayed(manualTouchResumeRunnable, MANUAL_TOUCH_RESUME_MS)
                         } else {
-                            addLog("手动触摸已结束；原有安全暂停状态保持不变")
+                            addLog("用户已停止操作屏幕；当前暂停不允许自动恢复，保留原安全暂停状态")
                         }
                     }
                 }
@@ -402,6 +427,10 @@ class FreedomAccessibilityService : AccessibilityService() {
         lastEventSignature = signature
         lastEventAt = now
 
+        if (eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED && className.isNotBlank()) {
+            handleMomoActivityTransition(className)
+        }
+
         val appLabel = resolveAppLabel(eventPackage)
         val pageHint = sequenceOf(content, description, className.substringAfterLast('.'))
             .firstOrNull { it.isNotBlank() }
@@ -423,6 +452,13 @@ class FreedomAccessibilityService : AccessibilityService() {
             if (description.isNotBlank()) add("内容描述=$description")
         }.joinToString("；")
         addLog("$friendlyEvent$LOG_DETAIL_SEPARATOR$technicalDetails")
+
+        handleManualInteractionFallback(
+            eventType = eventType,
+            className = className,
+            content = content,
+            description = description
+        )
 
         // Scan once shortly after the latest event, not once for every event in a burst.
         mainHandler.removeCallbacks(scanRunnable)
@@ -694,6 +730,12 @@ class FreedomAccessibilityService : AccessibilityService() {
         accountBrowseSwipeCount = 0
         accountBrowseFallbackScrollAttempted = false
         accountBrowseCountdownRemaining = 0
+        accountBrowseCurrentActivityClass = ""
+        accountBrowseImageBrowserReturnActivityClass = ""
+        accountBrowseImageBrowserActive = false
+        accountBrowseDetailDwellDueAt = 0L
+        accountBrowseDetailDwellRemainingMs = 0L
+        accountBrowseIgnoreManualEventsUntil = 0L
         hideFirstSwipeCountdown()
     }
 
@@ -734,6 +776,8 @@ class FreedomAccessibilityService : AccessibilityService() {
             AccountBrowsePhase.WAIT_FOR_CARD_OPEN -> openVisibleFeedCard()
             AccountBrowsePhase.WAIT_FOR_DETAIL_LOAD -> checkDetailPageLoaded()
             AccountBrowsePhase.DETAIL_DWELL -> returnFromDetailPage()
+            AccountBrowsePhase.WAIT_FOR_IMAGE_BROWSER_RETURN -> waitForImageBrowserReturn()
+            AccountBrowsePhase.WAIT_FOR_DETAIL_RESTABILIZE -> waitForDetailRestabilize()
             AccountBrowsePhase.WAIT_FOR_LIST_RETURN -> checkFeedListReturned()
         }
     }
@@ -1064,6 +1108,7 @@ class FreedomAccessibilityService : AccessibilityService() {
         accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_SCROLL_SETTLE
         accountBrowseScrollEventSeen = false
         accountBrowseScrollEventCount = 0
+        accountBrowseIgnoreManualEventsUntil = System.currentTimeMillis() + profile.durationMs + 2_000L
         accountBrowseLastScrollEventAt = 0L
         accountBrowseFallbackScrollAttempted = false
         accountBrowseGestureInFlight = false
@@ -1421,6 +1466,7 @@ class FreedomAccessibilityService : AccessibilityService() {
             return
         }
 
+        accountBrowseIgnoreManualEventsUntil = System.currentTimeMillis() + 1_800L
         val clicked = try {
             cardNode?.performAction(AccessibilityNodeInfo.ACTION_CLICK) == true
         } catch (_: Exception) {
@@ -1497,6 +1543,8 @@ class FreedomAccessibilityService : AccessibilityService() {
                 accountBrowseDetailFingerprint = fingerprint.signature
                 val dwell = randomBrowseDelayMs()
                 accountBrowsePhase = AccountBrowsePhase.DETAIL_DWELL
+                accountBrowseDetailDwellRemainingMs = dwell
+                accountBrowseDetailDwellDueAt = System.currentTimeMillis() + dwell
                 addLog("动态详情已确认载入；本次阅读停留 ${dwell / 1000.0} 秒")
                 scheduleAccountBrowseStep(dwell)
                 return
@@ -1530,6 +1578,7 @@ class FreedomAccessibilityService : AccessibilityService() {
             return
         }
 
+        accountBrowseIgnoreManualEventsUntil = System.currentTimeMillis() + 1_500L
         if (!performGlobalAction(GLOBAL_ACTION_BACK)) {
             pauseAccountBrowse("系统未能执行返回操作；请手动返回动态列表后重新启动")
             return
@@ -1541,6 +1590,160 @@ class FreedomAccessibilityService : AccessibilityService() {
         accountBrowseDeadlineAt = System.currentTimeMillis() + LIST_RETURN_TIMEOUT_MS
         addLog("阅读停留结束；正在确认已返回动态列表")
         scheduleAccountBrowseStep(PAGE_STATE_POLL_MS)
+    }
+
+    /**
+     * Track the known Momo photo-browser Activity as a child page of the current dynamic detail.
+     * Only the exact Activity that was active before the photo browser is accepted as its return.
+     */
+    private fun handleMomoActivityTransition(activityClass: String) {
+        if (!activityClass.endsWith("Activity")) return
+
+        val previousActivity = accountBrowseCurrentActivityClass
+        accountBrowseCurrentActivityClass = activityClass
+
+        if (activityClass == MOMO_FEED_IMAGE_BROWSER_ACTIVITY) {
+            if (accountBrowsePhase == AccountBrowsePhase.DETAIL_DWELL ||
+                (accountBrowsePhase == AccountBrowsePhase.PAUSED && accountBrowseManualResumeAllowed)
+            ) {
+                accountBrowseImageBrowserReturnActivityClass = previousActivity
+                    .takeIf { it.isNotBlank() && it != MOMO_FEED_IMAGE_BROWSER_ACTIVITY }
+                    ?: MOMO_DYNAMIC_DETAIL_ACTIVITY
+                accountBrowseImageBrowserActive = true
+                accountBrowseDetailDwellRemainingMs =
+                    (accountBrowseDetailDwellDueAt - System.currentTimeMillis()).coerceAtLeast(0L)
+                mainHandler.removeCallbacks(manualTouchResumeRunnable)
+                mainHandler.removeCallbacks(accountBrowseRunnable)
+                accountBrowseManualResumeAllowed = false
+                accountBrowseStepPending = false
+                accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_IMAGE_BROWSER_RETURN
+                accountBrowseDeadlineAt = System.currentTimeMillis() + IMAGE_BROWSER_RETURN_TIMEOUT_MS
+                addLog("已识别陌陌动态内部图片浏览页面：$activityClass；保留原动态详情上下文，暂停阅读倒计时，等待返回原详情页面")
+                scheduleAccountBrowseStep(PAGE_STATE_POLL_MS)
+            }
+            return
+        }
+
+        if (accountBrowseImageBrowserActive) {
+            if (activityClass == accountBrowseImageBrowserReturnActivityClass) {
+                accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_DETAIL_RESTABILIZE
+                accountBrowseDeadlineAt = System.currentTimeMillis() + DETAIL_RESTABILIZE_TIMEOUT_MS
+                accountBrowseLastStableFingerprint = ""
+                accountBrowseStableSamples = 0
+                addLog("检测到已退出图片浏览器并返回原动态详情 Activity：$activityClass；正在重新确认详情页面稳定性")
+                scheduleAccountBrowseStep(PAGE_STATE_POLL_MS)
+            } else {
+                accountBrowseImageBrowserActive = false
+                pauseAccountBrowse("图片浏览器退出后进入了非原动态详情页面：$activityClass；为避免误返回或误点击，已安全暂停")
+            }
+        }
+    }
+
+    private fun waitForImageBrowserReturn() {
+        if (!accountBrowseImageBrowserActive) {
+            accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_DETAIL_RESTABILIZE
+            accountBrowseDeadlineAt = System.currentTimeMillis() + DETAIL_RESTABILIZE_TIMEOUT_MS
+            accountBrowseLastStableFingerprint = ""
+            accountBrowseStableSamples = 0
+            scheduleAccountBrowseStep(PAGE_STATE_POLL_MS)
+            return
+        }
+
+        if (System.currentTimeMillis() >= accountBrowseDeadlineAt) {
+            pauseAccountBrowse("等待动态图片浏览页面返回原详情超时；没有执行返回或点击操作")
+        } else {
+            scheduleAccountBrowseStep(PAGE_STATE_POLL_MS)
+        }
+    }
+
+    private fun waitForDetailRestabilize() {
+        val root = obtainTargetRootOrPause() ?: return
+        val state = try {
+            isMomoDynamicFeedPage(root) to pageFingerprint(root)
+        } finally {
+            runCatching { root.recycle() }
+        }
+        val isFeedPage = state.first
+        val fingerprint = state.second
+
+        if (accountBrowseCurrentActivityClass != accountBrowseImageBrowserReturnActivityClass) {
+            pauseAccountBrowse("图片浏览器返回后的 Activity 与原动态详情不一致；已停止自动操作")
+            return
+        }
+        if (isFeedPage) {
+            pauseAccountBrowse("图片浏览器退出后已回到动态列表而非原详情页；保留暂停状态，等待手动重新进入动态")
+            return
+        }
+
+        if (fingerprint.nodeCount >= MIN_DETAIL_NODE_COUNT &&
+            fingerprint.signature != accountBrowseSourceFingerprint
+        ) {
+            if (fingerprint.signature == accountBrowseLastStableFingerprint) {
+                accountBrowseStableSamples++
+            } else {
+                accountBrowseLastStableFingerprint = fingerprint.signature
+                accountBrowseStableSamples = 1
+            }
+
+            if (accountBrowseStableSamples >= REQUIRED_STABLE_PAGE_SAMPLES) {
+                accountBrowseDetailFingerprint = fingerprint.signature
+                accountBrowseImageBrowserActive = false
+                accountBrowseDetailDwellDueAt = System.currentTimeMillis() + accountBrowseDetailDwellRemainingMs
+                accountBrowsePhase = AccountBrowsePhase.DETAIL_DWELL
+                val remaining = accountBrowseDetailDwellRemainingMs
+                addLog("原动态详情页面已连续 ${REQUIRED_STABLE_PAGE_SAMPLES} 次确认稳定；已更新页面指纹，继续剩余阅读时间 ${remaining / 1000.0} 秒")
+                scheduleAccountBrowseStep(remaining.coerceAtLeast(300L))
+                return
+            }
+        } else {
+            accountBrowseLastStableFingerprint = ""
+            accountBrowseStableSamples = 0
+        }
+
+        if (System.currentTimeMillis() >= accountBrowseDeadlineAt) {
+            pauseAccountBrowse("图片浏览器已退出，但原动态详情页面未能在限定时间内稳定；已安全暂停")
+        } else {
+            scheduleAccountBrowseStep(PAGE_STATE_POLL_MS)
+        }
+    }
+
+    /**
+     * Some devices do not deliver global touch-interaction events to this service.
+     * In that case, infer manual interaction from real target-app click/scroll/input events.
+     */
+    private fun handleManualInteractionFallback(
+        eventType: Int,
+        className: String,
+        content: String,
+        description: String
+    ) {
+        val isInteractionEvent = eventType == AccessibilityEvent.TYPE_VIEW_CLICKED ||
+            eventType == AccessibilityEvent.TYPE_VIEW_LONG_CLICKED ||
+            eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED ||
+            eventType == AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED
+        if (!isInteractionEvent) return
+        if (accountBrowseImageBrowserActive ||
+            accountBrowsePhase == AccountBrowsePhase.WAIT_FOR_IMAGE_BROWSER_RETURN ||
+            accountBrowsePhase == AccountBrowsePhase.WAIT_FOR_DETAIL_RESTABILIZE
+        ) return
+        if (accountBrowseGestureInFlight || System.currentTimeMillis() < accountBrowseIgnoreManualEventsUntil) return
+
+        val eventName = rawEventName(eventType)
+        val target = sequenceOf(content, description, className).firstOrNull { it.isNotBlank() }
+            ?.take(120) ?: "未提供控件文本"
+        val reason = "检测到用户在操作屏幕（目标应用事件：$eventName；控件：${className.substringAfterLast('.')}；内容：$target）；自动浏览暂时让出操作权"
+
+        if (accountBrowsePhase != AccountBrowsePhase.PAUSED) {
+            pauseAccountBrowse(reason, allowManualResume = true)
+        } else {
+            accountBrowseManualResumeAllowed = true
+            addLog("$reason；原暂停原因=${accountBrowsePauseReason.ifBlank { "未记录" }}；静默结束后只重新识别页面，不跳过安全检查")
+        }
+
+        accountBrowseTouchActive = false
+        mainHandler.removeCallbacks(manualTouchResumeRunnable)
+        addLog("已记录用户屏幕操作详情；最后一次操作后等待 ${MANUAL_TOUCH_RESUME_MS / 1000.0} 秒静默，再尝试恢复识别")
+        mainHandler.postDelayed(manualTouchResumeRunnable, MANUAL_TOUCH_RESUME_MS)
     }
 
     private fun checkFeedListReturned() {
@@ -2385,6 +2588,10 @@ class FreedomAccessibilityService : AccessibilityService() {
         private const val CARD_OPEN_SETTLE_MS = 500L
         private const val MONITOR_OVERLAY_PASSTHROUGH_WATCHDOG_MS = 5_000L
         private const val SWIPE_WINDOW_SYNC_DELAY_MS = 120L
+        private const val IMAGE_BROWSER_RETURN_TIMEOUT_MS = 60_000L
+        private const val DETAIL_RESTABILIZE_TIMEOUT_MS = 10_000L
+        private const val MOMO_DYNAMIC_DETAIL_ACTIVITY = "com.immomo.momo.luaview.LuaViewActivity"
+        private const val MOMO_FEED_IMAGE_BROWSER_ACTIVITY = "com.immomo.momo.imagefactory.imageborwser.impls.FeedImageBrowserActivity"
         private const val MANUAL_TOUCH_RESUME_MS = 2_500L
         private const val INITIAL_DYNAMIC_TAB_WAIT_TIMEOUT_MS = 60_000L
         private const val INITIAL_FEED_STABILITY_TIMEOUT_MS = 10_000L
