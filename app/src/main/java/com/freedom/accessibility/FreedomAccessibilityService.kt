@@ -22,6 +22,7 @@ import android.widget.TextView
 import com.freedom.data.MonitorActions
 import com.freedom.data.MonitorStore
 import com.freedom.accessibility.browse.MomoDynamicCardSelector
+import com.freedom.accessibility.browse.MomoFeedGestureController
 import com.freedom.accessibility.browse.MomoPageInspector
 import com.freedom.accessibility.browse.MomoPopupInspector
 import com.freedom.accessibility.browse.MomoNavigationController
