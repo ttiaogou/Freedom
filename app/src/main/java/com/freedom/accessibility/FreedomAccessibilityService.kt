@@ -24,6 +24,7 @@ import com.freedom.data.MonitorStore
 import com.freedom.accessibility.browse.MomoDynamicCardSelector
 import com.freedom.accessibility.browse.MomoPageInspector
 import com.freedom.accessibility.browse.MomoPopupInspector
+import com.freedom.accessibility.browse.MomoNavigationController
 import com.freedom.accessibility.browse.AccountBrowsePhase
 import com.freedom.accessibility.browse.DetailPageIdentityInspection
 import com.freedom.accessibility.browse.DynamicTabInspection
@@ -45,7 +46,6 @@ import com.freedom.overlay.GestureTrailOverlay
 import com.freedom.overlay.MonitorOverlay
 import com.freedom.stability.MonitorKeepAliveService
 import java.text.SimpleDateFormat
-import java.util.ArrayDeque
 import java.util.Date
 import java.util.Locale
 import kotlin.random.Random
@@ -163,6 +163,20 @@ class FreedomAccessibilityService : AccessibilityService() {
             config = MomoFeedGestureController.Config(
                 minListWidthRatio = MIN_LIST_WIDTH_RATIO,
                 minListHeightRatio = MIN_LIST_HEIGHT_RATIO
+            )
+        )
+    }
+
+    private val momoNavigationController by lazy(LazyThreadSafetyMode.NONE) {
+        MomoNavigationController(
+            context = this,
+            dp = ::dp,
+            performGlobalBack = { performGlobalAction(GLOBAL_ACTION_BACK) },
+            config = MomoNavigationController.Config(
+                maxScanNodes = PAGE_FINGERPRINT_MAX_NODES,
+                tabTargetMatchToleranceDp = TAB_TARGET_MATCH_TOLERANCE_DP,
+                maxClickTargetHeightRatio = MAX_TAB_CLICK_TARGET_HEIGHT_RATIO,
+                maxAncestorDepth = MAX_TAB_CLICK_ANCESTOR_DEPTH
             )
         )
     }
@@ -1095,13 +1109,7 @@ class FreedomAccessibilityService : AccessibilityService() {
 
         accountBrowseProgrammaticActionLabel = "Freedom ACTION_CLICK $actionDescription"
         accountBrowseIgnoreManualEventsUntil = System.currentTimeMillis() + NAVIGATION_ACTION_EVENT_WINDOW_MS
-        val clicked = try {
-            target.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-        } catch (_: Exception) {
-            false
-        } finally {
-            runCatching { target.recycle() }
-        }
+        val clicked = momoNavigationController.performClickAndRecycle(target)
         if (!clicked) {
             pauseAccountBrowse("系统未接受‘$actionDescription’的无障碍点击；没有继续尝试其他控件")
             return
@@ -1127,7 +1135,7 @@ class FreedomAccessibilityService : AccessibilityService() {
         accountBrowseRecoveryBackAttempts++
         accountBrowseProgrammaticActionLabel = "Freedom GLOBAL_ACTION_BACK 页面层级返回"
         accountBrowseIgnoreManualEventsUntil = System.currentTimeMillis() + NAVIGATION_ACTION_EVENT_WINDOW_MS
-        val accepted = runCatching { performGlobalAction(GLOBAL_ACTION_BACK) }.getOrDefault(false)
+        val accepted = runCatching { momoNavigationController.performBack() }.getOrDefault(false)
         if (!accepted) {
             pauseAccountBrowse("当前已识别为陌陌子页面，但系统未接受返回操作；停止自动导航")
             return
@@ -1273,69 +1281,18 @@ class FreedomAccessibilityService : AccessibilityService() {
         expectedBounds: Rect,
         minCenterY: Int,
         maxCenterY: Int
-    ): AccessibilityNodeInfo? {
-        val queue = ArrayDeque<AccessibilityNodeInfo>()
-        queue.add(AccessibilityNodeInfo.obtain(root))
-        var visited = 0
-        try {
-            while (queue.isNotEmpty() && visited < PAGE_FINGERPRINT_MAX_NODES) {
-                val node = queue.removeFirst()
-                visited++
-                try {
-                    val bounds = Rect()
-                    runCatching { node.getBoundsInScreen(bounds) }
-                    val text = runCatching { node.text?.toString()?.trim().orEmpty() }.getOrDefault("")
-                    val description = runCatching { node.contentDescription?.toString()?.trim().orEmpty() }
-                        .getOrDefault("")
-                    val nodeLabel = text.ifBlank { description }
-                    val sameTarget = nodeLabel == label && node.isVisibleToUser &&
-                        bounds.width() > 0 && bounds.height() > 0 &&
-                        bounds.centerY() in minCenterY..maxCenterY &&
-                        kotlin.math.abs(bounds.centerX() - expectedBounds.centerX()) <= dp(TAB_TARGET_MATCH_TOLERANCE_DP) &&
-                        kotlin.math.abs(bounds.centerY() - expectedBounds.centerY()) <= dp(TAB_TARGET_MATCH_TOLERANCE_DP)
-                    if (sameTarget) {
-                        val clickable = findClickableAncestor(node, bounds)
-                        if (clickable != null) return clickable
-                    }
-                    val childCount = runCatching { node.childCount }.getOrDefault(0)
-                    for (index in 0 until childCount) {
-                        if (visited + queue.size >= PAGE_FINGERPRINT_MAX_NODES) break
-                        val child = runCatching { node.getChild(index) }.getOrNull() ?: continue
-                        queue.add(child)
-                    }
-                } finally {
-                    runCatching { node.recycle() }
-                }
-            }
-        } finally {
-            while (queue.isNotEmpty()) runCatching { queue.removeFirst().recycle() }
-        }
-        return null
-    }
+    ): AccessibilityNodeInfo? = momoNavigationController.findClickableNodeForLabel(
+        root = root,
+        label = label,
+        expectedBounds = expectedBounds,
+        minCenterY = minCenterY,
+        maxCenterY = maxCenterY
+    )
 
     private fun findClickableAncestor(
         node: AccessibilityNodeInfo,
         labelBounds: Rect
-    ): AccessibilityNodeInfo? {
-        var current: AccessibilityNodeInfo? = AccessibilityNodeInfo.obtain(node)
-        val maxWidth = (resources.displayMetrics.widthPixels * 0.98f).toInt()
-        val maxHeight = (resources.displayMetrics.heightPixels * MAX_TAB_CLICK_TARGET_HEIGHT_RATIO).toInt()
-        repeat(MAX_TAB_CLICK_ANCESTOR_DEPTH) {
-            val candidate = current ?: return null
-            val bounds = Rect()
-            runCatching { candidate.getBoundsInScreen(bounds) }
-            val usable = candidate.isVisibleToUser && candidate.isClickable &&
-                bounds.width() > 0 && bounds.width() <= maxWidth &&
-                bounds.height() > 0 && bounds.height() <= maxHeight &&
-                bounds.contains(labelBounds)
-            if (usable) return candidate
-            val parent = runCatching { candidate.parent }.getOrNull()
-            runCatching { candidate.recycle() }
-            current = parent
-        }
-        runCatching { current?.recycle() }
-        return null
-    }
+    ): AccessibilityNodeInfo? = momoNavigationController.findClickableAncestor(node, labelBounds)
 
     private fun waitForMomoFeedStable() {
         val root = runCatching { rootInActiveWindow }.getOrNull()
@@ -1996,7 +1953,7 @@ class FreedomAccessibilityService : AccessibilityService() {
 
         accountBrowseProgrammaticActionLabel = "Freedom GLOBAL_ACTION_BACK 返回详情"
         accountBrowseIgnoreManualEventsUntil = System.currentTimeMillis() + 1_500L
-        if (!performGlobalAction(GLOBAL_ACTION_BACK)) {
+        if (!momoNavigationController.performBack()) {
             beginDynamicNavigationRecovery("详情页面身份已确认，但系统未接受返回操作")
             return
         }

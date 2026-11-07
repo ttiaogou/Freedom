@@ -77,3 +77,15 @@
 - `FreedomAccessibilityService` 继续负责创建 `GestureDescription`、悬浮窗触摸穿透、`dispatchGesture()`、系统回调、暂停/重试和自动浏览阶段转换。
 - 保留原有列表/输入框屏蔽阈值、手势时长范围、曲线偏移范围、32/100 个路径采样点、微扰频率和幅度、快照节点/文本上限及偏好设置键。
 - 原有 Service 调用点通过薄代理转发，避免改动状态机中的调用顺序。
+
+
+## Stage 6 — 拆分陌陌导航动作边界（2026-11-07）
+
+- 新增 `app/src/main/java/com/freedom/accessibility/browse/MomoNavigationController.kt`，迁移既有的导航标签节点查找、可点击祖先校验、低层 `ACTION_CLICK` 和系统全局 Back 动作入口。
+- `FreedomAccessibilityService` 保留 `submitNavigationClick()` / `submitNavigationBack()` 的业务协调：导航尝试计数、页面动作前快照、人工事件抑制窗口、超时、阶段切换、日志、验证轮询和重试均未迁移。
+- `verifyNavigationAction()`、`beginDynamicNavigationRecovery()`、`handleMomoActivityTransition()` 保持在 Service；页面证据仍由原 `MomoPageInspector` 提供。
+- 弹窗关闭仍由 `handleMomoPopup()` 决定和执行；Inspector 使用 Service 薄代理访问同一可点击祖先查找规则。
+- 详情页返回动作复用控制器的底层 Back 回调；原有返回失败处理、详情返回阶段切换和列表位置验证保持在 Service。
+- 保留节点扫描上限、标签中心偏差、可点击祖先宽高约束/深度、异常处理与节点回收语义。
+- 未修改导航重试次数、超时/轮询/延迟参数、Activity/包名标识、页面验证条件或自动浏览状态机。
+- 已完成静态引用与差异核对；完整 Android Gradle 编译及真机验证仍需 GitHub Actions / 设备确认。

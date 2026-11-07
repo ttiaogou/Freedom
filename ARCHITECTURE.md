@@ -79,3 +79,15 @@
 ## Stage 5 — Feed gesture planning
 
 `MomoFeedGestureController` owns feed-list target discovery, scrollable-container selection, bounded visible-node snapshots, persisted gesture-profile loading, and path construction. It returns `FeedGestureTarget`, `ScrollGestureProfile`, and `ScrollGesturePlan` data only. It does not create `GestureDescription`, call `dispatchGesture`, toggle overlay touch passthrough, schedule work, or mutate browse phases. `FreedomAccessibilityService` retains the actual gesture dispatch and all completion/cancellation/recovery behavior.
+
+
+## Stage 6 — Navigation action boundary extraction
+
+- Added `accessibility/browse/MomoNavigationController.kt` for the existing bounded label-to-clickable-node lookup, clickable-ancestor validation, `ACTION_CLICK` submission/node release, and the low-level global Back callback.
+- Kept `submitNavigationClick()` and `submitNavigationBack()` in `FreedomAccessibilityService`; attempt counters, before-page snapshots, event suppression windows, verification deadlines, logs, retry delays, stop conditions, and `VERIFY_NAVIGATION_ACTION` transitions remain service-owned.
+- Kept `verifyNavigationAction()`, `beginDynamicNavigationRecovery()`, and `handleMomoActivityTransition()` in the service. Their evidence collection and page-state decisions remain in the service and `MomoPageInspector`.
+- The popup inspector continues to use the same clickable-ancestor bounds/depth rule through a thin service delegate. Popup dismissal actions remain in `handleMomoPopup()`.
+- The detail-page Back action uses the same low-level controller callback; its original direct Boolean handling and subsequent list-return transition remain in place.
+- Preserved scan limit, target-center tolerance, maximum clickable-ancestor width/height, ancestor depth, action exception handling, and node ownership/recycling.
+- No navigation retries, timing values, labels, package/activity identifiers, page verification rules, or automation state-machine behavior were intentionally changed.
+- Full Android `assembleDebug` and device validation remain required through GitHub Actions.
