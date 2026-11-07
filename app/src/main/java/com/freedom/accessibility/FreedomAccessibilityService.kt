@@ -45,6 +45,7 @@ class FreedomAccessibilityService : AccessibilityService() {
     // Read the existing main-screen checkbox without changing its storage key.
     private enum class AccountBrowsePhase {
         IDLE,
+        WAIT_FOR_DYNAMIC_TAB,
         WAIT_FOR_FEED_STABLE,
         FIRST_SWIPE_COUNTDOWN,
         WAIT_FOR_LIST_SCROLL,
@@ -104,6 +105,7 @@ class FreedomAccessibilityService : AccessibilityService() {
     private var accountBrowsePhase = AccountBrowsePhase.IDLE
     private var accountBrowseStepPending = false
     private var accountBrowsePauseReason = ""
+    private var accountBrowseLastDynamicTabWaitReason = ""
     private var accountBrowseDeadlineAt = 0L
     private var accountBrowseSourceFingerprint = ""
     private var accountBrowseDetailFingerprint = ""
@@ -643,11 +645,12 @@ class FreedomAccessibilityService : AccessibilityService() {
             return
         }
 
-        accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_FEED_STABLE
-        accountBrowseDeadlineAt = System.currentTimeMillis() + INITIAL_FEED_STABILITY_TIMEOUT_MS
+        accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_DYNAMIC_TAB
+        accountBrowseDeadlineAt = System.currentTimeMillis() + INITIAL_DYNAMIC_TAB_WAIT_TIMEOUT_MS
+        accountBrowseLastDynamicTabWaitReason = ""
         accountBrowseLastStableFingerprint = ""
         accountBrowseStableSamples = 0
-        addLog("已检测到陌陌进入前台；正在等待动态列表稳定，确认后会显示 3 秒倒计时")
+        addLog("已检测到陌陌进入前台；等待首页顶部‘动态’标签被选中（最多等待 ${INITIAL_DYNAMIC_TAB_WAIT_TIMEOUT_MS / 1_000} 秒），之后再单独检查列表稳定性")
         scheduleAccountBrowseStep(PAGE_STATE_POLL_MS)
     }
 
@@ -670,6 +673,7 @@ class FreedomAccessibilityService : AccessibilityService() {
         accountBrowseStepPending = false
         accountBrowsePhase = AccountBrowsePhase.IDLE
         accountBrowsePauseReason = ""
+        accountBrowseLastDynamicTabWaitReason = ""
         accountBrowseDeadlineAt = 0L
         accountBrowseSourceFingerprint = ""
         accountBrowseSourceSnapshot = ""
@@ -722,6 +726,7 @@ class FreedomAccessibilityService : AccessibilityService() {
         when (accountBrowsePhase) {
             AccountBrowsePhase.IDLE,
             AccountBrowsePhase.PAUSED -> return
+            AccountBrowsePhase.WAIT_FOR_DYNAMIC_TAB -> waitForMomoDynamicTab()
             AccountBrowsePhase.WAIT_FOR_FEED_STABLE -> waitForMomoFeedStable()
             AccountBrowsePhase.FIRST_SWIPE_COUNTDOWN -> runFirstSwipeCountdown()
             AccountBrowsePhase.WAIT_FOR_LIST_SCROLL -> performFeedScroll()
@@ -733,7 +738,48 @@ class FreedomAccessibilityService : AccessibilityService() {
         }
     }
 
-    /** Wait until Home > top-level Dynamic tab and its visible feed list are ready and stable. */
+    /** Wait for the user to enter the Dynamic tab, with its own bounded timeout. */
+    private fun waitForMomoDynamicTab() {
+        val root = runCatching { rootInActiveWindow }.getOrNull()
+        var reason = "暂时无法读取当前页面"
+        if (root != null) {
+            try {
+                val activePackage = runCatching { root.packageName?.toString().orEmpty() }
+                    .getOrDefault("")
+                if (activePackage != MOMO_PACKAGE) {
+                    reason = "陌陌当前不在前台"
+                } else {
+                    val tabInspection = inspectDynamicTabRow(root)
+                    val evidence = tabInspection.evidence
+                    if (evidence != null) {
+                        accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_FEED_STABLE
+                        accountBrowseDeadlineAt = System.currentTimeMillis() + INITIAL_FEED_STABILITY_TIMEOUT_MS
+                        accountBrowseLastDynamicTabWaitReason = ""
+                        accountBrowseLastStableFingerprint = ""
+                        accountBrowseStableSamples = 0
+                        addLog("已确认陌陌首页顶部‘动态’标签；现在开始独立等待动态列表稳定（最多 ${INITIAL_FEED_STABILITY_TIMEOUT_MS / 1_000} 秒）。${evidence.diagnostic}")
+                        scheduleAccountBrowseStep(PAGE_STATE_POLL_MS)
+                        return
+                    }
+                    reason = tabInspection.reason
+                }
+            } finally {
+                runCatching { root.recycle() }
+            }
+        }
+
+        if (reason != accountBrowseLastDynamicTabWaitReason) {
+            accountBrowseLastDynamicTabWaitReason = reason
+            addLog("等待进入陌陌动态页面：$reason；尚未执行任何自动滑动或点击")
+        }
+        if (System.currentTimeMillis() >= accountBrowseDeadlineAt) {
+            pauseAccountBrowse("等待进入陌陌动态页面超时；没有执行任何自动操作，请手动切换到首页顶部‘动态’标签后重新启动")
+        } else {
+            scheduleAccountBrowseStep(PAGE_STATE_POLL_MS)
+        }
+    }
+
+    /** Wait until the selected Dynamic tab's visible feed list is ready and stable. */
     private fun waitForMomoFeedStable() {
         val root = runCatching { rootInActiveWindow }.getOrNull()
         if (root == null) {
@@ -792,7 +838,7 @@ class FreedomAccessibilityService : AccessibilityService() {
 
     private fun scheduleOrTimeoutFeedStability() {
         if (System.currentTimeMillis() >= accountBrowseDeadlineAt) {
-            pauseAccountBrowse("等待陌陌动态列表稳定超时；没有执行首次滑动，请确认已进入动态页面")
+            pauseAccountBrowse("动态列表加载或稳定确认超时；没有执行首次滑动")
         } else {
             scheduleAccountBrowseStep(PAGE_STATE_POLL_MS)
         }
@@ -1371,7 +1417,7 @@ class FreedomAccessibilityService : AccessibilityService() {
         }
 
         if (cardNode == null) {
-            pauseAccountBrowse("没有找到可安全打开的普通动态卡片；直播间动态已过滤，本轮没有点击任何控件")
+            pauseAccountBrowse("没有找到可安全打开的普通动态卡片；广告、直播和无法确认类型的卡片均已跳过，本轮没有点击任何控件")
             return
         }
 
@@ -1413,10 +1459,16 @@ class FreedomAccessibilityService : AccessibilityService() {
         if (result.skippedLiveStreamCount > 0) {
             addLog("卡片筛选：已跳过 ${result.skippedLiveStreamCount} 条疑似直播间动态")
         }
+        if (result.skippedAdvertisementCount > 0) {
+            addLog("卡片筛选：已跳过 ${result.skippedAdvertisementCount} 条广告或推广卡片")
+        }
+        if (result.skippedUnknownCount > 0) {
+            addLog("卡片筛选：已跳过 ${result.skippedUnknownCount} 条无法确认类型的卡片")
+        }
         if (result.node == null) {
-            addLog("卡片筛选未通过：${result.reason}；检查候选=${result.inspectedCardCount}，缺少内容证据=${result.rejectedWithoutContentCount}")
+            addLog("卡片筛选未通过：${result.reason}；检查候选=${result.inspectedCardCount}，直播=${result.skippedLiveStreamCount}，广告=${result.skippedAdvertisementCount}，未知=${result.skippedUnknownCount}")
         } else {
-            addLog("卡片筛选通过：已找到可见、完整且具有内容证据的普通动态")
+            addLog("卡片筛选通过：已确认候选具有可识别的普通社交卡片结构")
         }
         return result.node
     }
@@ -2334,6 +2386,7 @@ class FreedomAccessibilityService : AccessibilityService() {
         private const val MONITOR_OVERLAY_PASSTHROUGH_WATCHDOG_MS = 5_000L
         private const val SWIPE_WINDOW_SYNC_DELAY_MS = 120L
         private const val MANUAL_TOUCH_RESUME_MS = 2_500L
+        private const val INITIAL_DYNAMIC_TAB_WAIT_TIMEOUT_MS = 60_000L
         private const val INITIAL_FEED_STABILITY_TIMEOUT_MS = 10_000L
         private const val REQUIRED_STABLE_FEED_SAMPLES = 3
         private const val FIRST_SWIPE_COUNTDOWN_SECONDS = 3
