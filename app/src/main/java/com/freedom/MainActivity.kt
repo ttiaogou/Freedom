@@ -31,11 +31,16 @@ import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
 import com.freedom.accessibility.FreedomAccessibilityService
-import com.freedom.accessibility.GestureTuning
+import com.freedom.accessibility.gesture.GestureTuning
 import com.freedom.data.MonitorActions
 import com.freedom.data.MonitorStore
 import com.freedom.overlay.MonitorOverlay
 import com.freedom.stability.MonitorKeepAliveService
+import com.freedom.ui.calibration.GestureCalibrationUiController
+import com.freedom.ui.config.ConfigPanel
+import com.freedom.ui.config.TargetAppEditor
+import com.freedom.ui.logs.LogRecordsDialog
+import com.freedom.ui.logs.LogTextFormatter
 
 class MainActivity : Activity() {
 
@@ -45,88 +50,32 @@ class MainActivity : Activity() {
     private var receiverRegistered = false
     private var pendingLogExportContent: String? = null
 
-    private var gestureCalibrationReceiverRegistered = false
-    private var gestureCalibrationRunning = false
-    private val gestureCalibrationTrials = mutableListOf<List<Long>>()
-    private val gestureCalibrationCurrentTimes = ArrayList<Long>()
-    private val gestureCalibrationHandler = android.os.Handler(android.os.Looper.getMainLooper())
-    private var gestureCalibrationDialog: AlertDialog? = null
-    private var gestureCalibrationStatusView: TextView? = null
-    private var gestureCalibrationPad: View? = null
-    private var gestureCalibrationStartButton: Button? = null
-
-    private val gestureCalibrationTimeoutRunnable = Runnable {
-        if (gestureCalibrationRunning) {
-            gestureCalibrationRunning = false
-            sendGestureCalibrationCancel()
-            gestureCalibrationCurrentTimes.clear()
-            gestureCalibrationStatusView?.text =
-                "采样超时：没有在规定时间内收到完整测试轨迹。请确认无障碍服务已开启，然后重新采样。"
-            gestureCalibrationStartButton?.isEnabled = true
-            gestureCalibrationStartButton?.text = "重新采样"
-            gestureCalibrationDialog?.getButton(AlertDialog.BUTTON_NEGATIVE)?.isEnabled = true
-        }
+    private val configPanel by lazy(LazyThreadSafetyMode.NONE) {
+        ConfigPanel(
+            activity = this,
+            callbacks = ConfigPanel.Callbacks(
+                isAccessibilityEnabled = ::isAccessibilityEnabled,
+                dp = ::dp,
+                roundedBackground = ::roundedBackground,
+                timestamp = ::timestamp,
+                openAppDetailsSettings = ::openAppDetailsSettings,
+                requestOverlayPermission = ::requestOverlayPermission,
+                showTargetEditor = ::showTargetEditor,
+                requestPhotoPermission = ::requestPhotoPermission,
+                showPermissionExplanation = ::showPermissionExplanation,
+                showGestureCalibrationDialog = { gestureCalibrationUi.showDialog() }
+            )
+        )
     }
 
-    private val gestureCalibrationReceiver = object : BroadcastReceiver() {
-        override fun onReceive(context: Context?, intent: Intent?) {
-            when (intent?.action) {
-                GestureTuning.ACTION_CALIBRATION_TRIAL_COMPLETED -> {
-                    val completed = intent.getIntExtra(GestureTuning.EXTRA_TRIAL_INDEX, 0)
-                    gestureCalibrationStatusView?.text =
-                        "正在采样：已完成 ${completed}/${GestureTuning.CALIBRATION_TRIAL_COUNT} 组。请保持页面前台，不要触摸校准区域。"
-                }
-
-                GestureTuning.ACTION_CALIBRATION_FINISHED -> {
-                    gestureCalibrationHandler.removeCallbacks(gestureCalibrationTimeoutRunnable)
-                    gestureCalibrationRunning = false
-                    val serviceSuccess = intent.getBooleanExtra(GestureTuning.EXTRA_SUCCESS, false)
-                    if (!serviceSuccess) {
-                        val reason = intent.getStringExtra(GestureTuning.EXTRA_MESSAGE)
-                            ?: "系统未能完成测试手势。"
-                        showGestureCalibrationFailure(reason)
-                        return
-                    }
-
-                    val result = GestureTuning.evaluateSamples(gestureCalibrationTrials)
-                    if (!result.valid) {
-                        showGestureCalibrationFailure(result.message)
-                        return
-                    }
-
-                    GestureTuning.saveCalibration(this@MainActivity, result)
-                    MonitorStore.addLog(
-                        this@MainActivity,
-                        timestamp() + "  手势路径自动采样完成：推荐频率=" +
-                            GestureTuning.formatFrequency(result.recommendedFrequencyHz) +
-                            "Hz，P85采样间隔=${result.p85IntervalMs}ms，" +
-                            "有效时间间隔=${result.intervalCount}"
-                    )
-                    gestureCalibrationStatusView?.text = buildString {
-                        append("采样成功\n")
-                        append("自动推荐频率：")
-                        append(GestureTuning.formatFrequency(result.recommendedFrequencyHz))
-                        append("Hz\n")
-                        append("有效轨迹间隔：").append(result.intervalCount).append(" 个\n")
-                        append("中位采样间隔：").append(result.medianIntervalMs).append("ms\n")
-                        append("P85采样间隔：").append(result.p85IntervalMs).append("ms\n")
-                        append("采样波动参考：").append(result.jitterPercent).append("%\n\n")
-                        append("该频率已自动保存并应用。频率不可手动编辑；需要重新评估时点击下方按钮。")
-                    }
-                    gestureCalibrationStartButton?.isEnabled = true
-                    gestureCalibrationStartButton?.text = "重新采样"
-                    gestureCalibrationDialog?.getButton(AlertDialog.BUTTON_NEGATIVE)?.isEnabled = true
-                }
-
-                GestureTuning.ACTION_CALIBRATION_FAILED -> {
-                    gestureCalibrationHandler.removeCallbacks(gestureCalibrationTimeoutRunnable)
-                    gestureCalibrationRunning = false
-                    val reason = intent.getStringExtra(GestureTuning.EXTRA_MESSAGE)
-                        ?: "采样过程被中断。"
-                    showGestureCalibrationFailure(reason)
-                }
-            }
-        }
+    private val gestureCalibrationUi by lazy(LazyThreadSafetyMode.NONE) {
+        GestureCalibrationUiController(
+            activity = this,
+            isAccessibilityEnabled = { isAccessibilityEnabled() },
+            dp = { value -> dp(value) },
+            roundedBackground = { color, radius -> roundedBackground(color, radius) },
+            timestamp = { timestamp() }
+        )
     }
 
     private val refreshReceiver = object : BroadcastReceiver() {
@@ -180,17 +129,7 @@ class MainActivity : Activity() {
     }
 
     override fun onPause() {
-        if (gestureCalibrationRunning) {
-            gestureCalibrationRunning = false
-            gestureCalibrationHandler.removeCallbacks(gestureCalibrationTimeoutRunnable)
-            sendGestureCalibrationCancel()
-            gestureCalibrationCurrentTimes.clear()
-            gestureCalibrationStatusView?.text =
-                "采样已中止：Freedom 离开前台。请回到本页面后重新采样。"
-            gestureCalibrationStartButton?.isEnabled = true
-            gestureCalibrationStartButton?.text = "重新采样"
-            gestureCalibrationDialog?.getButton(AlertDialog.BUTTON_NEGATIVE)?.isEnabled = true
-        }
+        gestureCalibrationUi.onPause()
         if (receiverRegistered) {
             runCatching { unregisterReceiver(refreshReceiver) }
             receiverRegistered = false
@@ -235,7 +174,7 @@ class MainActivity : Activity() {
         val configButton = Button(this).apply {
             text = "☰ 配置"
             isAllCaps = false
-            setOnClickListener { showConfig() }
+            setOnClickListener { configPanel.show() }
         }
 
         heading = TextView(this).apply {
@@ -370,590 +309,14 @@ class MainActivity : Activity() {
         refreshScreen()
     }
 
-    /** Left-side configuration panel, grouped like the supplied reference image. */
-    private fun showConfig() {
-        val dialog = Dialog(this)
-        val panel = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setBackgroundColor(0xFFFFFEFA.toInt())
-        }
-
-        val top = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(20), dp(22), dp(14), dp(18))
-            setBackgroundColor(0xFFFFFEFA.toInt())
-        }
-        val mark = TextView(this).apply {
-            text = "F"
-            textSize = 27f
-            typeface = Typeface.DEFAULT_BOLD
-            gravity = Gravity.CENTER
-            setTextColor(Color.WHITE)
-            background = roundedBackground(0xFF16B889.toInt(), dp(12).toFloat())
-        }
-        top.addView(mark, LinearLayout.LayoutParams(dp(48), dp(48)))
-
-        val titleBlock = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(12), 0, 0, 0)
-            addView(TextView(this@MainActivity).apply {
-                text = "Freedom"
-                textSize = 21f
-                typeface = Typeface.DEFAULT_BOLD
-                setTextColor(0xFF202938.toInt())
-            })
-            addView(TextView(this@MainActivity).apply {
-                text = "运行与权限配置"
-                textSize = 12f
-                setTextColor(0xFF778195.toInt())
-            })
-        }
-        top.addView(titleBlock, LinearLayout.LayoutParams(0, -2, 1f))
-
-        val close = TextView(this).apply {
-            text = "×"
-            textSize = 27f
-            gravity = Gravity.CENTER
-            setTextColor(0xFF647084.toInt())
-            setOnClickListener { dialog.dismiss() }
-        }
-        top.addView(close, LinearLayout.LayoutParams(dp(38), dp(44)))
-        panel.addView(top)
-
-        val scroll = ScrollView(this).apply { isFillViewport = true }
-        val rows = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(16), dp(4), dp(16), dp(24))
-        }
-        scroll.addView(rows)
-
-        addConfigSection(rows, "获取权限")
-        addConfigActionRow(
-            rows, "⌘", "无障碍服务",
-            if (isAccessibilityEnabled()) "已授权" else "未授权 · 点击前往设置",
-            if (isAccessibilityEnabled()) "已授权" else "去授权"
-        ) {
-            startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
-        }
-        addConfigActionRow(
-            rows, "◉", "悬浮窗权限",
-            if (Settings.canDrawOverlays(this)) "已允许在其他应用上层显示" else "未授权 · 点击前往设置",
-            if (Settings.canDrawOverlays(this)) "已允许" else "去授权"
-        ) {
-            requestOverlayPermission()
-        }
-        addConfigSwitchRow(
-            rows, "⛨", "保活服务", "监听运行期间显示持续通知并提高进程优先级",
-            MonitorStore.isKeepAliveEnabled(this)
-        ) { enabled ->
-            MonitorStore.setKeepAliveEnabled(this, enabled)
-            if (enabled && MonitorStore.isRunning(this)) {
-                if (!MonitorKeepAliveService.start(this)) {
-                    Toast.makeText(this, "保活服务启动失败，请查看运行记录", Toast.LENGTH_LONG).show()
-                }
-            } else if (!enabled) {
-                MonitorKeepAliveService.stop(this)
-            }
-        }
-        addConfigSwitchRow(
-            rows, "↻", "自启动检测", "设备重启后检查授权状态并提示恢复",
-            MonitorStore.isBootCheckEnabled(this)
-        ) { enabled ->
-            MonitorStore.setBootCheckEnabled(this, enabled)
-            Toast.makeText(
-                this,
-                if (enabled) "已开启开机检查；厂商自启动限制仍需在系统设置中允许"
-                else "已关闭开机检查提醒",
-                Toast.LENGTH_LONG
-            ).show()
-        }
-        addConfigActionRow(
-            rows, "⚙", "后台运行设置", "查看系统电池和应用后台限制设置", "打开"
-        ) {
-            dialog.dismiss()
-            openAppDetailsSettings()
-        }
-
-        addConfigSection(rows, "脚本配置")
-        addConfigSwitchRow(
-            rows, "▤", "悬浮日志", "关闭时隐藏整个实时监控悬浮窗；开启时显示悬浮窗及日志",
-            MonitorStore.isFloatingLogEnabled(this)
-        ) { enabled ->
-            runCatching {
-                // Persist the user's choice before changing the WindowManager overlay.
-                MonitorStore.setFloatingLogEnabled(this, enabled)
-                // Keep the legacy internal overlay flag synchronized for the accessibility
-                // service; the separate "悬浮按钮" setting row has been removed.
-                MonitorStore.setOverlayEnabled(this, enabled)
-                if (enabled) {
-                    if (MonitorStore.isRunning(this) && Settings.canDrawOverlays(this)) {
-                        MonitorOverlay.show(this)
-                    }
-                } else {
-                    // hide() is now synchronous and idempotent on the main thread.
-                    MonitorOverlay.hide()
-                }
-            }.onFailure { error ->
-                MonitorStore.addLog(
-                    this,
-                    timestamp() + "  切换悬浮日志失败：${error.javaClass.simpleName}: " +
-                        (error.message ?: "无详细信息")
-                )
-                Toast.makeText(
-                    this,
-                    "切换悬浮日志失败，请查看运行记录",
-                    Toast.LENGTH_LONG
-                ).show()
-            }
-        }
-        addConfigActionRow(
-            rows, "◎", "监控目标", MonitorStore.targetPackage(this), "修改"
-        ) {
-            dialog.dismiss()
-            showTargetEditor()
-        }
-
-        addConfigSection(rows, "其他权限")
-        addConfigActionRow(
-            rows, "▧", "照片和视频访问（可选）", "当前监控功能不依赖此权限", "设置"
-        ) {
-            dialog.dismiss()
-            requestPhotoPermission()
-        }
-        addConfigActionRow(
-            rows, "ⓘ", "权限用途说明", "查看 Freedom 各项权限的用途", "查看"
-        ) {
-            showPermissionExplanation()
-        }
-
-        addConfigSection(rows, "手势参数")
-        addConfigActionRow(
-            rows,
-            "∿",
-            "自动采样路径偏移频率",
-            GestureTuning.configurationSubtitle(this),
-            if (GestureTuning.isCalibrated(this)) "查看" else "采样"
-        ) {
-            dialog.dismiss()
-            showGestureCalibrationDialog()
-        }
-
-        panel.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
-        dialog.setContentView(panel)
-        dialog.setCanceledOnTouchOutside(true)
-        dialog.show()
-
-        dialog.window?.apply {
-            setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
-            addFlags(android.view.WindowManager.LayoutParams.FLAG_DIM_BEHIND)
-            val params = attributes
-            params.gravity = Gravity.START or Gravity.TOP
-            params.width = (this@MainActivity.resources.displayMetrics.widthPixels * 0.82f).toInt()
-            params.height = ViewGroup.LayoutParams.MATCH_PARENT
-            params.dimAmount = 0.28f
-            attributes = params
-        }
-    }
-
-
-    private fun showGestureCalibrationDialog() {
-        if (!isAccessibilityEnabled()) {
-            AlertDialog.Builder(this)
-                .setTitle("需要开启无障碍服务")
-                .setMessage("自动采样需要通过 Freedom 无障碍服务发送内部测试手势。请先开启 Freedom 无障碍服务，再回来开始采样。")
-                .setPositiveButton("前往无障碍设置") { _, _ ->
-                    startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
-                }
-                .setNegativeButton("关闭", null)
-                .show()
-            return
-        }
-
-        registerGestureCalibrationReceiver()
-
-        val details = TextView(this).apply {
-            text = buildString {
-                append("采样目的\n")
-                append("测量当前设备通过 Android 无障碍手势接口实际送达应用界面的轨迹时间间隔，")
-                append("据此计算适合本机的路径偏移频率。\n\n")
-                append("操作方法\n")
-                append("1. 先停止 Freedom 监听，再点击下方“开始自动采样”。\n")
-                append("2. Freedom 会在本页面的校准区域内自动执行 ")
-                append(GestureTuning.CALIBRATION_TRIAL_COUNT)
-                append(" 组测试手势。\n")
-                append("3. 采样期间保持本页面在前台，不要触摸校准区域，也不要切换应用。\n")
-                append("4. 完成后自动计算、保存并应用推荐频率。\n\n")
-                append("安全说明\n")
-                append("测试手势只发送到 Freedom 自己的校准区域，不会在陌陌页面滑动、点击或打开内容。")
-                append("不会修改陌陌数据。采样失败时不会覆盖之前成功保存的结果。\n\n")
-                append("频率由系统采样时间间隔自动计算，不提供手动输入或修改入口。")
-            }
-            textSize = 12f
-            setTextColor(0xFF455064.toInt())
-            setPadding(0, 0, 0, dp(12))
-        }
-
-        val padLabel = TextView(this).apply {
-            text = "自动校准区域\n采样时请勿触摸"
-            textSize = 15f
-            gravity = Gravity.CENTER
-            setTextColor(0xFF536174.toInt())
-        }
-        val pad = android.widget.FrameLayout(this).apply {
-            isClickable = true
-            background = roundedBackground(0xFFF0F3F8.toInt(), dp(12).toFloat())
-            addView(
-                padLabel,
-                android.widget.FrameLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    ViewGroup.LayoutParams.MATCH_PARENT
-                )
-            )
-        }
-
-        val status = TextView(this).apply {
-            text = if (GestureTuning.isCalibrated(this@MainActivity)) {
-                GestureTuning.calibrationSummary(this@MainActivity)
-            } else {
-                "当前状态：尚未完成本机自动采样。\n未采样前将使用保守的系统估算频率。"
-            }
-            textSize = 12f
-            setTextColor(0xFF596579.toInt())
-            setPadding(0, dp(12), 0, dp(8))
-        }
-
-        val startButton = Button(this).apply {
-            text = if (GestureTuning.isCalibrated(this@MainActivity)) "重新采样" else "开始自动采样"
-            isAllCaps = false
-            setOnClickListener {
-                startGestureCalibration(pad)
-            }
-        }
-
-        val container = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(20), dp(4), dp(20), dp(8))
-            addView(details)
-            addView(
-                pad,
-                LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    dp(210)
-                )
-            )
-            addView(status)
-            addView(startButton, LinearLayout.LayoutParams(-1, -2))
-        }
-
-        val dialog = AlertDialog.Builder(this)
-            .setTitle("自动采样路径偏移频率")
-            .setView(container)
-            .setNegativeButton("关闭", null)
-            .create()
-
-        gestureCalibrationDialog = dialog
-        gestureCalibrationStatusView = status
-        gestureCalibrationPad = pad
-        gestureCalibrationStartButton = startButton
-
-        pad.setOnTouchListener { _, event ->
-            collectGestureCalibrationTouch(event)
-        }
-
-        dialog.setCancelable(false)
-        dialog.setCanceledOnTouchOutside(false)
-        dialog.setOnDismissListener {
-            if (gestureCalibrationRunning) {
-                gestureCalibrationRunning = false
-                gestureCalibrationHandler.removeCallbacks(gestureCalibrationTimeoutRunnable)
-                sendGestureCalibrationCancel()
-            }
-            unregisterGestureCalibrationReceiver()
-            gestureCalibrationDialog = null
-            gestureCalibrationStatusView = null
-            gestureCalibrationPad = null
-            gestureCalibrationStartButton = null
-        }
-
-        dialog.show()
-        dialog.window?.setLayout(
-            (resources.displayMetrics.widthPixels * 0.90f).toInt(),
-            ViewGroup.LayoutParams.WRAP_CONTENT
-        )
-    }
-
-    private fun registerGestureCalibrationReceiver() {
-        if (gestureCalibrationReceiverRegistered) return
-        val filter = IntentFilter().apply {
-            addAction(GestureTuning.ACTION_CALIBRATION_TRIAL_COMPLETED)
-            addAction(GestureTuning.ACTION_CALIBRATION_FINISHED)
-            addAction(GestureTuning.ACTION_CALIBRATION_FAILED)
-        }
-        if (Build.VERSION.SDK_INT >= 33) {
-            registerReceiver(
-                gestureCalibrationReceiver,
-                filter,
-                Context.RECEIVER_NOT_EXPORTED
-            )
-        } else {
-            @Suppress("DEPRECATION")
-            registerReceiver(gestureCalibrationReceiver, filter)
-        }
-        gestureCalibrationReceiverRegistered = true
-    }
-
-    private fun unregisterGestureCalibrationReceiver() {
-        if (!gestureCalibrationReceiverRegistered) return
-        runCatching { unregisterReceiver(gestureCalibrationReceiver) }
-        gestureCalibrationReceiverRegistered = false
-    }
-
-    private fun startGestureCalibration(pad: View) {
-        if (MonitorStore.isRunning(this)) {
-            Toast.makeText(
-                this,
-                "请先停止 Freedom 监听，再进行设备手势采样。",
-                Toast.LENGTH_LONG
-            ).show()
-            return
-        }
-        if (!isAccessibilityEnabled()) {
-            Toast.makeText(this, "请先开启 Freedom 无障碍服务", Toast.LENGTH_LONG).show()
-            return
-        }
-        if (gestureCalibrationRunning) return
-
-        gestureCalibrationTrials.clear()
-        gestureCalibrationCurrentTimes.clear()
-        gestureCalibrationRunning = true
-        gestureCalibrationStartButton?.isEnabled = false
-        gestureCalibrationDialog?.getButton(AlertDialog.BUTTON_NEGATIVE)?.isEnabled = false
-        gestureCalibrationStatusView?.text =
-            "正在准备校准区域……\n即将执行 ${GestureTuning.CALIBRATION_TRIAL_COUNT} 组内部测试手势，请勿触摸屏幕。"
-
-        gestureCalibrationHandler.removeCallbacks(gestureCalibrationTimeoutRunnable)
-        gestureCalibrationHandler.postDelayed(
-            gestureCalibrationTimeoutRunnable,
-            GestureTuning.CALIBRATION_TIMEOUT_MS
-        )
-
-        pad.post {
-            if (!gestureCalibrationRunning) return@post
-            val location = IntArray(2)
-            pad.getLocationOnScreen(location)
-            val width = pad.width
-            val height = pad.height
-            if (width < dp(100) || height < dp(100)) {
-                showGestureCalibrationFailure("校准区域尺寸不足，无法安全执行内部测试手势。")
-                return@post
-            }
-
-            val request = Intent(GestureTuning.ACTION_START_CALIBRATION)
-                .setPackage(packageName)
-                .putExtra(GestureTuning.EXTRA_LEFT, location[0])
-                .putExtra(GestureTuning.EXTRA_TOP, location[1])
-                .putExtra(GestureTuning.EXTRA_WIDTH, width)
-                .putExtra(GestureTuning.EXTRA_HEIGHT, height)
-            sendBroadcast(request)
-        }
-    }
-
-    private fun collectGestureCalibrationTouch(event: android.view.MotionEvent): Boolean {
-        if (!gestureCalibrationRunning) return false
-
-        fun addTimestamp(time: Long) {
-            if (gestureCalibrationCurrentTimes.isEmpty() ||
-                time > gestureCalibrationCurrentTimes.last()
-            ) {
-                gestureCalibrationCurrentTimes.add(time)
-            }
-        }
-
-        when (event.actionMasked) {
-            android.view.MotionEvent.ACTION_DOWN -> {
-                gestureCalibrationCurrentTimes.clear()
-                addTimestamp(event.eventTime)
-                return true
-            }
-
-            android.view.MotionEvent.ACTION_MOVE,
-            android.view.MotionEvent.ACTION_UP -> {
-                for (historyIndex in 0 until event.historySize) {
-                    addTimestamp(event.getHistoricalEventTime(historyIndex))
-                }
-                addTimestamp(event.eventTime)
-
-                if (event.actionMasked == android.view.MotionEvent.ACTION_UP) {
-                    if (gestureCalibrationCurrentTimes.size >= GestureTuning.MIN_POINTS_PER_TRIAL) {
-                        gestureCalibrationTrials.add(gestureCalibrationCurrentTimes.toList())
-                    }
-                    gestureCalibrationCurrentTimes.clear()
-                }
-                return true
-            }
-
-            android.view.MotionEvent.ACTION_CANCEL -> {
-                gestureCalibrationCurrentTimes.clear()
-                return true
-            }
-
-            else -> return true
-        }
-    }
-
-    private fun showGestureCalibrationFailure(reason: String) {
-        gestureCalibrationHandler.removeCallbacks(gestureCalibrationTimeoutRunnable)
-        gestureCalibrationRunning = false
-        gestureCalibrationCurrentTimes.clear()
-        gestureCalibrationStartButton?.isEnabled = true
-        gestureCalibrationStartButton?.text = "重新采样"
-        gestureCalibrationDialog?.getButton(AlertDialog.BUTTON_NEGATIVE)?.isEnabled = true
-        gestureCalibrationStatusView?.text =
-            "本次采样未成功\n$reason\n\n之前已保存的有效校准结果不会被覆盖。请检查无障碍服务和页面状态后重新采样。"
-        MonitorStore.addLog(this, timestamp() + "  手势路径自动采样失败：$reason")
-    }
-
-    private fun sendGestureCalibrationCancel() {
-        sendBroadcast(
-            Intent(GestureTuning.ACTION_CANCEL_CALIBRATION).setPackage(packageName)
-        )
-    }
-
     private fun showTargetEditor() {
-        val input = EditText(this).apply {
-            setSingleLine(true)
-            hint = "例如 com.immomo.momo"
-            setText(MonitorStore.targetPackage(this@MainActivity))
-            setSelection(text.length)
-            inputType = android.text.InputType.TYPE_CLASS_TEXT or
-                android.text.InputType.TYPE_TEXT_VARIATION_URI
-        }
-        val container = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(22), dp(6), dp(22), 0)
-            addView(TextView(this@MainActivity).apply {
-                text = "输入需要监控的 Android 应用包名："
-                textSize = 13f
-                setTextColor(0xFF596579.toInt())
-            })
-            addView(input)
-        }
-        AlertDialog.Builder(this)
-            .setTitle("监控目标")
-            .setView(container)
-            .setPositiveButton("保存目标") { _, _ ->
-                val value = input.text.toString().trim()
-                if (!PACKAGE_PATTERN.matches(value)) {
-                    Toast.makeText(
-                        this,
-                        "包名格式不正确，例如 com.immomo.momo",
-                        Toast.LENGTH_LONG
-                    ).show()
-                } else {
-                    MonitorStore.setTargetPackage(this, value)
-                    sendBroadcast(
-                        Intent(MonitorActions.ACTION_TARGET_CHANGED).setPackage(packageName)
-                    )
-                    MonitorStore.updateAppPage(
-                        this,
-                        app = "尚未识别",
-                        page = "等待页面信息"
-                    )
-                    MonitorStore.addLog(this, timestamp() + "  监控目标已设置为 $value")
-                    refreshScreen()
-                }
-            }
-            .setNegativeButton("取消", null)
-            .show()
-    }
-
-    private fun addConfigSection(parent: LinearLayout, title: String) {
-        parent.addView(TextView(this).apply {
-            text = title
-            textSize = 14f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(0xFF315EFB.toInt())
-            setPadding(dp(4), dp(16), dp(4), dp(8))
-        })
-    }
-
-    private fun addConfigActionRow(
-        parent: LinearLayout,
-        icon: String,
-        title: String,
-        subtitle: String,
-        actionText: String,
-        action: () -> Unit
-    ) {
-        val row = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(8), dp(9), dp(6), dp(9))
-            background = roundedBackground(Color.WHITE, dp(10).toFloat())
-            setOnClickListener { action() }
-        }
-        row.addView(configRowIcon(icon), LinearLayout.LayoutParams(dp(38), dp(38)))
-        row.addView(configRowTexts(title, subtitle), LinearLayout.LayoutParams(0, -2, 1f))
-        row.addView(TextView(this).apply {
-            text = actionText
-            textSize = 11f
-            setTextColor(0xFF315EFB.toInt())
-            gravity = Gravity.CENTER
-            setPadding(dp(5), 0, dp(3), 0)
-        }, LinearLayout.LayoutParams(-2, dp(38)))
-        parent.addView(row, LinearLayout.LayoutParams(-1, -2).apply {
-            bottomMargin = dp(7)
-        })
-    }
-
-    private fun addConfigSwitchRow(
-        parent: LinearLayout,
-        icon: String,
-        title: String,
-        subtitle: String,
-        checked: Boolean,
-        onChanged: (Boolean) -> Unit
-    ) {
-        val row = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(8), dp(7), dp(6), dp(7))
-            background = roundedBackground(Color.WHITE, dp(10).toFloat())
-        }
-        row.addView(configRowIcon(icon), LinearLayout.LayoutParams(dp(38), dp(38)))
-        row.addView(configRowTexts(title, subtitle), LinearLayout.LayoutParams(0, -2, 1f))
-        val toggle = Switch(this).apply {
-            isChecked = checked
-            setOnCheckedChangeListener { _, value -> onChanged(value) }
-        }
-        row.addView(toggle, LinearLayout.LayoutParams(-2, dp(42)))
-        parent.addView(row, LinearLayout.LayoutParams(-1, -2).apply {
-            bottomMargin = dp(7)
-        })
-    }
-
-    private fun configRowIcon(value: String) = TextView(this).apply {
-        text = value
-        textSize = 21f
-        gravity = Gravity.CENTER
-        setTextColor(0xFF263244.toInt())
-    }
-
-    private fun configRowTexts(title: String, subtitle: String) = LinearLayout(this).apply {
-        orientation = LinearLayout.VERTICAL
-        setPadding(dp(4), 0, dp(4), 0)
-        addView(TextView(this@MainActivity).apply {
-            text = title
-            textSize = 14f
-            setTextColor(0xFF202938.toInt())
-        })
-        addView(TextView(this@MainActivity).apply {
-            text = subtitle
-            textSize = 10f
-            setTextColor(0xFF7B8494.toInt())
-            maxLines = 2
-        })
+        TargetAppEditor.show(
+            activity = this,
+            dp = { value -> dp(value) },
+            packagePattern = PACKAGE_PATTERN,
+            timestamp = { timestamp() },
+            refreshScreen = { refreshScreen() }
+        )
     }
 
     private fun openAppDetailsSettings() {
@@ -1101,45 +464,16 @@ class MainActivity : Activity() {
 
     private fun showRecords() {
         val records = MonitorStore.logs(this)
-        var showTechnicalDetails = false
-        val view = TextView(this).apply {
-            textSize = 12f
-            setTextColor(0xFF263244.toInt())
-            setTextIsSelectable(true)
-            setPadding(dp(16), dp(12), dp(16), dp(12))
-            text = formatLogLines(records, false).ifBlank { "暂无运行记录" }
-        }
-        val detailsToggle = Button(this).apply {
-            text = "查看技术详情"
-            isAllCaps = false
-            setOnClickListener {
-                showTechnicalDetails = !showTechnicalDetails
-                text = if (showTechnicalDetails) "收起技术详情" else "查看技术详情"
-                view.text = formatLogLines(records, showTechnicalDetails)
-                    .ifBlank { "暂无运行记录" }
-            }
-        }
-        val scroll = ScrollView(this).apply {
-            addView(view)
-            setPadding(dp(4), 0, dp(4), 0)
-        }
-        val container = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            addView(detailsToggle, LinearLayout.LayoutParams(-1, -2))
-            addView(scroll, LinearLayout.LayoutParams(-1, dp(420)))
-        }
-        AlertDialog.Builder(this)
-            .setTitle("运行记录（最近 ${records.size} 条）")
-            .setView(container)
-            .setPositiveButton("关闭", null)
-            .setNeutralButton("导出 TXT") { _, _ ->
-                launchLogExport(records)
-            }
-            .setNegativeButton("清空记录") { _, _ ->
+        LogRecordsDialog.show(
+            activity = this,
+            records = records,
+            dp = { value -> dp(value) },
+            onExport = ::launchLogExport,
+            onCleared = {
                 MonitorStore.clearLogs(this)
                 refreshScreen()
             }
-            .show()
+        )
     }
 
     /** Open Android's system document picker; no storage permission is required. */
@@ -1175,7 +509,7 @@ class MainActivity : Activity() {
         append("\n记录数量：").append(records.size)
         append("\n导出内容：包含完整技术详情\n")
         append("=".repeat(72)).append("\n\n")
-        append(formatLogLines(records, includeTechnicalDetails = true))
+        append(LogTextFormatter.formatLogLines(records, includeTechnicalDetails = true))
         if (records.isNotEmpty()) append('\n')
     }
 
@@ -1226,85 +560,6 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun formatLogLines(
-        lines: List<String>,
-        includeTechnicalDetails: Boolean
-    ): String = lines.joinToString("\n") { line ->
-        formatLogLine(line, includeTechnicalDetails)
-    }
-
-    private fun formatLogLine(line: String, includeTechnicalDetails: Boolean): String {
-        val separatorIndex = line.indexOf(LOG_DETAIL_SEPARATOR)
-        if (separatorIndex >= 0) {
-            val summary = line.substring(0, separatorIndex).trimEnd()
-            val technical = line.substring(separatorIndex + 1).trim()
-            return if (includeTechnicalDetails && technical.isNotBlank()) {
-                "$summary\n  技术详情：$technical"
-            } else {
-                summary
-            }
-        }
-        return if (includeTechnicalDetails) line else formatLegacyEventLine(line)
-    }
-
-    /** Convert previously stored v1 event strings too, so old history remains readable after upgrade. */
-    private fun formatLegacyEventLine(line: String): String {
-        val type = Regex("\\[(TYPE_[A-Z0-9_]+)\\]").find(line)?.groupValues?.get(1)
-            ?: return line
-        val className = Regex("原始类名=([^；]+)").find(line)?.groupValues?.get(1)?.trim().orEmpty()
-        val simpleClass = className.substringAfterLast('.')
-        val area = when (simpleClass) {
-            "RecyclerView" -> "内容列表"
-            "ScrollView", "HorizontalScrollView" -> "可滚动区域"
-            "EditText" -> "文字输入框"
-            "TextView" -> "文字区域"
-            "Button", "ImageButton" -> "按钮区域"
-            "ImageView" -> "图片区域"
-            "WebView" -> "网页内容区域"
-            "ViewPager", "ViewPager2" -> "分页区域"
-            "CheckBox", "RadioButton", "Switch" -> "选项控件"
-            else -> "界面区域"
-        }
-        val title = when (type) {
-            "TYPE_WINDOW_CONTENT_CHANGED" -> "页面内容更新"
-            "TYPE_VIEW_SCROLLED" -> if (simpleClass == "RecyclerView") "列表滚动" else "页面滚动"
-            "TYPE_VIEW_CLICKED" -> "控件点击"
-            "TYPE_VIEW_LONG_CLICKED" -> "控件长按"
-            "TYPE_VIEW_TEXT_CHANGED" -> "文字内容变化"
-            "TYPE_WINDOW_STATE_CHANGED" -> "页面或窗口切换"
-            "TYPE_VIEW_SELECTED" -> "选项状态变化"
-            "TYPE_VIEW_FOCUSED" -> "控件获得焦点"
-            "TYPE_VIEW_TEXT_SELECTION_CHANGED" -> "文字选区变化"
-            "TYPE_NOTIFICATION_STATE_CHANGED" -> "通知内容变化"
-            "TYPE_WINDOWS_CHANGED" -> "应用窗口变化"
-            else -> "界面事件"
-        }
-        val explanation = when (type) {
-            "TYPE_WINDOW_CONTENT_CHANGED" -> "这个区域的内容或结构发生了变化，可能是列表刷新、内容加载或项目更新。"
-            "TYPE_VIEW_SCROLLED" -> if (simpleClass == "RecyclerView") {
-                "检测到内容列表的滚动位置或可见项目发生变化。"
-            } else {
-                "检测到可滚动区域的位置或可见内容发生变化。"
-            }
-            "TYPE_VIEW_CLICKED" -> "系统报告这个界面控件发生了一次点击事件。"
-            "TYPE_VIEW_LONG_CLICKED" -> "系统报告这个界面控件发生了一次长按事件。"
-            "TYPE_VIEW_TEXT_CHANGED" -> "一个文字控件中的内容发生了变化。"
-            "TYPE_WINDOW_STATE_CHANGED" -> "当前应用的窗口或页面状态发生了变化。"
-            else -> "系统检测到界面状态变化；详细类型可在技术详情中查看。"
-        }
-        val time = Regex("^\\d{2}:\\d{2}:\\d{2}\\.\\d{3}").find(line)?.value.orEmpty()
-        val relatedText = Regex("(?:内容|描述)=([^；]+)").find(line)?.groupValues?.get(1)?.trim()
-        return buildString {
-            if (time.isNotBlank()) append(time).append("  ")
-            append(title)
-            append("\n操作区域：").append(area)
-            append("\n说明：").append(explanation)
-            if (!relatedText.isNullOrBlank()) {
-                append("\n相关文字：").append(relatedText.take(100))
-            }
-        }
-    }
-
     // Retained utility views from the existing Activity implementation.
     private fun card(): LinearLayout = LinearLayout(this).apply {
         orientation = LinearLayout.VERTICAL
@@ -1343,7 +598,6 @@ class MainActivity : Activity() {
     companion object {
         private const val PREFS_UI = "freedom_main_ui"
         private const val KEY_KEEP_ACCOUNT_MODE = "keep_account_mode_enabled"
-        private const val LOG_DETAIL_SEPARATOR = "\u001F"
         private const val REQUEST_MEDIA_PERMISSION = 2001
         private const val REQUEST_EXPORT_LOGS = 2002
         private val PACKAGE_PATTERN = Regex("^[A-Za-z][A-Za-z0-9_]*(\\.[A-Za-z][A-Za-z0-9_]*)+$")

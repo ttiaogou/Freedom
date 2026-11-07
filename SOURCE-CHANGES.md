@@ -24,3 +24,17 @@
 ## 验证状态
 
 本次已完成 XML 解析、工作流 YAML 解析、关键配置/引用检查和 Kotlin 源码语法扫描。当前环境没有 Android SDK 与 Gradle 构建环境，未执行 Android `assembleDebug`，也没有真机验证；最终编译结果需以 GitHub Actions 为准。
+
+
+## Stage 1 — 按职责拆分结构（2026-11-07）
+
+- 抽取自动浏览数据模型和主流程单步调度器；保留原有 Handler 单待执行、阶段门控和取消语义。
+- 抽取无障碍事件格式化、目标窗口节点 BFS 扫描。
+- 将设置面板、手势校准 UI/广播/超时，以及运行日志格式化/展示移入 `ui/`。
+- `FreedomAccessibilityService` 继续负责 Android 无障碍服务生命周期、事件入口和既有自动浏览状态机；本阶段没有重写页面导航、手势执行或详情页返回逻辑。
+- `MainActivity` 保留运行启停、权限系统交互、目标包名编辑和系统文档导出入口；设置面板、校准界面与日志显示改由独立 UI 组件承担。
+- 新增 `ARCHITECTURE.md` 说明职责边界和调度约束。
+- 未增加新功能，未修改目标应用的自动化行为规则。
+
+- 将原 `accessibility/GestureTuning.kt` 移入 `accessibility/gesture/` 子包；API 名称和持久化键不变。
+- 将监控目标包名编辑界面移入 `ui/config/TargetAppEditor.kt`；校验规则、保存顺序和广播 Action 不变。

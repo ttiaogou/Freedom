@@ -23,6 +23,11 @@ import android.widget.TextView
 import com.freedom.data.MonitorActions
 import com.freedom.data.MonitorStore
 import com.freedom.accessibility.browse.MomoDynamicCardSelector
+import com.freedom.accessibility.browse.AccountBrowsePhase
+import com.freedom.accessibility.event.AccessibilityEventFormatter
+import com.freedom.accessibility.scan.AccessibilityTreeScanner
+import com.freedom.accessibility.scheduling.AccountBrowseScheduler
+import com.freedom.accessibility.gesture.GestureTuning
 import com.freedom.overlay.GestureTrailOverlay
 import com.freedom.overlay.MonitorOverlay
 import com.freedom.stability.MonitorKeepAliveService
@@ -43,108 +48,7 @@ class FreedomAccessibilityService : AccessibilityService() {
     private var scanQueued = false
     private var targetReceiverRegistered = false
 
-    // Read the existing main-screen checkbox without changing its storage key.
-    private enum class AccountBrowsePhase {
-        IDLE,
-        WAIT_FOR_DYNAMIC_TAB,
-        VERIFY_NAVIGATION_ACTION,
-        WAIT_FOR_FEED_STABLE,
-        FIRST_SWIPE_COUNTDOWN,
-        WAIT_FOR_LIST_SCROLL,
-        WAIT_FOR_SCROLL_SETTLE,
-        WAIT_FOR_CARD_OPEN,
-        WAIT_FOR_SAFE_CARD,
-        WAIT_FOR_DETAIL_LOAD,
-        DETAIL_DWELL,
-        WAIT_FOR_IMAGE_BROWSER_RETURN,
-        WAIT_FOR_DETAIL_RESTABILIZE,
-        WAIT_FOR_LIST_RETURN,
-        PAUSED
-    }
-
-    private data class PageFingerprint(
-        val signature: String,
-        val nodeCount: Int
-    )
-
-    private data class FeedReadinessInspection(
-        val fingerprint: PageFingerprint?,
-        val reason: String
-    )
-
-    private data class TabLabelEvidence(
-        val label: String,
-        val bounds: Rect,
-        val selected: Boolean
-    )
-
-    private data class DynamicTabRowEvidence(
-        val contentTop: Int,
-        val diagnostic: String,
-        val dynamicBounds: Rect,
-        val dynamicSelected: Boolean,
-        val selectionKnown: Boolean
-    )
-
-    private data class HomeBottomNavEvidence(
-        val homeBounds: Rect,
-        val homeSelected: Boolean,
-        val selectionKnown: Boolean,
-        val diagnostic: String
-    )
-
-    private data class ManualResumeContext(
-        val phaseName: String,
-        val activityClass: String,
-        val sourceFingerprint: String,
-        val detailFingerprint: String,
-        val imageBrowserActive: Boolean,
-        val lastProgrammaticAction: String,
-        val capturedAt: Long
-    )
-
-    private data class DynamicTabInspection(
-        val evidence: DynamicTabRowEvidence?,
-        val reason: String
-    )
-
-    private data class PopupInspection(
-        val container: AccessibilityNodeInfo?,
-        val closeTarget: AccessibilityNodeInfo?,
-        val dismissable: Boolean,
-        val critical: Boolean,
-        val signature: String,
-        val description: String
-    )
-
-    private data class DetailPageIdentityInspection(
-        val isFeedPage: Boolean,
-        val identityConfirmed: Boolean,
-        val fingerprint: PageFingerprint,
-        val reason: String
-    )
-
-    private data class FeedGestureTarget(
-        val bounds: Rect,
-        val className: String
-    )
-
-    private data class ScrollGestureProfile(
-        val durationMs: Long,
-        val curveOffsetRatio: Float,
-        val microPerturbationFrequencyHz: Float
-    )
-
-    private data class ScrollGesturePlan(
-        val path: Path,
-        val startX: Int,
-        val startY: Int,
-        val endX: Int,
-        val endY: Int
-    )
-
     private var accountBrowsePhase = AccountBrowsePhase.IDLE
-    private var accountBrowseStepPending = false
     private var accountBrowsePauseReason = ""
     private var accountBrowseLastDynamicTabWaitReason = ""
     private var accountBrowseDeadlineAt = 0L
@@ -198,6 +102,31 @@ class FreedomAccessibilityService : AccessibilityService() {
     private var accountBrowsePopupNextAttemptAt = 0L
     private var accountBrowsePopupActionAttempts = 0
     private var accountBrowsePopupExhaustedLogged = false
+
+    // The extracted scheduler preserves the former Handler Runnable contract:
+    // one pending step at a time, no replacement, and no second eligibility check
+    // between enqueue and callback dispatch. performAccountBrowseStep remains authoritative.
+    private val accountBrowseScheduler by lazy(LazyThreadSafetyMode.NONE) {
+        AccountBrowseScheduler(
+            handler = mainHandler,
+            canSchedule = {
+                MonitorStore.isRunning(this) &&
+                    isAccountBrowseModeEnabled() &&
+                    !accountBrowseTouchActive &&
+                    accountBrowsePhase != AccountBrowsePhase.PAUSED &&
+                    accountBrowsePhase != AccountBrowsePhase.IDLE
+            },
+            onStep = { performAccountBrowseStep() }
+        )
+    }
+
+    private val accessibilityTreeScanner by lazy(LazyThreadSafetyMode.NONE) {
+        AccessibilityTreeScanner(
+            service = this,
+            onLog = ::addLog,
+            onRefresh = ::refreshViews
+        )
+    }
 
     // Device-only gesture calibration state. Calibration strokes are restricted to
     // Freedom's own calibration surface and never target the selected third-party app.
@@ -255,12 +184,7 @@ class FreedomAccessibilityService : AccessibilityService() {
 
     private val scanRunnable = Runnable {
         scanQueued = false
-        scanActiveWindow()
-    }
-
-    private val accountBrowseRunnable = Runnable {
-        accountBrowseStepPending = false
-        performAccountBrowseStep()
+        accessibilityTreeScanner.scanActiveWindow()
     }
 
     // Resume after the user finishes navigating or interacting with the target app.
@@ -538,7 +462,7 @@ class FreedomAccessibilityService : AccessibilityService() {
             startAccountBrowseIfNeeded()
         }
 
-        val rawEventName = rawEventName(event.eventType)
+        val rawEventName = AccessibilityEventFormatter.rawEventName(event.eventType)
         val className = event.className?.toString().orEmpty()
         val content = event.text
             ?.joinToString(" ") { it?.toString().orEmpty() }
@@ -563,7 +487,7 @@ class FreedomAccessibilityService : AccessibilityService() {
             .orEmpty()
         MonitorStore.updateAppPage(this, app = appLabel, page = pageHint)
 
-        val friendlyEvent = friendlyEventDescription(
+        val friendlyEvent = AccessibilityEventFormatter.friendlyEventDescription(
             eventType = event.eventType,
             className = className,
             content = content,
@@ -832,23 +756,14 @@ class FreedomAccessibilityService : AccessibilityService() {
     }
 
     private fun scheduleAccountBrowseStep(delayMs: Long) {
-        if (!MonitorStore.isRunning(this) || !isAccountBrowseModeEnabled() ||
-            accountBrowseTouchActive || accountBrowsePhase == AccountBrowsePhase.PAUSED ||
-            accountBrowsePhase == AccountBrowsePhase.IDLE
-        ) {
-            return
-        }
-        if (accountBrowseStepPending) return
-        accountBrowseStepPending = true
-        mainHandler.postDelayed(accountBrowseRunnable, delayMs.coerceAtLeast(0L))
+        accountBrowseScheduler.schedule(delayMs)
     }
 
     private fun resetAccountBrowseSession() {
         GestureTrailOverlay.clear()
         restoreMonitorOverlayTouchPassthrough()
-        mainHandler.removeCallbacks(accountBrowseRunnable)
+        accountBrowseScheduler.cancel()
         mainHandler.removeCallbacks(manualTouchResumeRunnable)
-        accountBrowseStepPending = false
         accountBrowsePhase = AccountBrowsePhase.IDLE
         accountBrowsePauseReason = ""
         accountBrowseLastDynamicTabWaitReason = ""
@@ -928,8 +843,7 @@ class FreedomAccessibilityService : AccessibilityService() {
         }
         GestureTrailOverlay.clear()
         restoreMonitorOverlayTouchPassthrough()
-        mainHandler.removeCallbacks(accountBrowseRunnable)
-        accountBrowseStepPending = false
+        accountBrowseScheduler.cancel()
         accountBrowseManualResumeAllowed = allowManualResume
         accountBrowseGestureInFlight = false
         accountBrowseCountdownRemaining = 0
@@ -2703,8 +2617,7 @@ class FreedomAccessibilityService : AccessibilityService() {
         }
         GestureTrailOverlay.clear()
         restoreMonitorOverlayTouchPassthrough()
-        mainHandler.removeCallbacks(accountBrowseRunnable)
-        accountBrowseStepPending = false
+        accountBrowseScheduler.cancel()
         accountBrowsePauseReason = reason
         accountBrowseManualResumeAllowed = false
         accountBrowseNavigationActionKey = ""
@@ -2750,9 +2663,8 @@ class FreedomAccessibilityService : AccessibilityService() {
                 accountBrowseDetailDwellRemainingMs =
                     (accountBrowseDetailDwellDueAt - System.currentTimeMillis()).coerceAtLeast(0L)
                 mainHandler.removeCallbacks(manualTouchResumeRunnable)
-                mainHandler.removeCallbacks(accountBrowseRunnable)
+                accountBrowseScheduler.cancel()
                 accountBrowseManualResumeAllowed = false
-                accountBrowseStepPending = false
                 accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_IMAGE_BROWSER_RETURN
                 accountBrowseDeadlineAt = System.currentTimeMillis() + IMAGE_BROWSER_RETURN_TIMEOUT_MS
                 addLog("自动详情停留期间进入陌陌图片浏览页面：保留详情上下文，等待图片页面返回")
@@ -2980,7 +2892,7 @@ class FreedomAccessibilityService : AccessibilityService() {
             accountBrowsePhase == AccountBrowsePhase.WAIT_FOR_DETAIL_RESTABILIZE
         ) return
 
-        val eventName = rawEventName(eventType)
+        val eventName = AccessibilityEventFormatter.rawEventName(eventType)
         val target = sequenceOf(content, description, className).firstOrNull { it.isNotBlank() }
             ?.take(120) ?: "未提供控件文本"
         val globalTouchRecent = now - accountBrowseLastGlobalTouchEventAt <= GLOBAL_TOUCH_EVENT_ASSOCIATION_MS
@@ -3504,123 +3416,6 @@ class FreedomAccessibilityService : AccessibilityService() {
         return bestNode
     }
 
-    private fun scanActiveWindow() {
-        if (!MonitorStore.isRunning(this)) return
-        val targetPackage = MonitorStore.targetPackage(this)
-        val root = findTargetWindowRoot(targetPackage)
-        if (root == null) {
-            addLog("节点扫描未完成：当前活动窗口中没有找到目标应用公开的根节点")
-            return
-        }
-
-        val rootPackage = runCatching { root.packageName?.toString().orEmpty() }.getOrDefault("")
-
-        val appLabel = resolveAppLabel(rootPackage)
-        val queue = ArrayDeque<Pair<AccessibilityNodeInfo, Int>>()
-        val displayLines = ArrayList<String>(MonitorStore.MAX_DISPLAY_NODES)
-        var visited = 0
-        var truncated = false
-        var pageTitle = ""
-        queue.add(root to 0)
-
-        try {
-            while (queue.isNotEmpty() && visited < MonitorStore.MAX_NODES_PER_SCAN) {
-                val (node, depth) = queue.removeFirst()
-                visited++
-                try {
-                    val fullClassName = node.className?.toString()?.takeIf(String::isNotBlank) ?: "Unknown"
-                    val rawClass = fullClassName.substringAfterLast('.')
-                    val label = chineseClass(rawClass)
-                    val text = runCatching { node.text?.toString().orEmpty() }.getOrDefault("").trim().take(120)
-                    val description = runCatching { node.contentDescription?.toString().orEmpty() }
-                        .getOrDefault("").trim().take(100)
-                    val viewId = runCatching { node.viewIdResourceName.orEmpty() }.getOrDefault("")
-                    val state = buildList {
-                        if (runCatching { node.isClickable }.getOrDefault(false)) add("可点击")
-                        if (runCatching { node.isLongClickable }.getOrDefault(false)) add("可长按")
-                        if (runCatching { node.isEditable }.getOrDefault(false)) add("可输入")
-                        if (runCatching { node.isScrollable }.getOrDefault(false)) add("可滚动")
-                        if (runCatching { node.isCheckable }.getOrDefault(false)) add("可勾选")
-                        if (runCatching { node.isChecked }.getOrDefault(false)) add("已勾选")
-                        if (runCatching { node.isFocused }.getOrDefault(false)) add("焦点")
-                        if (runCatching { node.isEnabled }.getOrDefault(false)) add("启用")
-                    }.joinToString("、")
-
-                    if (pageTitle.isBlank() && depth <= 3) {
-                        pageTitle = sequenceOf(text, description)
-                            .firstOrNull { it.isNotBlank() && it.length <= 60 }
-                            .orEmpty()
-                    }
-
-                    if (displayLines.size < MonitorStore.MAX_DISPLAY_NODES) {
-                        val indent = "  ".repeat(depth.coerceAtMost(10))
-                        val readable = listOf(text, description).filter(String::isNotBlank).distinct().joinToString("；")
-                        val line = buildString {
-                            append(indent)
-                            append(label)
-                            append(" <")
-                            append(fullClassName)
-                            append(">")
-                            if (readable.isNotBlank()) append("：$readable")
-                            if (viewId.isNotBlank()) append(" [ID:$viewId]")
-                            if (state.isNotBlank()) append(" {$state}")
-                        }
-                        displayLines.add(line)
-                    }
-
-                    val childCount = runCatching { node.childCount }.getOrDefault(0)
-                    for (index in 0 until childCount) {
-                        if (visited + queue.size >= MonitorStore.MAX_NODES_PER_SCAN) {
-                            truncated = true
-                            break
-                        }
-                        val child = runCatching { node.getChild(index) }.getOrNull() ?: continue
-                        queue.add(child to depth + 1)
-                    }
-                } finally {
-                    runCatching { node.recycle() }
-                }
-            }
-            if (queue.isNotEmpty() || visited >= MonitorStore.MAX_NODES_PER_SCAN) truncated = true
-        } finally {
-            while (queue.isNotEmpty()) {
-                runCatching { queue.removeFirst().first.recycle() }
-            }
-        }
-
-        if (pageTitle.isBlank()) pageTitle = MonitorStore.snapshot(this).page
-        MonitorStore.saveSnapshot(
-            context = this,
-            app = appLabel,
-            page = pageTitle.ifBlank { "未识别页面标题" },
-            nodes = displayLines,
-            visitedCount = visited,
-            truncated = truncated
-        )
-        addLog("节点扫描完成：访问 $visited 个节点，预览显示 ${displayLines.size} 个" + if (truncated) "；已达到扫描上限，结果可能不完整" else "")
-        refreshViews()
-    }
-
-
-    /** Prefer the active root, then search visible interactive windows for the target package. */
-    private fun findTargetWindowRoot(targetPackage: String): AccessibilityNodeInfo? {
-        val active = runCatching { rootInActiveWindow }.getOrNull()
-        if (active != null) {
-            val activePackage = runCatching { active.packageName?.toString().orEmpty() }.getOrDefault("")
-            if (activePackage == targetPackage) return active
-            runCatching { active.recycle() }
-        }
-
-        val visibleWindows = runCatching { windows }.getOrNull().orEmpty()
-        for (window in visibleWindows) {
-            val candidate = runCatching { window.root }.getOrNull() ?: continue
-            val candidatePackage = runCatching { candidate.packageName?.toString().orEmpty() }.getOrDefault("")
-            if (candidatePackage == targetPackage) return candidate
-            runCatching { candidate.recycle() }
-        }
-        return null
-    }
-
     private fun resolveAppLabel(packageName: String): String = runCatching {
         val info = packageManager.getApplicationInfo(packageName, 0)
         packageManager.getApplicationLabel(info).toString()
@@ -3637,183 +3432,6 @@ class FreedomAccessibilityService : AccessibilityService() {
         MonitorOverlay.update(this)
     }
 
-    private fun rawEventName(type: Int): String = when (type) {
-        AccessibilityEvent.TYPE_VIEW_CLICKED -> "TYPE_VIEW_CLICKED"
-        AccessibilityEvent.TYPE_VIEW_LONG_CLICKED -> "TYPE_VIEW_LONG_CLICKED"
-        AccessibilityEvent.TYPE_VIEW_SELECTED -> "TYPE_VIEW_SELECTED"
-        AccessibilityEvent.TYPE_VIEW_FOCUSED -> "TYPE_VIEW_FOCUSED"
-        AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED -> "TYPE_VIEW_TEXT_CHANGED"
-        AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED -> "TYPE_WINDOW_STATE_CHANGED"
-        AccessibilityEvent.TYPE_NOTIFICATION_STATE_CHANGED -> "TYPE_NOTIFICATION_STATE_CHANGED"
-        AccessibilityEvent.TYPE_VIEW_HOVER_ENTER -> "TYPE_VIEW_HOVER_ENTER"
-        AccessibilityEvent.TYPE_VIEW_HOVER_EXIT -> "TYPE_VIEW_HOVER_EXIT"
-        AccessibilityEvent.TYPE_TOUCH_EXPLORATION_GESTURE_START -> "TYPE_TOUCH_EXPLORATION_GESTURE_START"
-        AccessibilityEvent.TYPE_TOUCH_EXPLORATION_GESTURE_END -> "TYPE_TOUCH_EXPLORATION_GESTURE_END"
-        AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED -> "TYPE_WINDOW_CONTENT_CHANGED"
-        AccessibilityEvent.TYPE_VIEW_SCROLLED -> "TYPE_VIEW_SCROLLED"
-        AccessibilityEvent.TYPE_VIEW_TEXT_SELECTION_CHANGED -> "TYPE_VIEW_TEXT_SELECTION_CHANGED"
-        AccessibilityEvent.TYPE_VIEW_TEXT_TRAVERSED_AT_MOVEMENT_GRANULARITY -> "TYPE_VIEW_TEXT_TRAVERSED_AT_MOVEMENT_GRANULARITY"
-        AccessibilityEvent.TYPE_ANNOUNCEMENT -> "TYPE_ANNOUNCEMENT"
-        AccessibilityEvent.TYPE_VIEW_ACCESSIBILITY_FOCUSED -> "TYPE_VIEW_ACCESSIBILITY_FOCUSED"
-        AccessibilityEvent.TYPE_VIEW_ACCESSIBILITY_FOCUS_CLEARED -> "TYPE_VIEW_ACCESSIBILITY_FOCUS_CLEARED"
-        AccessibilityEvent.TYPE_GESTURE_DETECTION_START -> "TYPE_GESTURE_DETECTION_START"
-        AccessibilityEvent.TYPE_GESTURE_DETECTION_END -> "TYPE_GESTURE_DETECTION_END"
-        AccessibilityEvent.TYPE_TOUCH_INTERACTION_START -> "TYPE_TOUCH_INTERACTION_START"
-        AccessibilityEvent.TYPE_TOUCH_INTERACTION_END -> "TYPE_TOUCH_INTERACTION_END"
-        AccessibilityEvent.TYPE_WINDOWS_CHANGED -> "TYPE_WINDOWS_CHANGED"
-        AccessibilityEvent.TYPE_VIEW_CONTEXT_CLICKED -> "TYPE_VIEW_CONTEXT_CLICKED"
-        AccessibilityEvent.TYPE_ASSIST_READING_CONTEXT -> "TYPE_ASSIST_READING_CONTEXT"
-        else -> "ACCESSIBILITY_EVENT_$type"
-    }
-
-    private fun eventLabel(type: Int): String = when (type) {
-        AccessibilityEvent.TYPE_VIEW_CLICKED -> "控件被点击"
-        AccessibilityEvent.TYPE_VIEW_LONG_CLICKED -> "控件被长按"
-        AccessibilityEvent.TYPE_VIEW_SELECTED -> "控件被选中"
-        AccessibilityEvent.TYPE_VIEW_FOCUSED -> "控件获得焦点"
-        AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED -> "控件文字发生变化"
-        AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED -> "页面或窗口发生切换"
-        AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED -> "窗口内容发生变化"
-        AccessibilityEvent.TYPE_VIEW_SCROLLED -> "页面发生滚动"
-        AccessibilityEvent.TYPE_VIEW_TEXT_SELECTION_CHANGED -> "文字选区发生变化"
-        AccessibilityEvent.TYPE_VIEW_TEXT_TRAVERSED_AT_MOVEMENT_GRANULARITY -> "文字按粒度移动"
-        AccessibilityEvent.TYPE_VIEW_HOVER_ENTER -> "指针进入控件"
-        AccessibilityEvent.TYPE_VIEW_HOVER_EXIT -> "指针离开控件"
-        AccessibilityEvent.TYPE_TOUCH_EXPLORATION_GESTURE_START -> "触摸探索手势开始"
-        AccessibilityEvent.TYPE_TOUCH_EXPLORATION_GESTURE_END -> "触摸探索手势结束"
-        AccessibilityEvent.TYPE_GESTURE_DETECTION_START -> "手势检测开始"
-        AccessibilityEvent.TYPE_GESTURE_DETECTION_END -> "手势检测结束"
-        AccessibilityEvent.TYPE_TOUCH_INTERACTION_START -> "触摸交互开始"
-        AccessibilityEvent.TYPE_TOUCH_INTERACTION_END -> "触摸交互结束"
-        AccessibilityEvent.TYPE_VIEW_ACCESSIBILITY_FOCUSED -> "控件获得无障碍焦点"
-        AccessibilityEvent.TYPE_VIEW_ACCESSIBILITY_FOCUS_CLEARED -> "控件失去无障碍焦点"
-        AccessibilityEvent.TYPE_VIEW_CONTEXT_CLICKED -> "控件上下文点击"
-        AccessibilityEvent.TYPE_ANNOUNCEMENT -> "系统播报内容"
-        AccessibilityEvent.TYPE_ASSIST_READING_CONTEXT -> "辅助阅读上下文变化"
-        AccessibilityEvent.TYPE_WINDOWS_CHANGED -> "系统窗口发生变化"
-        AccessibilityEvent.TYPE_NOTIFICATION_STATE_CHANGED -> "通知状态发生变化"
-        else -> "无障碍事件"
-    }
-
-    /** Convert technical accessibility events into a plain-language event summary. */
-    private fun friendlyEventDescription(
-        eventType: Int,
-        className: String,
-        content: String,
-        description: String
-    ): String {
-        val rawClass = className.substringAfterLast('.')
-        val area = when (rawClass) {
-            "RecyclerView" -> "内容列表"
-            "ScrollView", "HorizontalScrollView" -> "可滚动区域"
-            "EditText" -> "文字输入框"
-            "TextView" -> "文字区域"
-            "Button", "ImageButton" -> "按钮区域"
-            "ImageView" -> "图片区域"
-            "WebView" -> "网页内容区域"
-            "ViewPager", "ViewPager2" -> "分页区域"
-            "CheckBox", "RadioButton", "Switch" -> "选项控件"
-            "" -> "当前界面"
-            else -> "界面控件"
-        }
-
-        val title: String
-        val explanation: String
-        when (eventType) {
-            AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED -> {
-                title = "页面内容更新"
-                explanation = "这个区域的内容或结构发生了变化，可能是列表刷新、内容加载或项目更新。"
-            }
-            AccessibilityEvent.TYPE_VIEW_SCROLLED -> {
-                title = if (rawClass == "RecyclerView") "列表滚动" else "页面滚动"
-                explanation = if (rawClass == "RecyclerView") {
-                    "检测到内容列表的滚动位置或可见项目发生变化。"
-                } else {
-                    "检测到可滚动区域的位置或可见内容发生变化。"
-                }
-            }
-            AccessibilityEvent.TYPE_VIEW_CLICKED -> {
-                title = "控件点击"
-                explanation = "系统报告这个界面控件发生了一次点击事件。"
-            }
-            AccessibilityEvent.TYPE_VIEW_LONG_CLICKED -> {
-                title = "控件长按"
-                explanation = "系统报告这个界面控件发生了一次长按事件。"
-            }
-            AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED -> {
-                title = "文字内容变化"
-                explanation = "一个文字控件中的内容发生了变化。"
-            }
-            AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED -> {
-                title = "页面或窗口切换"
-                explanation = "当前应用的窗口或页面状态发生了变化。"
-            }
-            AccessibilityEvent.TYPE_VIEW_SELECTED -> {
-                title = "选项状态变化"
-                explanation = "一个界面控件报告了选中状态变化。"
-            }
-            AccessibilityEvent.TYPE_VIEW_FOCUSED -> {
-                title = "控件获得焦点"
-                explanation = "输入焦点或键盘焦点移动到了这个控件。"
-            }
-            AccessibilityEvent.TYPE_VIEW_TEXT_SELECTION_CHANGED -> {
-                title = "文字选区变化"
-                explanation = "文字控件中的选中范围发生了变化。"
-            }
-            AccessibilityEvent.TYPE_NOTIFICATION_STATE_CHANGED -> {
-                title = "通知内容变化"
-                explanation = "系统报告目标应用的通知状态发生了变化。"
-            }
-            AccessibilityEvent.TYPE_WINDOWS_CHANGED -> {
-                title = "应用窗口变化"
-                explanation = "系统报告当前应用相关窗口发生了变化。"
-            }
-            else -> {
-                title = eventLabel(eventType)
-                explanation = "系统检测到一个界面辅助事件；详细类型可在技术详情中查看。"
-            }
-        }
-
-        val relatedText = sequenceOf(content, description)
-            .firstOrNull { it.isNotBlank() }
-            ?.take(100)
-
-        return buildString {
-            append(title)
-            append("\n操作区域：")
-            append(area)
-            append("\n说明：")
-            append(explanation)
-            if (!relatedText.isNullOrBlank()) {
-                append("\n相关文字：")
-                append(relatedText)
-            }
-        }
-    }
-
-    private fun chineseClass(rawClass: String): String = when (rawClass) {
-        "FrameLayout" -> "帧布局容器"
-        "LinearLayout" -> "线性布局"
-        "RelativeLayout" -> "相对布局"
-        "ConstraintLayout" -> "约束布局"
-        "TextView" -> "文本控件"
-        "EditText" -> "文本输入框"
-        "ImageView" -> "图片控件"
-        "ImageButton" -> "图片按钮"
-        "Button" -> "按钮"
-        "CheckBox" -> "复选框"
-        "RadioButton" -> "单选按钮"
-        "Switch" -> "开关控件"
-        "RecyclerView" -> "列表控件"
-        "ScrollView" -> "滚动容器"
-        "ViewPager" -> "分页容器"
-        "ViewPager2" -> "分页容器"
-        "WebView" -> "网页容器"
-        "View" -> "普通视图"
-        "Unknown" -> "未知控件"
-        else -> "$rawClass 控件"
-    }
-
     override fun onInterrupt() {
         pauseAccountBrowse("无障碍服务被系统中断；请检查系统设置后重新启动")
         addLog("无障碍服务被系统中断")
@@ -3823,8 +3441,8 @@ class FreedomAccessibilityService : AccessibilityService() {
         GestureTrailOverlay.clear()
         restoreMonitorOverlayTouchPassthrough()
         mainHandler.removeCallbacksAndMessages(null)
+        accountBrowseScheduler.cancel()
         scanQueued = false
-        accountBrowseStepPending = false
         hideFirstSwipeCountdown()
         if (targetReceiverRegistered) {
             runCatching { unregisterReceiver(targetChangedReceiver) }

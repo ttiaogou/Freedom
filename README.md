@@ -1,0 +1,46 @@
+# Freedom
+
+Freedom 是一个基于 Android AccessibilityService 的原生 Kotlin 应用。当前项目包含无障碍事件监控、节点树扫描、本地运行日志、可调整悬浮监控面板、手势轨迹可视化、设备内手势校准，以及针对陌陌动态页的自动浏览适配。
+
+## 项目结构
+
+```text
+app/src/main/java/com/freedom/
+├── MainActivity.kt                 # 主界面、运行启停、权限与系统文档导出入口
+├── accessibility/
+│   ├── FreedomAccessibilityService.kt  # Android 无障碍生命周期、事件入口和自动浏览状态机
+│   ├── browse/                     # 陌陌动态卡片识别和自动浏览模型
+│   ├── event/                      # 无障碍事件描述格式化
+│   ├── gesture/                    # 手势校准参数与设备采样计算
+│   ├── scan/                        # 无障碍节点树扫描和快照
+│   └── scheduling/                  # 自动浏览主流程单步调度
+├── data/                            # 广播 Action 和本地设置/日志/快照存储
+├── overlay/                         # 实时监控悬浮窗和手势轨迹悬浮层
+├── stability/                       # 前台服务和开机授权检查
+└── ui/
+    ├── calibration/                 # 手势校准界面与 UI 生命周期
+    ├── config/                      # 设置面板和监控目标编辑
+    └── logs/                        # 运行记录展示与文本格式化
+```
+
+`FreedomAccessibilityService` 仍然持有自动浏览状态机及页面导航流程。本次拆分先将边界清晰、可独立验证的模型、调度、扫描、事件格式化和 UI 职责抽离；没有把状态机整体重写成新的控制器。
+
+## 构建
+
+项目使用 JDK 17、Android Gradle Plugin 8.7.3、Kotlin 2.0.21、compileSdk 35。可使用 Android Studio 打开项目，或在配置好 Android SDK 的环境中运行：
+
+```bash
+gradle --no-daemon clean assembleDebug
+```
+
+GitHub Actions 工作流也会安装 Gradle 8.9 和 Android 35 SDK 后构建 Debug APK。
+
+## 权限说明
+
+Freedom 需要用户主动开启无障碍服务和悬浮窗权限。前台伴随服务仅用于用户明确启动的监控会话。开机接收器只检查授权状态并提示用户，不会直接在开机广播中启动监控。
+
+自动浏览目前仅实现陌陌动态页面适配；修改监控目标包名不会自动使其他应用获得相同的页面识别或自动浏览能力。
+
+## 本次结构整理
+
+参阅 [ARCHITECTURE.md](ARCHITECTURE.md) 和 [SOURCE-CHANGES.md](SOURCE-CHANGES.md)。本次是第一阶段结构拆分，不新增自动化功能。Android 编译和真机验证仍应通过 GitHub Actions 与实际设备完成。
