@@ -58,3 +58,14 @@
 - Moved the read-only detail identity check into the inspector; Activity/session values are passed in by the service. Navigation actions, popup dismissal, and gesture execution remain in the service.
 - Passed the exact existing package/label/threshold/node-limit values into the inspector; no behavior constants were tuned.
 - No new features or dependencies. Full Android compilation still needs GitHub Actions validation.
+
+
+## Stage 4 — 拆分陌陌弹窗识别（2026-11-07）
+
+- 新增 `app/src/main/java/com/freedom/accessibility/browse/MomoPopupInspector.kt`。
+- 迁移弹窗候选节点扫描与评分、文本和描述收集、危险内容识别、明确关闭控件查找，以及 `PopupInspection` 节点所有权回收。
+- `FreedomAccessibilityService` 保留既有弹窗调用入口为委托方法；`handleMomoPopup()` 仍然负责安全关闭决策、执行 ACTION_DISMISS/ACTION_CLICK、重试次数、验证超时和后续调度。
+- 保留原有弹窗关键词集合、节点扫描上限 500、候选上限 12、子树扫描上限 180、文本最多 24 条/每条 100 字、候选评分与屏幕几何阈值。
+- 关闭控件的可点击祖先仍使用 Service 原有 `findClickableAncestor()` 约束；不改变可点击目标范围。
+- 未修改陌陌页面导航、卡片过滤、自动浏览状态机、点击/返回/滑动顺序和计时参数。
+- 本次完成静态结构/引用核对；容器未安装 Android SDK/Gradle，未执行 `assembleDebug`，需以 GitHub Actions 和真机测试为准。

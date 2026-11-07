@@ -64,3 +64,13 @@
 - The detail-page identity check also lives in the inspector; the service passes its current/expected Activity values because those belong to the live navigation session. Navigation click-target lookup, popup handling, gestures, and all state transitions remain in the service.
 - `MomoPageInspector` is read-only: it does not click, scroll, navigate, schedule callbacks, or alter account-browse state.
 - No UI behavior, timing, gesture parameters, package filters, or third-party dependencies were changed.
+
+
+## Stage 4 — Momo popup inspection extraction
+
+- 新增 `accessibility/browse/MomoPopupInspector.kt`，迁移陌陌弹窗候选扫描、容器评分、弹窗文本收集、危险内容识别、明确关闭控件查找和识别结果节点回收。
+- `MomoPopupInspector` 只返回既有 `PopupInspection` 识别证据；不执行 `ACTION_DISMISS` / `ACTION_CLICK`，不安排重试，不修改自动浏览阶段。
+- `FreedomAccessibilityService.handleMomoPopup()` 继续独占弹窗安全决策、关闭动作、重试次数、900ms 重试间隔、350ms 验证轮询、2500ms 关闭验证超时和失败等待。
+- 原有弹窗候选扫描上限、候选数量、节点文本数量/长度上限、识别分数、几何范围、关键词集合和节点回收顺序保持不变。可点击祖先查找仍调用 Service 的既有辅助函数，避免改变点击目标尺寸与深度约束。
+- 页面导航、状态机、卡片过滤、点击、返回和手势执行均未迁入或改写。
+- 本阶段无新权限、广播、持久化键、依赖或用户可见功能。完整 Android 构建仍需 GitHub Actions 验证。
