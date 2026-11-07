@@ -112,8 +112,6 @@ class FreedomAccessibilityService : AccessibilityService() {
     private var accountBrowseScrollEventCount = 0
     private var accountBrowseLastScrollEventAt = 0L
     private var accountBrowseSwipeCount = 0
-    private var accountBrowseSwipeTargetCount = 0
-    private var accountBrowseInitialSwipeCompleted = false
     private var accountBrowseFallbackScrollAttempted = false
     private var accountBrowseSourceSnapshot = ""
     private var accountBrowseCountdownRemaining = 0
@@ -163,7 +161,7 @@ class FreedomAccessibilityService : AccessibilityService() {
 
     // Resume after the user finishes navigating or interacting with the target app.
     private val manualTouchResumeRunnable = Runnable {
-        if (!accountBrowseInitialSwipeCompleted && !accountBrowseTouchActive &&
+        if (!accountBrowseTouchActive &&
             MonitorStore.isRunning(this) && isAccountBrowseModeEnabled()
         ) {
             accountBrowsePhase = AccountBrowsePhase.IDLE
@@ -406,8 +404,6 @@ class FreedomAccessibilityService : AccessibilityService() {
         accountBrowseScrollEventCount = 0
         accountBrowseLastScrollEventAt = 0L
         accountBrowseSwipeCount = 0
-        accountBrowseSwipeTargetCount = 0
-        accountBrowseInitialSwipeCompleted = false
         accountBrowseFallbackScrollAttempted = false
         accountBrowseCountdownRemaining = 0
         hideFirstSwipeCountdown()
@@ -487,15 +483,11 @@ class FreedomAccessibilityService : AccessibilityService() {
 
         if (accountBrowseStableSamples >= REQUIRED_STABLE_FEED_SAMPLES) {
             accountBrowseSwipeCount = 0
-            accountBrowseSwipeTargetCount = Random.nextInt(
-                MIN_SWIPES_PER_SESSION,
-                MAX_SWIPES_PER_SESSION + 1
-            )
             accountBrowsePhase = AccountBrowsePhase.FIRST_SWIPE_COUNTDOWN
             accountBrowseCountdownRemaining = FIRST_SWIPE_COUNTDOWN_SECONDS
             addLog(
                 "已连续确认陌陌动态列表稳定 ${REQUIRED_STABLE_FEED_SAMPLES} 次；" +
-                    "本轮随机安排 $accountBrowseSwipeTargetCount 轮真实滑动，现在开始首次滑动倒计时"
+                    "即将开始持续滑动循环，现在开始首次滑动倒计时"
             )
             if (!showFirstSwipeCountdown(accountBrowseCountdownRemaining)) {
                 pauseAccountBrowse("无法显示首次滑动倒计时提示；为避免无提示操作，已暂停")
@@ -716,7 +708,7 @@ class FreedomAccessibilityService : AccessibilityService() {
             pauseAccountBrowse("无法定位首页动态列表的有效滑动区域；本轮未发送滑动")
             return
         }
-        addLog("第 ${accountBrowseSwipeCount + 1}/${accountBrowseSwipeTargetCount} 轮滑动前可见节点快照：${accountBrowseSourceSnapshot.ifBlank { "未提取到可见文字节点" }}")
+        addLog("第 ${accountBrowseSwipeCount + 1} 轮滑动前可见节点快照：${accountBrowseSourceSnapshot.ifBlank { "未提取到可见文字节点" }}")
 
         val bounds = target.bounds
         val profile = loadScrollGestureProfile()
@@ -740,7 +732,7 @@ class FreedomAccessibilityService : AccessibilityService() {
         accountBrowseFallbackScrollAttempted = false
         accountBrowseGestureInFlight = false
         addLog(
-            "第 ${accountBrowseSwipeCount + 1}/${accountBrowseSwipeTargetCount} 轮列表区域坐标滑动准备：容器=${target.className}，边界=$bounds，" +
+            "第 ${accountBrowseSwipeCount + 1} 轮列表区域坐标滑动准备：容器=${target.className}，边界=$bounds，" +
                 "起点 (${gesturePlan.startX},${gesturePlan.startY})，终点 (${gesturePlan.endX},${gesturePlan.endY})，" +
                 "持续 ${profile.durationMs} 毫秒"
         )
@@ -831,24 +823,16 @@ class FreedomAccessibilityService : AccessibilityService() {
             accountBrowseSourceSnapshot != afterSnapshot
         accountBrowseSwipeCount++
         addLog(
-            "第 $accountBrowseSwipeCount/${accountBrowseSwipeTargetCount} 轮真实滑动已确认；" +
+            "第 $accountBrowseSwipeCount 轮真实滑动已确认；" +
                 "TYPE_VIEW_SCROLLED 事件数=$accountBrowseScrollEventCount；" +
                 "前后节点快照${if (snapshotsDiffer) "发生变化" else "未显示明显差异"}"
         )
 
-        if (accountBrowseSwipeCount >= accountBrowseSwipeTargetCount) {
-            accountBrowseInitialSwipeCompleted = true
-            pauseAccountBrowse(
-                "已完成随机安排的 $accountBrowseSwipeCount 轮真实滑动；滑动阶段结束，等待进入下一阶段"
-            )
-            return
-        }
-
         accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_LIST_SCROLL
-        val delay = randomBrowseDelayMs()
+        val delay = randomScrollIntervalMs()
         addLog(
-            "动态列表已停止滚动；下一轮真实滑动将在 ${delay / 1000.0} 秒后进行。" +
-                "当前进度=$accountBrowseSwipeCount/$accountBrowseSwipeTargetCount"
+            "动态列表已停止滚动；下一轮滑动将在随机等待 ${delay / 1000.0} 秒后进行。" +
+                "累计已确认滑动=$accountBrowseSwipeCount 轮"
         )
         scheduleAccountBrowseStep(delay)
     }
@@ -1205,8 +1189,8 @@ class FreedomAccessibilityService : AccessibilityService() {
 
         if (isFeedList) {
             accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_LIST_SCROLL
-            val delay = randomBrowseDelayMs()
-            addLog("已返回陌陌动态列表；下一次滑动将在 ${delay / 1000.0} 秒后进行")
+            val delay = randomScrollIntervalMs()
+            addLog("已返回陌陌动态列表；下一次滑动将在随机等待 ${delay / 1000.0} 秒后进行")
             scheduleAccountBrowseStep(delay)
         } else if (System.currentTimeMillis() >= accountBrowseDeadlineAt) {
             pauseAccountBrowse("返回后没有重新识别到动态列表；请检查页面并重新启动")
@@ -1511,6 +1495,10 @@ class FreedomAccessibilityService : AccessibilityService() {
 
     private fun randomBrowseDelayMs(): Long =
         Random.nextLong(MIN_BROWSE_DELAY_MS, MAX_BROWSE_DELAY_MS + 1L)
+
+    /** Random pause between confirmed feed swipes. Both endpoints are inclusive. */
+    private fun randomScrollIntervalMs(): Long =
+        Random.nextLong(MIN_SCROLL_INTERVAL_MS, MAX_SCROLL_INTERVAL_MS + 1L)
 
     /**
      * Finds the largest visible, vertical, scrollable list in the target window.
@@ -1950,8 +1938,8 @@ class FreedomAccessibilityService : AccessibilityService() {
 
         private const val MIN_BROWSE_DELAY_MS = 3_000L
         private const val MAX_BROWSE_DELAY_MS = 15_000L
-        private const val MIN_SWIPES_PER_SESSION = 4
-        private const val MAX_SWIPES_PER_SESSION = 5
+        private const val MIN_SCROLL_INTERVAL_MS = 5_000L
+        private const val MAX_SCROLL_INTERVAL_MS = 8_000L
         private const val DETAIL_LOAD_TIMEOUT_MS = 12_000L
         private const val LIST_RETURN_TIMEOUT_MS = 10_000L
         private const val PAGE_STATE_POLL_MS = 300L
