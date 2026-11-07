@@ -7,6 +7,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.graphics.Color
+import android.graphics.Path
 import android.graphics.Rect
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
@@ -38,6 +39,7 @@ import com.freedom.accessibility.browse.FeedGestureTarget
 import com.freedom.accessibility.browse.FeedPositionMatcher
 import com.freedom.accessibility.browse.FeedReturnStability
 import com.freedom.accessibility.browse.FeedReturnVerificationPolicy
+import com.freedom.accessibility.browse.FeedRefreshVerificationPolicy
 import com.freedom.accessibility.browse.FeedReadinessInspection
 import com.freedom.accessibility.browse.HomeBottomNavEvidence
 import com.freedom.accessibility.browse.ManualResumeContext
@@ -265,6 +267,42 @@ class FreedomAccessibilityService : AccessibilityService() {
         get() = accountBrowseSession.dynamicTabClickConfirmed
         set(value) { accountBrowseSession.dynamicTabClickConfirmed = value }
 
+    private var accountBrowseFeedRefreshRecoveryActive: Boolean
+        get() = accountBrowseSession.feedRefreshRecoveryActive
+        set(value) { accountBrowseSession.feedRefreshRecoveryActive = value }
+
+    private var accountBrowseFeedRefreshAttempts: Int
+        get() = accountBrowseSession.feedRefreshAttempts
+        set(value) { accountBrowseSession.feedRefreshAttempts = value }
+
+    private var accountBrowseFeedRefreshBeforeSnapshot: String
+        get() = accountBrowseSession.feedRefreshBeforeSnapshot
+        set(value) { accountBrowseSession.feedRefreshBeforeSnapshot = value }
+
+    private var accountBrowseFeedRefreshLastSnapshot: String
+        get() = accountBrowseSession.feedRefreshLastSnapshot
+        set(value) { accountBrowseSession.feedRefreshLastSnapshot = value }
+
+    private var accountBrowseFeedRefreshStableSamples: Int
+        get() = accountBrowseSession.feedRefreshStableSamples
+        set(value) { accountBrowseSession.feedRefreshStableSamples = value }
+
+    private var accountBrowseFeedRefreshRecyclerEvents: Int
+        get() = accountBrowseSession.feedRefreshRecyclerContentChangeEvents
+        set(value) { accountBrowseSession.feedRefreshRecyclerContentChangeEvents = value }
+
+    private var accountBrowseFeedRefreshActionAt: Long
+        get() = accountBrowseSession.feedRefreshActionAt
+        set(value) { accountBrowseSession.feedRefreshActionAt = value }
+
+    private var accountBrowseFeedRefreshDeadlineAt: Long
+        get() = accountBrowseSession.feedRefreshVerificationDeadlineAt
+        set(value) { accountBrowseSession.feedRefreshVerificationDeadlineAt = value }
+
+    private var accountBrowseFeedRefreshWaitReason: String
+        get() = accountBrowseSession.feedRefreshWaitReason
+        set(value) { accountBrowseSession.feedRefreshWaitReason = value }
+
     private var accountBrowseNotTargetForegroundLogged: Boolean
         get() = accountBrowseSession.notTargetForegroundLogged
         set(value) { accountBrowseSession.notTargetForegroundLogged = value }
@@ -309,6 +347,8 @@ class FreedomAccessibilityService : AccessibilityService() {
             actions = AccountBrowseController.Actions(
                 waitForDynamicTab = ::waitForMomoDynamicTab,
                 verifyNavigationAction = ::verifyNavigationAction,
+                refreshDynamicFeed = ::refreshDynamicFeed,
+                verifyDynamicFeedRefresh = ::verifyDynamicFeedRefresh,
                 waitForFeedStable = ::waitForMomoFeedStable,
                 runFirstSwipeCountdown = ::runFirstSwipeCountdown,
                 performFeedScroll = ::performFeedScroll,
@@ -717,7 +757,25 @@ class FreedomAccessibilityService : AccessibilityService() {
         val description = event.contentDescription?.toString()?.take(180).orEmpty()
         val signature = "$eventPackage|$rawEventName|$className|$content|$description"
         val now = System.currentTimeMillis()
-        // Reduce identical event bursts while preserving meaningful changes.
+
+        // Count each underlying RecyclerView update before log de-duplication.
+        // Momo may emit several legitimate refresh events within the same 250 ms window.
+        if (accountBrowsePhase == AccountBrowsePhase.VERIFY_DYNAMIC_FEED_REFRESH &&
+            accountBrowseFeedRefreshRecoveryActive &&
+            eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED &&
+            className.substringAfterLast('.') == "RecyclerView" &&
+            now >= accountBrowseFeedRefreshActionAt
+        ) {
+            accountBrowseFeedRefreshRecyclerEvents++
+            if (accountBrowseFeedRefreshRecyclerEvents <= 3) {
+                addLog(
+                    "首页双击后的动态列表内容更新事件：" +
+                        "RecyclerView，第 ${accountBrowseFeedRefreshRecyclerEvents} 次"
+                )
+            }
+        }
+
+        // Reduce identical event bursts in the visible event log.
         if (signature == lastEventSignature && now - lastEventAt < 250L) return
         lastEventSignature = signature
         lastEventAt = now
@@ -1077,6 +1135,16 @@ class FreedomAccessibilityService : AccessibilityService() {
                             if (readiness.fingerprint != null &&
                                 (tabEvidence.selectionKnown || accountBrowseDynamicTabClickConfirmed)
                             ) {
+                                if (accountBrowseFeedRefreshRecoveryActive) {
+                                    accountBrowsePhase = AccountBrowsePhase.REFRESH_DYNAMIC_FEED
+                                    accountBrowseFeedRefreshWaitReason = ""
+                                    addLog(
+                                        "已重新确认首页顶部‘动态’标签及其下方列表；" +
+                                            "进入首页连续双击刷新验证，不使用旧列表位置继续滑动"
+                                    )
+                                    scheduleAccountBrowseStep(PAGE_STATE_POLL_MS)
+                                    return
+                                }
                                 accountBrowseImageBrowserActive = false
                                 accountBrowseImageBrowserReturnActivityClass = ""
                                 accountBrowseDetailActivityClass = ""
@@ -1479,6 +1547,428 @@ class FreedomAccessibilityService : AccessibilityService() {
         }
     }
 
+    /**
+     * A mismatched return snapshot is not treated as a permanent stop. Re-identify
+     * Home -> Dynamic, then use Momo's own Home-tab reselect refresh and verify it.
+     */
+    private fun beginDynamicFeedRefreshRecovery(reason: String) {
+        accountBrowseScheduler.cancel()
+        GestureTrailOverlay.clear()
+        restoreMonitorOverlayTouchPassthrough("动态页面刷新恢复准备")
+        accountBrowseFeedRefreshRecoveryActive = true
+        accountBrowseFeedRefreshAttempts = 0
+        accountBrowseFeedRefreshBeforeSnapshot = ""
+        accountBrowseFeedRefreshLastSnapshot = ""
+        accountBrowseFeedRefreshStableSamples = 0
+        accountBrowseFeedRefreshRecyclerEvents = 0
+        accountBrowseFeedRefreshActionAt = 0L
+        accountBrowseFeedRefreshDeadlineAt = 0L
+        accountBrowseFeedRefreshWaitReason = ""
+        accountBrowseNavigationActionKey = ""
+        accountBrowseNavigationBeforeActivity = ""
+        accountBrowseNavigationBeforeFingerprint = ""
+        accountBrowseNavigationActionDeadlineAt = 0L
+        accountBrowseNavigationActionAttempts = 0
+        accountBrowseRecoveryBackAttempts = 0
+        accountBrowseRecoveryHomeClickAttempts = 0
+        accountBrowseRecoveryDynamicClickAttempts = 0
+        accountBrowseDynamicTabClickConfirmed = false
+        accountBrowseLastDynamicTabWaitReason = ""
+        accountBrowseDeadlineAt = System.currentTimeMillis() + INITIAL_DYNAMIC_TAB_WAIT_TIMEOUT_MS
+        accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_DYNAMIC_TAB
+        addLog(
+            "$reason；不再尝试猜测旧列表位置，开始主动恢复：" +
+                "识别陌陌底部‘首页’，确认顶部‘动态’标签，再执行首页连续双击刷新"
+        )
+        scheduleAccountBrowseStep(PAGE_STATE_POLL_MS)
+    }
+
+    /** Submit two actual tap strokes at the verified bottom Home tab. */
+    private fun refreshDynamicFeed() {
+        if (!accountBrowseFeedRefreshRecoveryActive) {
+            pauseAccountBrowse("动态刷新恢复状态丢失；没有执行滑动")
+            return
+        }
+        if (accountBrowseFeedRefreshAttempts >= MAX_DYNAMIC_FEED_REFRESH_ATTEMPTS) {
+            accountBrowseFeedRefreshRecoveryActive = false
+            pauseAccountBrowse("首页连续双击刷新已达到最大尝试次数；没有确认动态列表重新加载，因此未继续滑动")
+            return
+        }
+
+        val root = runCatching { rootInActiveWindow }.getOrNull() ?: run {
+            scheduleDynamicFeedRefreshNavigationWait("暂时无法读取陌陌页面")
+            return
+        }
+        try {
+            val activePackage = runCatching { root.packageName?.toString().orEmpty() }.getOrDefault("")
+            if (activePackage != MOMO_PACKAGE) {
+                scheduleDynamicFeedRefreshNavigationWait("当前前台不是陌陌")
+                return
+            }
+            if (handleMomoPopup(root)) return
+
+            val tabEvidence = inspectDynamicTabRow(root).evidence
+            val dynamicTabConfirmed = tabEvidence != null && (
+                (tabEvidence.selectionKnown && tabEvidence.dynamicSelected) ||
+                    (!tabEvidence.selectionKnown && accountBrowseDynamicTabClickConfirmed)
+                )
+            val readiness = inspectMomoFeedReadiness(root)
+            if (readiness.fingerprint == null || !dynamicTabConfirmed) {
+                accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_DYNAMIC_TAB
+                scheduleAccountBrowseStep(PAGE_STATE_POLL_MS)
+                return
+            }
+
+            val homeEvidence = inspectHomeBottomNav(root)
+            if (homeEvidence == null) {
+                scheduleDynamicFeedRefreshNavigationWait("没有识别到底部‘首页’导航控件")
+                return
+            }
+
+            if (homeEvidence.selectionKnown && !homeEvidence.homeSelected) {
+                val homeTarget = findClickableNodeForLabel(
+                    root = root,
+                    label = MOMO_HOME_TAB_LABEL,
+                    expectedBounds = homeEvidence.homeBounds,
+                    minCenterY = (resources.displayMetrics.heightPixels * HOME_NAV_LOWER_BAND_RATIO).toInt(),
+                    maxCenterY = resources.displayMetrics.heightPixels
+                )
+                if (homeTarget == null) {
+                    scheduleDynamicFeedRefreshNavigationWait("底部‘首页’未选中，但没有找到可安全点击的首页控件")
+                    return
+                }
+                addLog("已确认底部当前不是‘首页’；先单击底部‘首页’并验证导航，再执行连续双击刷新")
+                submitNavigationClick(
+                    root = root,
+                    target = homeTarget,
+                    actionKey = NAV_ACTION_HOME_TAB,
+                    actionDescription = "陌陌底部‘首页’标签"
+                )
+                return
+            }
+
+            val homeTarget = findClickableNodeForLabel(
+                root = root,
+                label = MOMO_HOME_TAB_LABEL,
+                expectedBounds = homeEvidence.homeBounds,
+                minCenterY = (resources.displayMetrics.heightPixels * HOME_NAV_LOWER_BAND_RATIO).toInt(),
+                maxCenterY = resources.displayMetrics.heightPixels
+            )
+            if (homeTarget == null) {
+                scheduleDynamicFeedRefreshNavigationWait("已识别底部‘首页’，但没有找到可点击的首页控件")
+                return
+            }
+            val targetBounds = Rect()
+            runCatching { homeTarget.getBoundsInScreen(targetBounds) }
+            runCatching { homeTarget.recycle() }
+            val tapX = homeEvidence.homeBounds.centerX()
+            val tapY = homeEvidence.homeBounds.centerY()
+            if (targetBounds.isEmpty || !targetBounds.contains(tapX, tapY)) {
+                scheduleDynamicFeedRefreshNavigationWait("首页文字位置不在可点击控件范围内；拒绝盲目点击")
+                return
+            }
+
+            val listNode = findScrollableFeedContainer(root)
+            if (listNode == null) {
+                scheduleDynamicFeedRefreshNavigationWait("动态列表容器尚未出现")
+                return
+            }
+            val beforeSnapshot = try {
+                captureVisibleFeedNodeSnapshot(listNode)
+            } finally {
+                runCatching { listNode.recycle() }
+            }
+            if (beforeSnapshot.isBlank()) {
+                scheduleDynamicFeedRefreshNavigationWait("当前动态列表没有可读取的可见内容；暂不执行刷新点击")
+                return
+            }
+
+            if (!enableMonitorOverlayTouchPassthrough("首页连续双击刷新")) {
+                accountBrowseFeedRefreshRecoveryActive = false
+                pauseAccountBrowse("实时监控悬浮窗无法启用触摸穿透；首页双击刷新未执行")
+                return
+            }
+
+            val firstTapPath = Path().apply {
+                moveTo(tapX.toFloat(), tapY.toFloat())
+                lineTo(tapX + 1f, tapY + 1f)
+            }
+            val secondTapPath = Path().apply {
+                moveTo(tapX.toFloat(), tapY.toFloat())
+                lineTo(tapX + 1f, tapY + 1f)
+            }
+            val gesture = GestureDescription.Builder()
+                .addStroke(
+                    GestureDescription.StrokeDescription(
+                        firstTapPath,
+                        0L,
+                        HOME_REFRESH_TAP_DURATION_MS
+                    )
+                )
+                .addStroke(
+                    GestureDescription.StrokeDescription(
+                        secondTapPath,
+                        HOME_REFRESH_TAP_INTERVAL_MS,
+                        HOME_REFRESH_TAP_DURATION_MS
+                    )
+                )
+                .build()
+
+            accountBrowseFeedRefreshAttempts++
+            accountBrowseFeedRefreshBeforeSnapshot = beforeSnapshot
+            accountBrowseFeedRefreshLastSnapshot = ""
+            accountBrowseFeedRefreshStableSamples = 0
+            accountBrowseFeedRefreshRecyclerEvents = 0
+            accountBrowseFeedRefreshActionAt = System.currentTimeMillis()
+            accountBrowseFeedRefreshDeadlineAt = accountBrowseFeedRefreshActionAt + DYNAMIC_FEED_REFRESH_VERIFY_TIMEOUT_MS
+            accountBrowseFeedRefreshWaitReason = ""
+            accountBrowsePhase = AccountBrowsePhase.VERIFY_DYNAMIC_FEED_REFRESH
+            accountBrowseProgrammaticActionLabel = "Freedom dispatchGesture ACTION_CLICK 连续双击首页刷新动态"
+            accountBrowseIgnoreManualEventsUntil = accountBrowseFeedRefreshActionAt + HOME_REFRESH_PROGRAMMATIC_EVENT_WINDOW_MS
+            accountBrowseGestureInFlight = true
+            accountBrowseTouchStartedDuringGesture = false
+            accountBrowseTouchEndedDuringGesture = false
+            addLog(
+                "已确认陌陌首页内顶部‘动态’页面；底部导航证据=${homeEvidence.diagnostic}；" +
+                    "对底部‘首页’执行第 $accountBrowseFeedRefreshAttempts/$MAX_DYNAMIC_FEED_REFRESH_ATTEMPTS 次连续双击，" +
+                    "点击位置=($tapX,$tapY)，两次点击间隔=${HOME_REFRESH_TAP_INTERVAL_MS - HOME_REFRESH_TAP_DURATION_MS} 毫秒；" +
+                    "开始等待动态列表重新加载证据"
+            )
+
+            val accepted = runCatching {
+                dispatchGesture(gesture, object : AccessibilityService.GestureResultCallback() {
+                    override fun onCompleted(gestureDescription: GestureDescription?) {
+                        accountBrowseGestureInFlight = false
+                        accountBrowseTouchStartedDuringGesture = false
+                        accountBrowseTouchEndedDuringGesture = false
+                        restoreMonitorOverlayTouchPassthrough("首页连续双击刷新手势完成")
+                        if (accountBrowsePhase != AccountBrowsePhase.VERIFY_DYNAMIC_FEED_REFRESH ||
+                            !MonitorStore.isRunning(this@FreedomAccessibilityService)
+                        ) return
+                        addLog("Android 已完成首页连续双击手势；正在检查动态列表是否确实重新加载")
+                        scheduleAccountBrowseStep(PAGE_STATE_POLL_MS)
+                    }
+
+                    override fun onCancelled(gestureDescription: GestureDescription?) {
+                        val touchStarted = accountBrowseTouchStartedDuringGesture
+                        val touchEnded = accountBrowseTouchEndedDuringGesture
+                        accountBrowseGestureInFlight = false
+                        accountBrowseTouchStartedDuringGesture = false
+                        accountBrowseTouchEndedDuringGesture = false
+                        restoreMonitorOverlayTouchPassthrough("首页连续双击刷新手势取消")
+                        if (accountBrowsePhase != AccountBrowsePhase.VERIFY_DYNAMIC_FEED_REFRESH) return
+                        val interruptedByTouch = touchStarted || touchEnded
+                        if (interruptedByTouch) {
+                            pauseAccountBrowse("首页连续双击刷新被屏幕触摸中断；等待用户操作结束后重新识别页面", allowManualResume = true)
+                            if (touchEnded) {
+                                accountBrowseTouchActive = false
+                                mainHandler.removeCallbacks(manualTouchResumeRunnable)
+                                mainHandler.postDelayed(manualTouchResumeRunnable, MANUAL_TOUCH_RESUME_MS)
+                            } else {
+                                accountBrowseTouchActive = true
+                            }
+                        } else {
+                            accountBrowseFeedRefreshRecoveryActive = false
+                            pauseAccountBrowse("Android 取消了首页连续双击刷新手势；未确认动态列表已重新加载")
+                        }
+                    }
+                }, mainHandler)
+            }.getOrDefault(false)
+
+            if (!accepted) {
+                accountBrowseGestureInFlight = false
+                restoreMonitorOverlayTouchPassthrough("首页连续双击刷新手势提交失败")
+                accountBrowseFeedRefreshRecoveryActive = false
+                pauseAccountBrowse("Android 未接受首页连续双击刷新手势；没有执行后续滑动")
+            }
+        } finally {
+            runCatching { root.recycle() }
+        }
+    }
+
+    /** Verify a real RecyclerView reload signal and a stable, recognizable Dynamic feed. */
+    private fun verifyDynamicFeedRefresh() {
+        if (!accountBrowseFeedRefreshRecoveryActive) {
+            pauseAccountBrowse("动态刷新验证状态丢失；没有执行滑动")
+            return
+        }
+        val root = runCatching { rootInActiveWindow }.getOrNull() ?: run {
+            scheduleOrRetryDynamicFeedRefresh("暂时无法读取刷新后的页面")
+            return
+        }
+
+        var currentSnapshot = ""
+        var isDynamicFeedReady = false
+        var readinessReason = "尚未识别到完整动态列表"
+        try {
+            val activePackage = runCatching { root.packageName?.toString().orEmpty() }.getOrDefault("")
+            if (activePackage != MOMO_PACKAGE) {
+                scheduleOrRetryDynamicFeedRefresh("刷新期间陌陌不在前台")
+                return
+            }
+            if (handleMomoPopup(root)) return
+
+            val readiness = inspectMomoFeedReadiness(root)
+            readinessReason = readiness.reason
+            val homeEvidence = inspectHomeBottomNav(root)
+            val tabEvidence = inspectDynamicTabRow(root).evidence
+            val dynamicTabConfirmed = tabEvidence != null && (
+                (tabEvidence.selectionKnown && tabEvidence.dynamicSelected) ||
+                    (!tabEvidence.selectionKnown && accountBrowseDynamicTabClickConfirmed)
+                )
+            val homeConfirmed = homeEvidence != null && (
+                (homeEvidence.selectionKnown && homeEvidence.homeSelected) ||
+                    (!homeEvidence.selectionKnown && dynamicTabConfirmed)
+                )
+            if (readiness.fingerprint != null && dynamicTabConfirmed && homeConfirmed) {
+                val listNode = findScrollableFeedContainer(root)
+                if (listNode != null) {
+                    try {
+                        currentSnapshot = captureVisibleFeedNodeSnapshot(listNode)
+                        isDynamicFeedReady = currentSnapshot.isNotBlank()
+                    } finally {
+                        runCatching { listNode.recycle() }
+                    }
+                }
+            } else if (readiness.fingerprint != null && !dynamicTabConfirmed) {
+                readinessReason = "顶部‘动态’标签选中状态未能确认"
+            } else if (readiness.fingerprint != null && !homeConfirmed) {
+                readinessReason = "顶部动态列表存在，但底部首页选中状态未能确认"
+            }
+        } finally {
+            runCatching { root.recycle() }
+        }
+
+        if (!isDynamicFeedReady) {
+            accountBrowseFeedRefreshStableSamples = 0
+            accountBrowseFeedRefreshLastSnapshot = ""
+            if (readinessReason != accountBrowseFeedRefreshWaitReason) {
+                accountBrowseFeedRefreshWaitReason = readinessReason
+                addLog("首页双击刷新验证等待：$readinessReason")
+            }
+        } else {
+            accountBrowseFeedRefreshWaitReason = ""
+            accountBrowseFeedRefreshStableSamples = if (currentSnapshot == accountBrowseFeedRefreshLastSnapshot) {
+                accountBrowseFeedRefreshStableSamples + 1
+            } else {
+                1
+            }
+            accountBrowseFeedRefreshLastSnapshot = currentSnapshot
+        }
+
+        val snapshotChanged = accountBrowseFeedRefreshBeforeSnapshot.isNotBlank() &&
+            currentSnapshot.isNotBlank() &&
+            currentSnapshot != accountBrowseFeedRefreshBeforeSnapshot
+        val reloadEvidence = FeedRefreshVerificationPolicy.hasReloadEvidence(
+            snapshotChanged = snapshotChanged,
+            recyclerContentChangeEvents = accountBrowseFeedRefreshRecyclerEvents
+        )
+        if (isDynamicFeedReady) {
+            addLog(
+                "刷新验证采样：动态页面=${if (isDynamicFeedReady) "已确认" else "未确认"}；" +
+                    "列表内容变化=${if (snapshotChanged) "是" else "否"}；" +
+                    "RecyclerView 内容更新事件=${accountBrowseFeedRefreshRecyclerEvents}；" +
+                    "列表稳定=${accountBrowseFeedRefreshStableSamples}/$REQUIRED_DYNAMIC_REFRESH_STABLE_SAMPLES；" +
+                    "刷新证据=${if (reloadEvidence) "已取得" else "不足"}"
+            )
+        }
+
+        if (FeedRefreshVerificationPolicy.canResumeBrowsing(
+                isDynamicFeedPage = isDynamicFeedReady,
+                snapshotChanged = snapshotChanged,
+                recyclerContentChangeEvents = accountBrowseFeedRefreshRecyclerEvents,
+                stableSamples = accountBrowseFeedRefreshStableSamples,
+                requiredStableSamples = REQUIRED_DYNAMIC_REFRESH_STABLE_SAMPLES
+            )
+        ) {
+            completeDynamicFeedRefreshRecovery(snapshotChanged)
+            return
+        }
+
+        scheduleOrRetryDynamicFeedRefresh(
+            if (reloadEvidence) {
+                "已观察到刷新迹象，等待列表连续稳定"
+            } else {
+                "尚未取得足够的动态列表重新加载证据"
+            }
+        )
+    }
+
+    private fun scheduleDynamicFeedRefreshNavigationWait(reason: String) {
+        if (reason != accountBrowseFeedRefreshWaitReason) {
+            accountBrowseFeedRefreshWaitReason = reason
+            addLog("首页双击刷新准备等待：$reason")
+        }
+        if (System.currentTimeMillis() >= accountBrowseDeadlineAt) {
+            accountBrowseFeedRefreshRecoveryActive = false
+            pauseAccountBrowse("无法确认陌陌底部‘首页’和顶部‘动态’导航控件；主动刷新恢复超时")
+        } else {
+            scheduleAccountBrowseStep(PAGE_STATE_POLL_MS)
+        }
+    }
+
+    private fun scheduleOrRetryDynamicFeedRefresh(reason: String) {
+        if (System.currentTimeMillis() < accountBrowseFeedRefreshDeadlineAt) {
+            scheduleAccountBrowseStep(PAGE_STATE_POLL_MS)
+            return
+        }
+        if (accountBrowseFeedRefreshAttempts < MAX_DYNAMIC_FEED_REFRESH_ATTEMPTS) {
+            addLog(
+                "$reason；第 $accountBrowseFeedRefreshAttempts 次首页连续双击未能完成验证；" +
+                    "重新识别首页/动态标签后再进行最后一次刷新尝试"
+            )
+            accountBrowseFeedRefreshLastSnapshot = ""
+            accountBrowseFeedRefreshStableSamples = 0
+            accountBrowseFeedRefreshRecyclerEvents = 0
+            accountBrowseFeedRefreshWaitReason = ""
+            accountBrowseRecoveryBackAttempts = 0
+            accountBrowseRecoveryHomeClickAttempts = 0
+            accountBrowseRecoveryDynamicClickAttempts = 0
+            accountBrowseDynamicTabClickConfirmed = false
+            accountBrowseLastDynamicTabWaitReason = ""
+            accountBrowseDeadlineAt = System.currentTimeMillis() + INITIAL_DYNAMIC_TAB_WAIT_TIMEOUT_MS
+            accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_DYNAMIC_TAB
+            scheduleAccountBrowseStep(PAGE_STATE_POLL_MS)
+            return
+        }
+
+        accountBrowseFeedRefreshRecoveryActive = false
+        pauseAccountBrowse(
+            "已尝试 $MAX_DYNAMIC_FEED_REFRESH_ATTEMPTS 次首页连续双击，但仍无法确认动态列表重新加载并稳定；" +
+                "为避免在未知页面滑动，已安全暂停"
+        )
+    }
+
+    private fun completeDynamicFeedRefreshRecovery(snapshotChanged: Boolean) {
+        val attempts = accountBrowseFeedRefreshAttempts
+        val events = accountBrowseFeedRefreshRecyclerEvents
+        accountBrowseFeedRefreshRecoveryActive = false
+        accountBrowseDetailActivityClass = ""
+        accountBrowseDetailFingerprint = ""
+        accountBrowseProgrammaticActionLabel = ""
+        accountBrowseDetailDwellDueAt = 0L
+        accountBrowseDetailDwellStartedAt = 0L
+        accountBrowseDetailDwellRemainingMs = 0L
+        accountBrowseImageBrowserActive = false
+        accountBrowseImageBrowserReturnActivityClass = ""
+        accountBrowseSourceSnapshot = ""
+        accountBrowseLastReturnedSnapshot = ""
+        accountBrowseReturnedStableSamples = 0
+        accountBrowseReturnMismatchLogged = false
+        accountBrowseSwipeCount = 0
+        accountBrowseLastStableFingerprint = ""
+        accountBrowseStableSamples = 0
+        accountBrowseDeadlineAt = System.currentTimeMillis() + INITIAL_FEED_STABILITY_TIMEOUT_MS
+        accountBrowsePhase = AccountBrowsePhase.WAIT_FOR_FEED_STABLE
+        addLog(
+            "首页连续双击刷新已验证成功（尝试次数=$attempts；" +
+                "列表内容变化=${if (snapshotChanged) "是" else "否"}；RecyclerView 内容更新事件=$events；" +
+                "列表连续稳定 $REQUIRED_DYNAMIC_REFRESH_STABLE_SAMPLES 次）；" +
+                "不再沿用旧位置，已建立刷新后的新动态列表基准，准备恢复浏览"
+        )
+        scheduleAccountBrowseStep(PAGE_STATE_POLL_MS)
+    }
+
     /** Keep the user informed for three seconds, and re-check the feed before dispatch. */
     private fun runFirstSwipeCountdown() {
         val root = obtainTargetRootOrPause() ?: return
@@ -1597,10 +2087,12 @@ class FreedomAccessibilityService : AccessibilityService() {
     }
 
     /** Temporarily remove the live monitor window from the touch path for the swipe. */
-    private fun enableMonitorOverlayTouchPassthrough(): Boolean {
+    private fun enableMonitorOverlayTouchPassthrough(
+        actionDescription: String = "首次滑动"
+    ): Boolean {
         if (!MonitorOverlay.isAttached()) {
             accountBrowseOverlayPassthroughActive = false
-            addLog("实时监控悬浮窗当前未附加（配置中‘悬浮日志’已关闭）；本次滑动不经过悬浮窗")
+            addLog("实时监控悬浮窗当前未附加（配置中‘悬浮日志’已关闭）；$actionDescription 不经过悬浮窗")
             return true
         }
         val before = MonitorOverlay.touchStateDescription()
@@ -1616,19 +2108,21 @@ class FreedomAccessibilityService : AccessibilityService() {
             MONITOR_OVERLAY_PASSTHROUGH_WATCHDOG_MS
         )
         addLog(
-            "首次滑动前已临时隐藏实时监控悬浮窗并启用触摸穿透。" +
+            "$actionDescription 前已临时隐藏实时监控悬浮窗并启用触摸穿透。" +
                 "$before；切换后=${MonitorOverlay.touchStateDescription()}"
         )
         return true
     }
 
-    private fun restoreMonitorOverlayTouchPassthrough(): Boolean {
+    private fun restoreMonitorOverlayTouchPassthrough(
+        actionDescription: String = "首次滑动检查结束"
+    ): Boolean {
         if (!accountBrowseOverlayPassthroughActive) return true
         val restored = MonitorOverlay.setTouchPassthrough(false)
         if (restored) {
             accountBrowseOverlayPassthroughActive = false
             mainHandler.removeCallbacks(monitorOverlayPassthroughWatchdog)
-            addLog("首次滑动检查结束：实时监控悬浮窗已恢复显示和触摸操作")
+            addLog("$actionDescription：实时监控悬浮窗已恢复显示和触摸操作")
             return true
         }
         addLog("警告：实时监控悬浮窗触摸状态恢复失败；悬浮窗可能仍处于隐藏/穿透状态")
@@ -2324,6 +2818,16 @@ class FreedomAccessibilityService : AccessibilityService() {
             accountBrowsePhase == AccountBrowsePhase.VERIFY_NAVIGATION_ACTION &&
             className.substringAfterLast('.') == "RecyclerView"
 
+    private fun isDynamicFeedRefreshStartupScroll(
+        eventType: Int,
+        className: String,
+        now: Long
+    ): Boolean =
+        eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED &&
+            accountBrowsePhase == AccountBrowsePhase.VERIFY_DYNAMIC_FEED_REFRESH &&
+            className.substringAfterLast('.') == "RecyclerView" &&
+            now - accountBrowseFeedRefreshActionAt in 0..HOME_REFRESH_PROGRAMMATIC_EVENT_WINDOW_MS
+
     private fun classifyInteractionEventOrigin(eventType: Int, now: Long, className: String): String = when {
         isDynamicTabStartupScroll(eventType, className, now) ->
             "陌陌首页刚进入动态标签识别阶段；2 秒内 RecyclerView 初始化滚动事件且没有触摸证据，不按用户操作处理"
@@ -2333,6 +2837,8 @@ class FreedomAccessibilityService : AccessibilityService() {
             "动态详情刚确认载入；2 秒缓冲期内 RecyclerView 滚动/布局事件不单独认定为用户操作"
         isNavigationVerificationScroll(eventType, className) ->
             "导航动作后的页面切换/列表加载事件；正在验证页面层级，单独的 RecyclerView 滚动不足以认定为用户操作"
+        isDynamicFeedRefreshStartupScroll(eventType, className, now) ->
+            "首页连续双击刷新后的 RecyclerView 加载/回顶事件；处于刷新动作验证窗口，不按用户操作处理"
         eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED &&
             accountBrowsePhase == AccountBrowsePhase.WAIT_FOR_SCROLL_SETTLE ->
             "Freedom 自动滑动确认阶段的列表事件；仅凭列表事件无法区分系统手势反馈与同期手动滚动，不归类为用户操作"
@@ -2399,6 +2905,10 @@ class FreedomAccessibilityService : AccessibilityService() {
             addLog("导航页面正在切换或加载；检测到 RecyclerView 滚动事件，但没有独立用户触摸证据，暂不触发暂停")
             return
         }
+        if (isDynamicFeedRefreshStartupScroll(eventType, className, now)) {
+            addLog("首页连续双击后检测到 RecyclerView 滚动/回顶事件；按刷新动作反馈处理，不触发暂停")
+            return
+        }
         if (accountBrowseImageBrowserActive ||
             accountBrowsePhase == AccountBrowsePhase.WAIT_FOR_IMAGE_BROWSER_RETURN ||
             accountBrowsePhase == AccountBrowsePhase.WAIT_FOR_DETAIL_RESTABILIZE
@@ -2461,7 +2971,7 @@ class FreedomAccessibilityService : AccessibilityService() {
                 deadlineReached = System.currentTimeMillis() >= accountBrowseDeadlineAt
             )
             if (decision == FeedReturnVerificationPolicy.Decision.PAUSE_ROOT_UNAVAILABLE) {
-                pauseAccountBrowse("返回后持续无法读取当前页面；为避免误操作，已暂停")
+                beginDynamicFeedRefreshRecovery("返回后持续无法读取当前页面")
             } else {
                 scheduleAccountBrowseStep(PAGE_STATE_POLL_MS)
             }
@@ -2528,19 +3038,17 @@ class FreedomAccessibilityService : AccessibilityService() {
 
             FeedReturnVerificationPolicy.Decision.PAUSE_ROOT_UNAVAILABLE -> {
                 // The root-available path above cannot produce this outcome.
-                pauseAccountBrowse("返回后持续无法读取当前页面；为避免误操作，已暂停")
+                beginDynamicFeedRefreshRecovery("返回后持续无法读取当前页面")
                 return
             }
 
             FeedReturnVerificationPolicy.Decision.PAUSE_POSITION_UNCONFIRMED -> {
-                pauseAccountBrowse(
-                    "已返回动态列表，但无法确认恢复到打开动态前的位置；为避免跳过内容，已暂停"
-                )
+                beginDynamicFeedRefreshRecovery("已返回动态列表，但无法确认恢复到打开动态前的位置")
                 return
             }
 
             FeedReturnVerificationPolicy.Decision.PAUSE_NOT_FEED_PAGE -> {
-                pauseAccountBrowse("返回后没有重新识别到动态列表；请检查页面并重新启动")
+                beginDynamicFeedRefreshRecovery("返回后没有重新识别到动态列表")
                 return
             }
 
@@ -2694,6 +3202,12 @@ class FreedomAccessibilityService : AccessibilityService() {
         private const val MAX_RECOVERY_TAB_CLICK_ATTEMPTS = 2
         private const val MAX_RECOVERY_HOME_CLICK_ATTEMPTS = 2
         private const val MAX_RECOVERY_BACK_STEPS = 4
+        private const val HOME_REFRESH_TAP_DURATION_MS = 90L
+        private const val HOME_REFRESH_TAP_INTERVAL_MS = 380L
+        private const val HOME_REFRESH_PROGRAMMATIC_EVENT_WINDOW_MS = 1_800L
+        private const val DYNAMIC_FEED_REFRESH_VERIFY_TIMEOUT_MS = 10_000L
+        private const val MAX_DYNAMIC_FEED_REFRESH_ATTEMPTS = 2
+        private const val REQUIRED_DYNAMIC_REFRESH_STABLE_SAMPLES = 3
         private const val POPUP_VERIFY_POLL_MS = 350L
         private const val POPUP_DISMISS_VERIFY_TIMEOUT_MS = 2_500L
         private const val POPUP_RETRY_DELAY_MS = 900L

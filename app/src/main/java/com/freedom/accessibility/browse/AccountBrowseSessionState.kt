@@ -57,6 +57,15 @@ internal class AccountBrowseSessionState {
     var recoveryHomeClickAttempts = 0
     var recoveryDynamicClickAttempts = 0
     var dynamicTabClickConfirmed = false
+    var feedRefreshRecoveryActive = false
+    var feedRefreshAttempts = 0
+    var feedRefreshBeforeSnapshot = ""
+    var feedRefreshLastSnapshot = ""
+    var feedRefreshStableSamples = 0
+    var feedRefreshRecyclerContentChangeEvents = 0
+    var feedRefreshActionAt = 0L
+    var feedRefreshVerificationDeadlineAt = 0L
+    var feedRefreshWaitReason = ""
     var notTargetForegroundLogged = false
     var rootUnavailableLogged = false
 
@@ -122,6 +131,15 @@ internal class AccountBrowseSessionState {
         recoveryHomeClickAttempts = 0
         recoveryDynamicClickAttempts = 0
         dynamicTabClickConfirmed = false
+        feedRefreshRecoveryActive = false
+        feedRefreshAttempts = 0
+        feedRefreshBeforeSnapshot = ""
+        feedRefreshLastSnapshot = ""
+        feedRefreshStableSamples = 0
+        feedRefreshRecyclerContentChangeEvents = 0
+        feedRefreshActionAt = 0L
+        feedRefreshVerificationDeadlineAt = 0L
+        feedRefreshWaitReason = ""
         notTargetForegroundLogged = false
         rootUnavailableLogged = false
     }

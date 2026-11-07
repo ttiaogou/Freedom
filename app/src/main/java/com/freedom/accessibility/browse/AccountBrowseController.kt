@@ -17,6 +17,8 @@ internal class AccountBrowseController(
     internal data class Actions(
         val waitForDynamicTab: () -> Unit,
         val verifyNavigationAction: () -> Unit,
+        val refreshDynamicFeed: () -> Unit,
+        val verifyDynamicFeedRefresh: () -> Unit,
         val waitForFeedStable: () -> Unit,
         val runFirstSwipeCountdown: () -> Unit,
         val performFeedScroll: () -> Unit,
@@ -58,6 +60,8 @@ internal class AccountBrowseController(
             AccountBrowsePhase.PAUSED -> return
             AccountBrowsePhase.WAIT_FOR_DYNAMIC_TAB -> actions.waitForDynamicTab()
             AccountBrowsePhase.VERIFY_NAVIGATION_ACTION -> actions.verifyNavigationAction()
+            AccountBrowsePhase.REFRESH_DYNAMIC_FEED -> actions.refreshDynamicFeed()
+            AccountBrowsePhase.VERIFY_DYNAMIC_FEED_REFRESH -> actions.verifyDynamicFeedRefresh()
             AccountBrowsePhase.WAIT_FOR_FEED_STABLE -> actions.waitForFeedStable()
             AccountBrowsePhase.FIRST_SWIPE_COUNTDOWN -> actions.runFirstSwipeCountdown()
             AccountBrowsePhase.WAIT_FOR_LIST_SCROLL -> actions.performFeedScroll()

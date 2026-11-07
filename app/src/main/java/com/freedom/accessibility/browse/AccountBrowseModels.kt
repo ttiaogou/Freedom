@@ -9,6 +9,8 @@ internal enum class AccountBrowsePhase {
         IDLE,
         WAIT_FOR_DYNAMIC_TAB,
         VERIFY_NAVIGATION_ACTION,
+        REFRESH_DYNAMIC_FEED,
+        VERIFY_DYNAMIC_FEED_REFRESH,
         WAIT_FOR_FEED_STABLE,
         FIRST_SWIPE_COUNTDOWN,
         WAIT_FOR_LIST_SCROLL,
