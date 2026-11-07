@@ -33,6 +33,7 @@ import com.freedom.accessibility.browse.DetailPageIdentityInspection
 import com.freedom.accessibility.browse.DynamicTabInspection
 import com.freedom.accessibility.browse.DynamicTabRowEvidence
 import com.freedom.accessibility.browse.FeedGestureTarget
+import com.freedom.accessibility.browse.FeedPositionMatcher
 import com.freedom.accessibility.browse.FeedReadinessInspection
 import com.freedom.accessibility.browse.HomeBottomNavEvidence
 import com.freedom.accessibility.browse.ManualResumeContext
@@ -2467,18 +2468,12 @@ class FreedomAccessibilityService : AccessibilityService() {
     private fun isFeedPositionRestored(
         expectedSnapshot: String,
         currentSnapshot: String
-    ): Boolean {
-        if (expectedSnapshot.isBlank() || currentSnapshot.isBlank()) return false
-        val expected = expectedSnapshot.split(" | ").filter { it.isNotBlank() }.toSet()
-        val current = currentSnapshot.split(" | ").filter { it.isNotBlank() }.toSet()
-        val comparableCount = minOf(expected.size, current.size)
-        if (comparableCount < MIN_RETURN_SNAPSHOT_MATCH_LINES) return false
-        val requiredMatches = maxOf(
-            MIN_RETURN_SNAPSHOT_MATCH_LINES,
-            kotlin.math.ceil(comparableCount * RETURN_SNAPSHOT_MATCH_RATIO).toInt()
-        )
-        return expected.intersect(current).size >= requiredMatches
-    }
+    ): Boolean = FeedPositionMatcher.isPositionRestored(
+        expectedSnapshot = expectedSnapshot,
+        currentSnapshot = currentSnapshot,
+        minimumMatches = MIN_RETURN_SNAPSHOT_MATCH_LINES,
+        matchRatio = RETURN_SNAPSHOT_MATCH_RATIO
+    )
 
     private fun isMomoDynamicFeedPage(root: AccessibilityNodeInfo): Boolean =
         momoPageInspector.isMomoDynamicFeedPage(root)

@@ -48,8 +48,8 @@ jobs:
               print(f"XML OK: {path}")
           PY
 
-      - name: Build debug APK
-        run: gradle --no-daemon clean assembleDebug
+      - name: Run unit tests and build debug APK
+        run: gradle --no-daemon clean testDebugUnitTest assembleDebug
 
       # Intentionally upload only the APK. No ZIP containing the APK is created.
       - name: Upload APK artifact only
